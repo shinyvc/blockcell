@@ -271,16 +271,18 @@ impl DingTalkChannel {
                     // Parse the stream event
                     match serde_json::from_str::<StreamEvent>(&text) {
                         Ok(event) => {
-                            // Send ACK back
+                            // Send ACK back (per official Stream SDK protocol)
+                            let msg_id = event.headers.as_ref()
+                                .and_then(|h| h.event_id.as_deref())
+                                .unwrap_or("");
                             let ack = serde_json::json!({
                                 "code": 200,
                                 "headers": {
-                                    "messageId": event.headers.as_ref()
-                                        .and_then(|h| h.event_id.as_deref())
-                                        .unwrap_or("")
+                                    "contentType": "application/json",
+                                    "messageId": msg_id
                                 },
                                 "message": "OK",
-                                "data": ""
+                                "data": "{\"response\": null}"
                             });
                             if let Err(e) = write.send(WsMessage::Text(ack.to_string())).await {
                                 error!(error = %e, "Failed to send DingTalk stream ACK");
@@ -289,7 +291,22 @@ impl DingTalkChannel {
                             match event.event_type.as_str() {
                                 "CALLBACK" => {
                                     if let Some(data) = &event.data {
-                                        if let Err(e) = self.handle_callback_message(data).await {
+                                        // DingTalk Stream SDK sends `data` as a JSON
+                                        // *string* (stringified JSON), not a raw object.
+                                        // We must parse the string to get the actual object.
+                                        let parsed_data = if let Some(s) = data.as_str() {
+                                            match serde_json::from_str::<serde_json::Value>(s) {
+                                                Ok(v) => v,
+                                                Err(e) => {
+                                                    error!(error = %e, "Failed to parse DingTalk callback data string");
+                                                    continue;
+                                                }
+                                            }
+                                        } else {
+                                            // Already a JSON object (defensive fallback)
+                                            data.clone()
+                                        };
+                                        if let Err(e) = self.handle_callback_message(&parsed_data).await {
                                             error!(error = %e, "Failed to handle DingTalk callback");
                                         }
                                     }
@@ -1004,6 +1021,41 @@ mod tests {
         assert_eq!(event.event_type, "CALLBACK");
         assert!(event.headers.is_some());
         assert!(event.data.is_some());
+    }
+
+    /// DingTalk Stream SDK sends `data` as a JSON *string*, not a raw object.
+    /// This test verifies the real protocol format can be parsed and the inner
+    /// stringified JSON can be extracted.
+    #[test]
+    fn test_stream_event_stringified_data() {
+        // This matches the actual DingTalk protocol: data is a string containing JSON
+        let json = r#"{
+            "specVersion": "1.0",
+            "type": "CALLBACK",
+            "headers": {
+                "appId": "test-app",
+                "contentType": "application/json",
+                "messageId": "msg123",
+                "time": "1690362102194",
+                "topic": "/v1.0/im/bot/messages/get"
+            },
+            "data": "{\"conversationId\":\"cidTest==\",\"msgtype\":\"text\",\"text\":{\"content\":\" hello\"},\"senderId\":\"user123\",\"senderNick\":\"TestUser\",\"msgId\":\"msgTest==\",\"conversationType\":\"1\",\"robotCode\":\"dingxxx\"}"
+        }"#;
+        let event: StreamEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.event_type, "CALLBACK");
+
+        // data should be a Value::String, not a Value::Object
+        let data = event.data.unwrap();
+        assert!(data.is_string(), "data should be a JSON string, got: {:?}", data);
+
+        // Parse the stringified JSON
+        let inner: serde_json::Value = serde_json::from_str(data.as_str().unwrap()).unwrap();
+        assert_eq!(inner.get("msgtype").and_then(|v| v.as_str()), Some("text"));
+        assert_eq!(inner.get("senderId").and_then(|v| v.as_str()), Some("user123"));
+        assert_eq!(
+            inner.get("text").and_then(|v| v.get("content")).and_then(|v| v.as_str()),
+            Some(" hello")
+        );
     }
 
     #[test]
