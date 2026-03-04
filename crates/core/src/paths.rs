@@ -107,6 +107,10 @@ impl Paths {
         self.workspace().join("evolved_tools")
     }
 
+    pub fn channel_contacts_file(&self) -> PathBuf {
+        self.base.join("channel_contacts.json")
+    }
+
     pub fn toggles_file(&self) -> PathBuf {
         self.workspace().join("toggles.json")
     }

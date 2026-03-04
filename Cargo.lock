@@ -582,6 +582,7 @@ dependencies = [
  "async-trait",
  "base64",
  "blockcell-core",
+ "blockcell-storage",
  "calamine",
  "chrono",
  "csv",

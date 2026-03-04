@@ -578,6 +578,7 @@ mod tests {
             spawn_handle: None,
             capability_registry: None,
             core_evolution: None,
+            channel_contacts_file: None,
         };
         assert_eq!(resolve_path(&ctx, "/absolute/path.mp4"), "/absolute/path.mp4");
         assert_eq!(resolve_path(&ctx, "relative.mp4"), "/tmp/workspace/relative.mp4");

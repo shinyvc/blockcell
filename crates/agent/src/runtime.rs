@@ -579,6 +579,8 @@ pub struct AgentRuntime {
     /// Cooldown tracker: capability_id → last auto-request timestamp (epoch secs).
     /// Prevents repeated auto-triggering of the same capability within 24h.
     cap_request_cooldown: HashMap<String, i64>,
+    /// Persistent registry of known channel contacts for cross-channel messaging.
+    channel_contacts: blockcell_storage::ChannelContacts,
 }
 
 impl AgentRuntime {
@@ -602,6 +604,7 @@ impl AgentRuntime {
 
         let session_store = SessionStore::new(paths.clone());
         let audit_logger = AuditLogger::new(paths.clone());
+        let channel_contacts = blockcell_storage::ChannelContacts::new(paths.clone());
 
         Ok(Self {
             config,
@@ -621,6 +624,7 @@ impl AgentRuntime {
             core_evolution: None,
             event_tx: None,
             cap_request_cooldown: HashMap::new(),
+            channel_contacts,
         })
     }
 
@@ -1050,6 +1054,36 @@ impl AgentRuntime {
     pub async fn process_message(&mut self, msg: InboundMessage) -> Result<String> {
         let session_key = msg.session_key();
         info!(session_key = %session_key, "Processing message");
+
+        // ── Record sender as a known channel contact (for cross-channel lookup) ──
+        if msg.channel != "ws" && msg.channel != "cli" && msg.channel != "system" {
+            let sender_name = msg.metadata.get("sender_nick")
+                .and_then(|v| v.as_str())
+                .or_else(|| msg.metadata.get("username").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let chat_type = match msg.metadata.get("conversation_type").and_then(|v| v.as_str()) {
+                Some("1") => "private",
+                Some("2") => "group",
+                _ => {
+                    if msg.metadata.get("is_group").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        "group"
+                    } else if msg.sender_id == msg.chat_id {
+                        "private"
+                    } else {
+                        "group"
+                    }
+                }
+            };
+            self.channel_contacts.upsert(blockcell_storage::ChannelContact {
+                channel: msg.channel.clone(),
+                chat_id: msg.chat_id.clone(),
+                sender_id: msg.sender_id.clone(),
+                name: sender_name,
+                chat_type: chat_type.to_string(),
+                last_active: chrono::Utc::now().to_rfc3339(),
+            });
+        }
 
         // ── skill script fast path: execute SKILL.rhai / SKILL.py directly without LLM ──
         let scripted_kind = if msg
@@ -2095,6 +2129,7 @@ impl AgentRuntime {
             spawn_handle: Some(spawn_handle),
             capability_registry: self.capability_registry.clone(),
             core_evolution: self.core_evolution.clone(),
+            channel_contacts_file: Some(self.paths.channel_contacts_file()),
         };
 
         // Emit tool_call_start event to WebSocket clients
@@ -2403,6 +2438,7 @@ impl AgentRuntime {
                 spawn_handle: None, // No spawning from cron skill scripts
                 capability_registry: capability_registry.clone(),
                 core_evolution: core_evolution.clone(),
+                channel_contacts_file: Some(paths.channel_contacts_file()),
             };
 
             // Execute tool synchronously via a new tokio runtime handle

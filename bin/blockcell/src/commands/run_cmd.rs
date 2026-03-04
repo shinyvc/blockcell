@@ -32,6 +32,7 @@ pub async fn tool(tool_name: &str, params_json: &str) -> anyhow::Result<()> {
         memory_store: None,
         capability_registry: None,
         core_evolution: None,
+        channel_contacts_file: Some(paths.channel_contacts_file()),
     };
 
     let result: serde_json::Value = tool.execute(ctx, params).await?;

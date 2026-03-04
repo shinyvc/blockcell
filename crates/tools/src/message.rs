@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use blockcell_core::{Error, OutboundMessage, Result};
+use blockcell_core::{Error, OutboundMessage, Paths, Result};
 use serde_json::{json, Value};
 use tracing::debug;
 use std::path::Path;
@@ -13,7 +13,7 @@ impl Tool for MessageTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "message",
-            description: "Send a message (text and/or media files) to a channel. Use this to send images, files, or text to the current or a different channel/chat. For sending images/files, provide their local file paths in the 'media' array.",
+            description: "Send a message (text and/or media files) to a channel. Use this to send images, files, or text to the current or a different channel/chat. For cross-channel sending, you can provide either 'chat_id' directly OR 'target_name' to look up a known contact by name. The system automatically remembers users who have sent messages on each channel.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -32,7 +32,11 @@ impl Tool for MessageTool {
                     },
                     "chat_id": {
                         "type": "string",
-                        "description": "Target chat ID. Optional, defaults to current chat."
+                        "description": "Target chat ID. If sending to a different channel and you don't know the chat_id, use 'target_name' instead to look up by name."
+                    },
+                    "target_name": {
+                        "type": "string",
+                        "description": "Name of the target user or group to send to. The system will look up the chat_id from known contacts who have previously messaged the bot on the target channel. Use this when you don't have the exact chat_id."
                     }
                 },
                 "required": []
@@ -51,14 +55,32 @@ impl Tool for MessageTool {
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
         let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let channel = params
-            .get("channel")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&ctx.channel);
-        let chat_id = params
-            .get("chat_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&ctx.chat_id);
+        let channel_param = params.get("channel").and_then(|v| v.as_str());
+        let chat_id_param = params.get("chat_id").and_then(|v| v.as_str());
+        let target_name_param = params.get("target_name").and_then(|v| v.as_str());
+
+        let channel = channel_param.unwrap_or(&ctx.channel);
+
+        // Resolve chat_id: direct param > target_name lookup > same-channel default
+        let resolved_chat_id: String;
+        if let Some(cid) = chat_id_param {
+            resolved_chat_id = cid.to_string();
+        } else if channel != ctx.channel {
+            // Cross-channel: try target_name lookup
+            if let Some(name) = target_name_param {
+                resolved_chat_id = self.lookup_contact_by_name(&ctx, channel, name)?;
+            } else {
+                // No chat_id and no target_name — list known contacts as hint
+                let hint = self.list_known_contacts_hint(&ctx, channel);
+                return Err(Error::Tool(format!(
+                    "When sending to a different channel ('{}'), you must provide 'chat_id' or 'target_name'. {}",
+                    channel, hint
+                )));
+            }
+        } else {
+            resolved_chat_id = ctx.chat_id.clone();
+        }
+        let chat_id = &resolved_chat_id;
 
         let media_paths_raw: Vec<String> = params
             .get("media")
@@ -144,6 +166,89 @@ impl Tool for MessageTool {
             "media_count": final_media_paths.len(),
             "media": final_media_paths
         }))
+    }
+}
+
+impl MessageTool {
+    /// Look up a contact by name in the channel contacts registry.
+    /// Returns the chat_id if exactly one match is found, or an error with hints.
+    fn lookup_contact_by_name(&self, ctx: &ToolContext, channel: &str, name: &str) -> Result<String> {
+        let contacts_file = ctx.channel_contacts_file.as_ref().ok_or_else(|| {
+            Error::Tool("Channel contacts registry is not configured.".to_string())
+        })?;
+        // Derive the base dir from the contacts file path (it lives at ~/.blockcell/channel_contacts.json)
+        let base = contacts_file.parent().unwrap_or(Path::new("."));
+        let paths = Paths::with_base(base.to_path_buf());
+        let store = blockcell_storage::ChannelContacts::new(paths);
+        let matches = store.lookup(channel, name);
+
+        match matches.len() {
+            0 => {
+                let all = store.list_by_channel(channel);
+                if all.is_empty() {
+                    Err(Error::Tool(format!(
+                        "No known contacts for channel '{}'. A user must first send a message to the bot on '{}' before you can send messages to them.",
+                        channel, channel
+                    )))
+                } else {
+                    let names: Vec<String> = all.iter().map(|c| {
+                        if c.name.is_empty() { c.chat_id.clone() } else { format!("{} ({})", c.name, c.chat_type) }
+                    }).collect();
+                    Err(Error::Tool(format!(
+                        "No contact matching '{}' found on '{}'. Known contacts: {}",
+                        name, channel, names.join(", ")
+                    )))
+                }
+            }
+            1 => {
+                debug!(
+                    channel = channel,
+                    name = name,
+                    chat_id = %matches[0].chat_id,
+                    "Resolved target_name to chat_id via contacts registry"
+                );
+                Ok(matches[0].chat_id.clone())
+            }
+            _ => {
+                let options: Vec<String> = matches.iter().map(|c| {
+                    format!("{} → chat_id: {} ({})", c.name, c.chat_id, c.chat_type)
+                }).collect();
+                Err(Error::Tool(format!(
+                    "Multiple contacts matching '{}' on '{}'. Please be more specific or use chat_id directly: {}",
+                    name, channel, options.join("; ")
+                )))
+            }
+        }
+    }
+
+    /// Build a hint string listing known contacts for a channel.
+    fn list_known_contacts_hint(&self, ctx: &ToolContext, channel: &str) -> String {
+        let contacts_file = match ctx.channel_contacts_file.as_ref() {
+            Some(f) => f,
+            None => return "Channel contacts registry is not configured.".to_string(),
+        };
+        let base = contacts_file.parent().unwrap_or(Path::new("."));
+        let paths = Paths::with_base(base.to_path_buf());
+        let store = blockcell_storage::ChannelContacts::new(paths);
+        let all = store.list_by_channel(channel);
+        if all.is_empty() {
+            format!(
+                "No known contacts for '{}'. A user must first send a message to the bot on '{}' so the system can remember their ID.",
+                channel, channel
+            )
+        } else {
+            let names: Vec<String> = all.iter().map(|c| {
+                if c.name.is_empty() {
+                    format!("chat_id={} ({})", c.chat_id, c.chat_type)
+                } else {
+                    format!("\"{}\" → chat_id={} ({})", c.name, c.chat_id, c.chat_type)
+                }
+            }).collect();
+            format!(
+                "Known contacts on '{}': {}. You can use 'target_name' to send by name.",
+                channel, names.join(", ")
+            )
+        }
     }
 }
 

@@ -183,6 +183,8 @@ pub struct ToolContext {
     pub spawn_handle: Option<Arc<dyn SpawnHandle>>,
     pub capability_registry: Option<CapabilityRegistryHandle>,
     pub core_evolution: Option<CoreEvolutionHandle>,
+    /// Path to channel_contacts.json for cross-channel contact lookup.
+    pub channel_contacts_file: Option<PathBuf>,
 }
 
 pub struct ToolSchema {
