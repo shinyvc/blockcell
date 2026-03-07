@@ -1,3 +1,4 @@
+use blockcell_core::mcp_config::McpResolvedConfig;
 use blockcell_core::{Config, Error, Result};
 use blockcell_tools::ToolRegistry;
 use regex::Regex;
@@ -244,6 +245,14 @@ impl<'a> IntentToolResolver<'a> {
     }
 
     pub fn validate(&self, registry: &ToolRegistry) -> Result<()> {
+        self.validate_with_mcp(registry, None)
+    }
+
+    pub fn validate_with_mcp(
+        &self,
+        registry: &ToolRegistry,
+        mcp: Option<&McpResolvedConfig>,
+    ) -> Result<()> {
         let default_router;
         let router = if let Some(router) = self.config.intent_router.as_ref() {
             router
@@ -308,14 +317,14 @@ impl<'a> IntentToolResolver<'a> {
             }
 
             for tool in &profile.core_tools {
-                ensure_known_tool(self.config, profile_name, tool, &registered)?;
+                ensure_known_tool(self.config, mcp, profile_name, tool, &registered)?;
             }
             for tool in &profile.deny_tools {
-                ensure_known_tool(self.config, profile_name, tool, &registered)?;
+                ensure_known_tool(self.config, mcp, profile_name, tool, &registered)?;
             }
             for entry in profile.intent_tools.values() {
                 for tool in entry.tools() {
-                    ensure_known_tool(self.config, profile_name, tool, &registered)?;
+                    ensure_known_tool(self.config, mcp, profile_name, tool, &registered)?;
                 }
             }
         }
@@ -326,11 +335,12 @@ impl<'a> IntentToolResolver<'a> {
 
 fn ensure_known_tool(
     config: &Config,
+    mcp: Option<&McpResolvedConfig>,
     profile_name: &str,
     tool_name: &str,
     registered: &HashSet<String>,
 ) -> Result<()> {
-    if registered.contains(tool_name) || declared_mcp_tool(config, tool_name) {
+    if registered.contains(tool_name) || declared_mcp_tool(config, mcp, tool_name, registered) {
         Ok(())
     } else {
         Err(Error::Config(format!(
@@ -340,16 +350,43 @@ fn ensure_known_tool(
     }
 }
 
-fn declared_mcp_tool(config: &Config, tool_name: &str) -> bool {
-    let Some((server_name, _tool_suffix)) = tool_name.split_once("__") else {
+fn declared_mcp_tool(
+    _config: &Config,
+    mcp: Option<&McpResolvedConfig>,
+    tool_name: &str,
+    registered: &HashSet<String>,
+) -> bool {
+    let Some((server_name, tool_suffix)) = tool_name.split_once("__") else {
         return false;
     };
 
-    config
-        .mcp_servers
-        .get(server_name)
-        .map(|server| server.enabled)
-        .unwrap_or(false)
+    let server_name = server_name.trim();
+    let tool_suffix = tool_suffix.trim();
+    if server_name.is_empty() || tool_suffix.is_empty() {
+        return false;
+    }
+
+    let Some(mcp) = mcp else {
+        return false;
+    };
+    let Some(server) = mcp.servers.get(server_name) else {
+        return false;
+    };
+    if !server.enabled {
+        return false;
+    }
+
+    let server_prefix = format!("{}__", server_name);
+    let discovered_server_tools = registered
+        .iter()
+        .filter(|name| name.starts_with(&server_prefix))
+        .count();
+
+    if discovered_server_tools == 0 {
+        true
+    } else {
+        registered.contains(tool_name)
+    }
 }
 
 /// Check if the intents should show skills list.
@@ -377,13 +414,22 @@ mod tests {
     #[test]
     fn test_non_chat_classification_falls_back_to_unknown() {
         let classifier = IntentClassifier::new();
-        assert_eq!(classifier.classify("查一下茅台股价"), vec![IntentCategory::Unknown]);
+        assert_eq!(
+            classifier.classify("查一下茅台股价"),
+            vec![IntentCategory::Unknown]
+        );
         assert_eq!(
             classifier.classify("0x1234567890abcdef1234567890abcdef12345678 这个地址安全吗"),
             vec![IntentCategory::Unknown]
         );
-        assert_eq!(classifier.classify("帮我读一下 config.json"), vec![IntentCategory::Unknown]);
-        assert_eq!(classifier.classify("帮我做一件复杂的事情"), vec![IntentCategory::Unknown]);
+        assert_eq!(
+            classifier.classify("帮我读一下 config.json"),
+            vec![IntentCategory::Unknown]
+        );
+        assert_eq!(
+            classifier.classify("帮我做一件复杂的事情"),
+            vec![IntentCategory::Unknown]
+        );
     }
 
     #[test]
@@ -480,13 +526,6 @@ mod tests {
     #[test]
     fn test_intent_router_validation_accepts_declared_mcp_tool_prefix() {
         let raw = r#"{
-  "mcpServers": {
-    "github": {
-      "enabled": true,
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"]
-    }
-  },
   "intentRouter": {
     "enabled": true,
     "defaultProfile": "default",
@@ -504,8 +543,29 @@ mod tests {
         let config: Config = serde_json::from_str(raw).unwrap();
         let resolver = IntentToolResolver::new(&config);
         let registry = ToolRegistry::with_defaults();
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "github".to_string(),
+            blockcell_core::mcp_config::McpServerConfig {
+                command: "npx".to_string(),
+                args: vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-github".to_string(),
+                ],
+                env: std::collections::HashMap::new(),
+                cwd: None,
+                enabled: true,
+                auto_start: true,
+                startup_timeout_secs: 20,
+                call_timeout_secs: 60,
+            },
+        );
+        let mcp = blockcell_core::mcp_config::McpResolvedConfig {
+            defaults: blockcell_core::mcp_config::McpDefaultsConfig::default(),
+            servers,
+        };
 
-        assert!(resolver.validate(&registry).is_ok());
+        assert!(resolver.validate_with_mcp(&registry, Some(&mcp)).is_ok());
     }
 
     #[test]

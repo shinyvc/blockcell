@@ -3,7 +3,9 @@ use blockcell_core::{Config, InboundMessage, Paths};
 use blockcell_skills::evolution::EvolutionRecord;
 use blockcell_skills::is_builtin_tool;
 use blockcell_storage::MemoryStore;
-use blockcell_tools::ToolRegistry;
+use blockcell_tools::build_tool_registry_for_agent_config;
+use blockcell_tools::mcp::manager::McpManager;
+use std::sync::Arc;
 
 /// List all skill evolution records.
 pub async fn list(all: bool, enabled_only: bool) -> anyhow::Result<()> {
@@ -388,9 +390,9 @@ pub async fn learn(description: &str) -> anyhow::Result<()> {
     let provider_pool = blockcell_providers::ProviderPool::from_config(&config)?;
 
     // Create runtime
-    let tool_registry = ToolRegistry::with_defaults();
+    let mcp_manager = Arc::new(McpManager::load(&paths).await?);
+    let tool_registry = build_tool_registry_for_agent_config(&config, Some(&mcp_manager)).await?;
     let mut runtime = AgentRuntime::new(config, paths.clone(), provider_pool, tool_registry)?;
-    runtime.mount_mcp_servers().await;
 
     // Optionally wire up memory store
     let memory_db_path = paths.memory_dir().join("memory.db");

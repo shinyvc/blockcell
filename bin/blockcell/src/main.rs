@@ -114,6 +114,12 @@ enum Commands {
         command: ToolsCommands,
     },
 
+    /// Manage MCP servers
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
+
     /// Execute a tool or agent message directly
     Run {
         #[command(subcommand)]
@@ -260,6 +266,84 @@ enum ToolsCommands {
         /// Disable the tool
         #[arg(long)]
         disable: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCommands {
+    /// List MCP servers
+    List,
+    /// Show one MCP server
+    Show {
+        /// MCP server name
+        name: String,
+    },
+    /// Add an MCP server from template or raw config
+    Add {
+        /// Template name (github/sqlite/filesystem/postgres/puppeteer) or logical name for `--raw`
+        template_or_name: String,
+        /// Use raw command/args/env instead of template generation
+        #[arg(long)]
+        raw: bool,
+        /// Explicit server name override
+        #[arg(long)]
+        name: Option<String>,
+        /// Raw command executable
+        #[arg(long)]
+        command: Option<String>,
+        /// Repeatable raw argument
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        /// Repeatable environment variable entry KEY=VALUE
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// Working directory
+        #[arg(long)]
+        cwd: Option<String>,
+        /// SQLite template database path
+        #[arg(long)]
+        db_path: Option<String>,
+        /// Filesystem template root path (repeatable)
+        #[arg(long = "path")]
+        filesystem_paths: Vec<String>,
+        /// Postgres template DSN
+        #[arg(long)]
+        dsn: Option<String>,
+        /// Overwrite existing file if present
+        #[arg(long)]
+        force: bool,
+        /// Create disabled
+        #[arg(long)]
+        disabled: bool,
+        /// Disable auto-start
+        #[arg(long)]
+        no_auto_start: bool,
+        /// Startup timeout override
+        #[arg(long)]
+        startup_timeout_secs: Option<u64>,
+        /// Call timeout override
+        #[arg(long)]
+        call_timeout_secs: Option<u64>,
+    },
+    /// Remove an MCP server
+    Remove {
+        /// MCP server name
+        name: String,
+    },
+    /// Enable an MCP server
+    Enable {
+        /// MCP server name
+        name: String,
+    },
+    /// Disable an MCP server
+    Disable {
+        /// MCP server name
+        name: String,
+    },
+    /// Open MCP config in editor
+    Edit {
+        /// Optional server name; edits mcp.d/<name>.json if present
+        name: Option<String>,
     },
 }
 
@@ -843,6 +927,64 @@ async fn main() -> anyhow::Result<()> {
             }
         },
 
+        // ── P0: MCP ─────────────────────────────────────────────────────
+        Commands::Mcp { command } => match command {
+            McpCommands::List => {
+                commands::mcp::list().await?;
+            }
+            McpCommands::Show { name } => {
+                commands::mcp::show(&name).await?;
+            }
+            McpCommands::Add {
+                template_or_name,
+                raw,
+                name,
+                command,
+                args,
+                env,
+                cwd,
+                db_path,
+                filesystem_paths,
+                dsn,
+                force,
+                disabled,
+                no_auto_start,
+                startup_timeout_secs,
+                call_timeout_secs,
+            } => {
+                commands::mcp::add(
+                    &template_or_name,
+                    raw,
+                    name,
+                    command,
+                    args,
+                    env,
+                    cwd,
+                    db_path,
+                    filesystem_paths,
+                    dsn,
+                    force,
+                    disabled,
+                    no_auto_start,
+                    startup_timeout_secs,
+                    call_timeout_secs,
+                )
+                .await?;
+            }
+            McpCommands::Remove { name } => {
+                commands::mcp::remove(&name).await?;
+            }
+            McpCommands::Enable { name } => {
+                commands::mcp::set_enabled(&name, true).await?;
+            }
+            McpCommands::Disable { name } => {
+                commands::mcp::set_enabled(&name, false).await?;
+            }
+            McpCommands::Edit { name } => {
+                commands::mcp::edit(name.as_deref()).await?;
+            }
+        },
+
         // ── P0: Run ─────────────────────────────────────────────────────
         Commands::Run { command } => match command {
             RunCommands::Tool {
@@ -1134,7 +1276,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1168,7 +1309,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_run_message_subcommand_accepts_agent_flag() {
         let cli = Cli::try_parse_from(["blockcell", "run", "msg", "hello", "--agent", "ops"])
@@ -1176,17 +1316,23 @@ mod tests {
 
         match cli.command {
             Commands::Run { command } => match command {
-                RunCommands::Message { message, session, agent } => {
+                RunCommands::Message {
+                    message,
+                    session,
+                    agent,
+                } => {
                     assert_eq!(message, "hello");
                     assert_eq!(session, "cli:run");
                     assert_eq!(agent.as_deref(), Some("ops"));
                 }
-                other => panic!("unexpected run command: {:?}", std::mem::discriminant(&other)),
+                other => panic!(
+                    "unexpected run command: {:?}",
+                    std::mem::discriminant(&other)
+                ),
             },
             other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
         }
     }
-
 
     #[test]
     fn test_run_tool_subcommand_accepts_agent_flag() {
@@ -1212,7 +1358,10 @@ mod tests {
                     assert_eq!(params, r#"{"path":"README.md"}"#);
                     assert_eq!(agent.as_deref(), Some("ops"));
                 }
-                other => panic!("unexpected run command: {:?}", std::mem::discriminant(&other)),
+                other => panic!(
+                    "unexpected run command: {:?}",
+                    std::mem::discriminant(&other)
+                ),
             },
             other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
         }
@@ -1246,9 +1395,15 @@ mod tests {
                         assert_eq!(account.as_deref(), Some("bot2"));
                         assert_eq!(agent, "ops");
                     }
-                    other => panic!("unexpected owner command: {:?}", std::mem::discriminant(&other)),
+                    other => panic!(
+                        "unexpected owner command: {:?}",
+                        std::mem::discriminant(&other)
+                    ),
                 },
-                other => panic!("unexpected channels command: {:?}", std::mem::discriminant(&other)),
+                other => panic!(
+                    "unexpected channels command: {:?}",
+                    std::mem::discriminant(&other)
+                ),
             },
             other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
         }
@@ -1275,9 +1430,15 @@ mod tests {
                         assert_eq!(channel, "telegram");
                         assert_eq!(account.as_deref(), Some("bot2"));
                     }
-                    other => panic!("unexpected owner command: {:?}", std::mem::discriminant(&other)),
+                    other => panic!(
+                        "unexpected owner command: {:?}",
+                        std::mem::discriminant(&other)
+                    ),
                 },
-                other => panic!("unexpected channels command: {:?}", std::mem::discriminant(&other)),
+                other => panic!(
+                    "unexpected channels command: {:?}",
+                    std::mem::discriminant(&other)
+                ),
             },
             other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
         }

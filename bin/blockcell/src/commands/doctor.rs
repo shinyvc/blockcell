@@ -1,7 +1,10 @@
 use blockcell_agent::intent::IntentToolResolver;
 use blockcell_channels::account::{channel_configured, listener_labels};
 use blockcell_core::{Config, Paths};
-use blockcell_tools::ToolRegistry;
+use std::sync::Arc;
+
+use blockcell_tools::build_tool_registry_with_all_mcp;
+use blockcell_tools::mcp::manager::McpManager;
 use std::process::Command;
 
 const EXTERNAL_CHANNELS: [&str; 8] = [
@@ -10,14 +13,62 @@ const EXTERNAL_CHANNELS: [&str; 8] = [
 
 fn known_account_ids(config: &Config, channel: &str) -> Vec<String> {
     let mut ids = match channel {
-        "telegram" => config.channels.telegram.accounts.keys().cloned().collect::<Vec<_>>(),
-        "whatsapp" => config.channels.whatsapp.accounts.keys().cloned().collect::<Vec<_>>(),
-        "feishu" => config.channels.feishu.accounts.keys().cloned().collect::<Vec<_>>(),
-        "slack" => config.channels.slack.accounts.keys().cloned().collect::<Vec<_>>(),
-        "discord" => config.channels.discord.accounts.keys().cloned().collect::<Vec<_>>(),
-        "dingtalk" => config.channels.dingtalk.accounts.keys().cloned().collect::<Vec<_>>(),
-        "wecom" => config.channels.wecom.accounts.keys().cloned().collect::<Vec<_>>(),
-        "lark" => config.channels.lark.accounts.keys().cloned().collect::<Vec<_>>(),
+        "telegram" => config
+            .channels
+            .telegram
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "whatsapp" => config
+            .channels
+            .whatsapp
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "feishu" => config
+            .channels
+            .feishu
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "slack" => config
+            .channels
+            .slack
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "discord" => config
+            .channels
+            .discord
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "dingtalk" => config
+            .channels
+            .dingtalk
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "wecom" => config
+            .channels
+            .wecom
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "lark" => config
+            .channels
+            .lark
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
         _ => Vec::new(),
     };
     ids.sort();
@@ -26,14 +77,70 @@ fn known_account_ids(config: &Config, channel: &str) -> Vec<String> {
 
 fn enabled_account_ids(config: &Config, channel: &str) -> Vec<String> {
     let mut ids = match channel {
-        "telegram" => config.channels.telegram.accounts.iter().filter(|(_, account)| account.enabled && !account.token.trim().is_empty()).map(|(id, _)| id.clone()).collect::<Vec<_>>(),
-        "whatsapp" => config.channels.whatsapp.accounts.iter().filter(|(_, account)| account.enabled && !account.bridge_url.trim().is_empty()).map(|(id, _)| id.clone()).collect::<Vec<_>>(),
-        "feishu" => config.channels.feishu.accounts.iter().filter(|(_, account)| account.enabled && !account.app_id.trim().is_empty()).map(|(id, _)| id.clone()).collect::<Vec<_>>(),
-        "slack" => config.channels.slack.accounts.iter().filter(|(_, account)| account.enabled && !account.bot_token.trim().is_empty()).map(|(id, _)| id.clone()).collect::<Vec<_>>(),
-        "discord" => config.channels.discord.accounts.iter().filter(|(_, account)| account.enabled && !account.bot_token.trim().is_empty()).map(|(id, _)| id.clone()).collect::<Vec<_>>(),
-        "dingtalk" => config.channels.dingtalk.accounts.iter().filter(|(_, account)| account.enabled && !account.app_key.trim().is_empty()).map(|(id, _)| id.clone()).collect::<Vec<_>>(),
-        "wecom" => config.channels.wecom.accounts.iter().filter(|(_, account)| account.enabled && !account.corp_id.trim().is_empty()).map(|(id, _)| id.clone()).collect::<Vec<_>>(),
-        "lark" => config.channels.lark.accounts.iter().filter(|(_, account)| account.enabled && !account.app_id.trim().is_empty()).map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+        "telegram" => config
+            .channels
+            .telegram
+            .accounts
+            .iter()
+            .filter(|(_, account)| account.enabled && !account.token.trim().is_empty())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
+        "whatsapp" => config
+            .channels
+            .whatsapp
+            .accounts
+            .iter()
+            .filter(|(_, account)| account.enabled && !account.bridge_url.trim().is_empty())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
+        "feishu" => config
+            .channels
+            .feishu
+            .accounts
+            .iter()
+            .filter(|(_, account)| account.enabled && !account.app_id.trim().is_empty())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
+        "slack" => config
+            .channels
+            .slack
+            .accounts
+            .iter()
+            .filter(|(_, account)| account.enabled && !account.bot_token.trim().is_empty())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
+        "discord" => config
+            .channels
+            .discord
+            .accounts
+            .iter()
+            .filter(|(_, account)| account.enabled && !account.bot_token.trim().is_empty())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
+        "dingtalk" => config
+            .channels
+            .dingtalk
+            .accounts
+            .iter()
+            .filter(|(_, account)| account.enabled && !account.app_key.trim().is_empty())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
+        "wecom" => config
+            .channels
+            .wecom
+            .accounts
+            .iter()
+            .filter(|(_, account)| account.enabled && !account.corp_id.trim().is_empty())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
+        "lark" => config
+            .channels
+            .lark
+            .accounts
+            .iter()
+            .filter(|(_, account)| account.enabled && !account.app_id.trim().is_empty())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
         _ => Vec::new(),
     };
     ids.sort();
@@ -47,11 +154,16 @@ fn agent_owner_bindings(config: &Config, agent_id: &str) -> Vec<String> {
         .filter(|(_, owner)| owner.trim() == agent_id)
         .map(|(channel, _)| channel.clone())
         .collect();
-    owners.extend(config.channel_account_owners.iter().flat_map(|(channel, bindings)| {
-        bindings.iter().filter_map(move |(account_id, owner)| {
-            (owner.trim() == agent_id).then(|| format!("{}:{}", channel, account_id))
-        })
-    }));
+    owners.extend(
+        config
+            .channel_account_owners
+            .iter()
+            .flat_map(|(channel, bindings)| {
+                bindings.iter().filter_map(move |(account_id, owner)| {
+                    (owner.trim() == agent_id).then(|| format!("{}:{}", channel, account_id))
+                })
+            }),
+    );
     owners.sort();
     owners
 }
@@ -165,7 +277,8 @@ pub async fn run() -> anyhow::Result<()> {
 
     // --- 3. Tools ---
     println!("🔧 Tools");
-    let registry = ToolRegistry::with_defaults();
+    let mcp_manager = Arc::new(McpManager::load(&paths).await?);
+    let registry = build_tool_registry_with_all_mcp(Some(&mcp_manager)).await?;
     let tool_count = registry.tool_names().len();
     print_ok(&format!("{} tools registered", tool_count), "");
     ok_count += 1;
@@ -184,9 +297,10 @@ pub async fn run() -> anyhow::Result<()> {
                     .unwrap_or_else(|| router.default_profile.clone());
                 println!("  Agent {} -> {}", agent.id, profile);
             }
-            match IntentToolResolver::new(&config).validate(&registry) {
+            let mcp = blockcell_core::mcp_config::McpResolvedConfig::load_merged(&paths)?;
+            match IntentToolResolver::new(&config).validate_with_mcp(&registry, Some(&mcp)) {
                 Ok(_) => {
-                    print_ok("Intent router validation", "builtin tools ok");
+                    print_ok("Intent router validation", "tools and MCP config ok");
                     ok_count += 1;
                 }
                 Err(err) => {
@@ -383,9 +497,24 @@ pub async fn run() -> anyhow::Result<()> {
         ch.telegram.enabled,
         channel_configured(&config, "telegram"),
     );
-    check_channel(&config, "whatsapp", ch.whatsapp.enabled, channel_configured(&config, "whatsapp"));
-    check_channel(&config, "feishu", ch.feishu.enabled, channel_configured(&config, "feishu"));
-    check_channel(&config, "slack", ch.slack.enabled, channel_configured(&config, "slack"));
+    check_channel(
+        &config,
+        "whatsapp",
+        ch.whatsapp.enabled,
+        channel_configured(&config, "whatsapp"),
+    );
+    check_channel(
+        &config,
+        "feishu",
+        ch.feishu.enabled,
+        channel_configured(&config, "feishu"),
+    );
+    check_channel(
+        &config,
+        "slack",
+        ch.slack.enabled,
+        channel_configured(&config, "slack"),
+    );
     check_channel(
         &config,
         "discord",
@@ -398,8 +527,18 @@ pub async fn run() -> anyhow::Result<()> {
         ch.dingtalk.enabled,
         channel_configured(&config, "dingtalk"),
     );
-    check_channel(&config, "wecom", ch.wecom.enabled, channel_configured(&config, "wecom"));
-    check_channel(&config, "lark", ch.lark.enabled, channel_configured(&config, "lark"));
+    check_channel(
+        &config,
+        "wecom",
+        ch.wecom.enabled,
+        channel_configured(&config, "wecom"),
+    );
+    check_channel(
+        &config,
+        "lark",
+        ch.lark.enabled,
+        channel_configured(&config, "lark"),
+    );
     for channel in EXTERNAL_CHANNELS {
         if let Some(bindings) = config.channel_account_owners.get(channel) {
             let known_accounts = known_account_ids(&config, channel);
@@ -439,19 +578,23 @@ pub async fn run() -> anyhow::Result<()> {
                     let enabled_accounts = enabled_account_ids(&config, channel);
                     let missing_accounts = enabled_accounts
                         .iter()
-                        .filter(|account_id| config.resolve_channel_account_owner(channel, account_id).is_none())
+                        .filter(|account_id| {
+                            config
+                                .resolve_channel_account_owner(channel, account_id)
+                                .is_none()
+                        })
                         .cloned()
                         .collect::<Vec<_>>();
                     if enabled_accounts.is_empty() || !missing_accounts.is_empty() {
                         let detail = if missing_accounts.is_empty() {
                             "enabled channel must be bound in channelOwners.<channel> or covered by channelAccountOwners".to_string()
                         } else {
-                            format!("missing account owners for: {}", missing_accounts.join(", "))
+                            format!(
+                                "missing account owners for: {}",
+                                missing_accounts.join(", ")
+                            )
                         };
-                        print_err(
-                            &format!("{} owner binding missing", channel),
-                            &detail,
-                        );
+                        print_err(&format!("{} owner binding missing", channel), &detail);
                         err_count += 1;
                     } else {
                         print_ok(

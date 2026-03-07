@@ -298,9 +298,7 @@ impl ToolRegistry {
             .tools
             .iter()
             .filter(|(name, _)| names.contains(&name.as_str()))
-            .filter_map(|(name, tool)| {
-                tool.prompt_rule(ctx).map(|rule| (name.clone(), rule))
-            })
+            .filter_map(|(name, tool)| tool.prompt_rule(ctx).map(|rule| (name.clone(), rule)))
             .collect();
         rules.sort_by(|a, b| a.0.cmp(&b.0));
         rules.into_iter().map(|(_, rule)| rule).collect()
@@ -358,7 +356,7 @@ mod tests {
         assert!(names.contains(&"exec".to_string()));
         assert!(names.contains(&"web_search".to_string()));
         assert!(names.contains(&"browse".to_string()));
-        assert!(names.contains(&"blockchain_rpc".to_string()));
+        assert!(names.contains(&"http_request".to_string()));
         assert!(names.contains(&"toggle_manage".to_string()));
     }
 

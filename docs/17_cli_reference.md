@@ -194,6 +194,38 @@ blockcell gateway --port 8080 --host 127.0.0.1
 
 ---
 
+## mcp — 管理 MCP 服务器
+
+```
+blockcell mcp <SUBCOMMAND>
+```
+
+用于管理独立的 MCP 配置文件：`~/.blockcell/mcp.json` 与 `~/.blockcell/mcp.d/*.json`。
+
+| 子命令 | 说明 |
+|------|------|
+| `list` | 列出全部 MCP server |
+| `show <NAME>` | 查看某个 MCP server 的合并后配置 |
+| `add <TEMPLATE>` | 从模板添加 MCP server，如 `github`、`sqlite`、`filesystem`、`postgres`、`puppeteer` |
+| `add <NAME> --raw ...` | 直接按底层 `command/args/env/cwd` 写入配置 |
+| `enable <NAME>` | 启用某个 MCP server |
+| `disable <NAME>` | 禁用某个 MCP server |
+| `remove <NAME>` | 删除某个 MCP server 配置 |
+| `edit [NAME]` | 打开 `mcp.json` 或某个 `mcp.d/<name>.json` |
+
+**示例：**
+```bash
+blockcell mcp list
+blockcell mcp add github
+blockcell mcp add sqlite --db-path /tmp/notes.db
+blockcell mcp add custom --raw --name custom --command uvx --arg my-mcp-server
+blockcell mcp disable github
+```
+
+**说明：** MCP 配置变更默认在重启 `blockcell agent` 或 `blockcell gateway` 后生效。
+
+---
+
 ## status — 查看状态
 
 ```

@@ -1,382 +1,193 @@
-# 第19篇：MCP Server 集成 —— 让 blockcell 接入任意外部工具
+# 第19篇：MCP Server 集成 —— blockcell 的独立 MCP 子系统
 
 > 系列文章：《blockcell 开源项目深度解析》第 19 篇
 
----
-
 ## MCP 是什么
 
-**MCP（Model Context Protocol）** 是由 Anthropic 主导推出的开放协议，目标是让 AI 助手能够以标准化方式调用外部工具和数据源。
+**MCP（Model Context Protocol）** 是让 AI 助手按统一协议发现并调用外部工具/数据源的标准接口。
 
-可以把它理解为 AI 世界的 **"USB 接口"**：
+在 blockcell 里，MCP 适合承载：
 
-- 工具提供方（MCP Server）：按协议暴露工具
-- AI 客户端（MCP Client）：按协议发现并调用这些工具
-- 两端只要遵守同一套协议，就能即插即用
+- GitHub / GitLab 等平台集成
+- SQLite / PostgreSQL / MySQL 等数据库访问
+- Filesystem、Puppeteer 等外部工具集
+- 任何遵循 MCP 协议的自定义 server
 
-目前 MCP Server 生态已经相当丰富，官方和社区维护了大量现成的服务器：GitHub、SQLite、PostgreSQL、Filesystem、Slack、Google Drive、Puppeteer 浏览器自动化……
+## 当前架构
 
----
+现在的 blockcell 不再把 MCP 配置塞进 `config.json` 的 `mcpServers` 字段，而是改成**独立 MCP 配置层**：
 
-## blockcell 如何集成 MCP
+- `~/.blockcell/mcp.json`：全局 MCP 元配置
+- `~/.blockcell/mcp.d/*.json`：按 server 拆分的独立文件
 
-blockcell 内置了 `McpClient`，通过 **stdio 模式**与 MCP Server 通信：
+同时，MCP 与多 agent 的关系也更清晰：
 
-```
-blockcell 进程
-    ├── 启动子进程（MCP Server）
-    │       stdin ← JSON-RPC 请求（换行分隔）
-    │       stdout → JSON-RPC 响应（换行分隔）
-    ├── 握手：initialize + notifications/initialized
-    ├── 获取工具列表：tools/list
-    └── 调用工具：tools/call
-```
-
-MCP Server 的每个工具会被注册为 blockcell 内置工具，工具名格式为：
-
-```
-<服务器名>__<工具名>
-```
-
-例如配置了名为 `sqlite` 的 MCP Server，其 `query` 工具在 blockcell 里就叫 `sqlite__query`。
-
----
+- **MCP 独立**：server 定义属于基础设施层
+- **agent 绑定权限视图**：agent 只声明允许访问哪些 MCP servers/tools
+- **运行时共享**：同一进程内，MCP server 由共享管理器统一启动与复用
 
 ## 快速开始
 
-### 第一步：安装 MCP Server
-
-MCP Server 通常通过 `npx`（Node.js）或 `uvx`（Python）启动，无需单独安装：
+### 方式一：CLI 快捷添加（推荐）
 
 ```bash
-# 测试能否正常启动（Ctrl+C 退出）
-uvx mcp-server-sqlite --db-path /tmp/test.db
+# 添加 GitHub MCP
+blockcell mcp add github
+
+# 添加 SQLite MCP
+blockcell mcp add sqlite --db-path /tmp/test.db
+
+# 查看当前 MCP 配置
+blockcell mcp list
 ```
 
-或者 GitHub 工具：
+### 方式二：直接编辑文件
 
-```bash
-npx -y @modelcontextprotocol/server-github
-```
-
-### 第二步：编辑 config.json
-
-打开 `~/.blockcell/config.json`，添加 `mcpServers` 字段：
+例如创建 `~/.blockcell/mcp.d/github.json`：
 
 ```json
 {
-  "agents": { ... },
-  "providers": { ... },
-
-  "mcpServers": {
-    "sqlite": {
-      "command": "uvx",
-      "args": ["mcp-server-sqlite", "--db-path", "/tmp/mydata.db"]
-    },
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_xxxxxxxxxxxx"
-      }
-    }
-  }
-}
-```
-
-### 第三步：启动 blockcell
-
-```bash
-blockcell agent
-```
-
-启动时你会在日志中看到：
-
-```
-INFO Starting MCP server server=sqlite command=uvx
-INFO MCP server mounted successfully server=sqlite
-INFO Starting MCP server server=github command=npx
-INFO MCP server mounted successfully server=github
-```
-
-MCP 工具已经自动加入工具列表，Agent 可以直接调用。
-
----
-
-## 配置字段说明
-
-```json
-"mcpServers": {
-  "<服务器名>": {
-    "command": "启动命令（必填）",
-    "args": ["命令行参数列表（可选）"],
-    "env": {
-      "环境变量名": "环境变量值"
-    },
-    "cwd": "子进程工作目录（可选）",
-    "enabled": true
-  }
-}
-```
-
-| 字段 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `command` | string | — | 要执行的命令，如 `npx`、`uvx`、`python` |
-| `args` | array | `[]` | 命令行参数 |
-| `env` | object | `{}` | 追加到子进程的环境变量 |
-| `cwd` | string | null | 子进程的工作目录，不填则继承父进程 |
-| `enabled` | bool | `true` | 设为 `false` 可临时禁用而不删除配置 |
-
----
-
-## 常用 MCP Server 配置示例
-
-### SQLite 数据库
-
-适合本地数据查询、日志分析、简单数据管理。
-
-```json
-"sqlite": {
-  "command": "uvx",
-  "args": ["mcp-server-sqlite", "--db-path", "/Users/yourname/data/notes.db"]
-}
-```
-
-配置后，对 Agent 说：
-> "帮我查一下 notes 数据库里最近 10 条记录"
-
-### GitHub
-
-读取仓库信息、Issues、PR、文件内容。
-
-```json
-"github": {
+  "name": "github",
   "command": "npx",
   "args": ["-y", "@modelcontextprotocol/server-github"],
   "env": {
-    "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_xxxxxxxxxxxx"
-  }
+    "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_PERSONAL_ACCESS_TOKEN}"
+  },
+  "enabled": true,
+  "autoStart": true
 }
 ```
 
-配置后，对 Agent 说：
-> "帮我列出 blockcell-labs/blockcell 最近 5 个 open Issue"
-
-### 文件系统（扩展访问范围）
-
-允许 Agent 通过 MCP 协议访问指定目录（可作为内置 `read_file` 的补充）。
+或者创建 `~/.blockcell/mcp.d/sqlite.json`：
 
 ```json
-"filesystem": {
-  "command": "npx",
-  "args": [
-    "-y",
-    "@modelcontextprotocol/server-filesystem",
-    "/Users/yourname/Documents",
-    "/Users/yourname/Projects"
-  ]
-}
-```
-
-### Puppeteer 浏览器自动化
-
-使用 Node.js 驱动 Chrome，适合需要 JavaScript 渲染的页面。
-
-```json
-"puppeteer": {
-  "command": "npx",
-  "args": ["-y", "@modelcontextprotocol/server-puppeteer"]
-}
-```
-
-### PostgreSQL
-
-连接生产数据库，执行查询。
-
-```json
-"postgres": {
-  "command": "npx",
-  "args": [
-    "-y",
-    "@modelcontextprotocol/server-postgres",
-    "postgresql://user:password@localhost:5432/mydb"
-  ]
-}
-```
-
----
-
-## 临时禁用某个服务器
-
-不想删除配置，只想暂停某个 MCP Server：
-
-```json
-"sqlite": {
+{
+  "name": "sqlite",
   "command": "uvx",
   "args": ["mcp-server-sqlite", "--db-path", "/tmp/test.db"],
-  "enabled": false
+  "enabled": true,
+  "autoStart": true
 }
 ```
 
----
+修改后重启：
+
+```bash
+blockcell agent
+# 或
+blockcell gateway
+```
+
+## 配置字段
+
+每个 `mcp.d/<name>.json` 支持如下字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `name` | string | server 逻辑名称，也是工具名前缀 |
+| `command` | string | 启动命令，如 `npx`、`uvx` |
+| `args` | array | 启动参数 |
+| `env` | object | 额外环境变量 |
+| `cwd` | string/null | 工作目录 |
+| `enabled` | bool | 是否启用 |
+| `autoStart` | bool | 启动 blockcell 时是否自动启动 |
+| `startupTimeoutSecs` | integer | 启动/握手超时 |
+| `callTimeoutSecs` | integer | 工具调用超时 |
 
 ## 工具命名规则
 
-MCP 工具在 blockcell 内的名称格式为 `<服务器名>__<工具名>`（双下划线分隔）。
+MCP 工具在 blockcell 内统一命名为：
+
+```text
+<serverName>__<toolName>
+```
 
 例如：
 
-| 服务器名 | MCP 原始工具名 | blockcell 工具名 |
-|----------|---------------|-----------------|
-| `sqlite` | `query` | `sqlite__query` |
-| `sqlite` | `list_tables` | `sqlite__list_tables` |
-| `github` | `list_issues` | `github__list_issues` |
-| `github` | `get_file_contents` | `github__get_file_contents` |
+- `github__list_issues`
+- `sqlite__query`
+- `filesystem__read_file`
 
-Agent 会自动使用正确的工具名，你不需要手动记忆，直接用自然语言描述需求即可。
+## 与多 agent 的关系
 
----
+这是这次重构里最重要的边界：
+
+- **MCP 不是 agent 自有配置**
+- **agent 只是绑定 MCP 权限视图**
+
+这意味着：
+
+- MCP server 定义是全局的
+- agent 通过 `allowedMcpServers` / `allowedMcpTools` 控制可见性
+- subagent 默认不自动继承 MCP
+
+## CLI 管理命令
+
+```bash
+blockcell mcp list
+blockcell mcp show github
+blockcell mcp add github
+blockcell mcp add sqlite --db-path /tmp/app.db
+blockcell mcp add custom --raw --name custom --command uvx --arg my-mcp-server
+blockcell mcp enable github
+blockcell mcp disable github
+blockcell mcp remove github
+blockcell mcp edit github
+```
 
 ## 工作原理
 
-blockcell 在启动时（`mount_mcp_servers`）依次：
+blockcell 内部通过共享 `McpManager` 管理 MCP：
 
-1. **启动子进程** — `tokio::process::Command` 启动 MCP Server，捕获 stdin/stdout
-2. **握手** — 发送 `initialize` 请求（协议版本 `2024-11-05`），收到响应后发送 `notifications/initialized`
-3. **发现工具** — 发送 `tools/list`，解析返回的工具列表（名称、描述、inputSchema）
-4. **注册工具** — 每个 MCP 工具封装为 `McpToolWrapper`（实现 `Tool` trait），注册进 `ToolRegistry`
-5. **运行时调用** — Agent 调用工具时，`McpToolWrapper.execute()` 发送 `tools/call` 给子进程
-
-整个通信是全异步的，多个 MCP Server 并行运行互不干扰。
-
-```
-                    ┌──────────────────────────────┐
-                    │         blockcell             │
-                    │                               │
-  用户消息 ──→  LLM │─→ 决定调用 sqlite__query      │
-                    │         │                     │
-                    │   ToolRegistry.execute()       │
-                    │         │                     │
-                    │   McpToolWrapper              │
-                    │         │ tools/call (JSON-RPC)│
-                    └─────────┼────────────────────┘
-                              │ stdin
-                    ┌─────────▼────────────────────┐
-                    │    MCP Server (子进程)         │
-                    │    uvx mcp-server-sqlite       │
-                    └──────────────────────────────┘
-                              │ stdout (结果)
-                    ┌─────────▼────────────────────┐
-                    │    返回结果给 LLM              │
-                    │    LLM 生成最终回答            │
-                    └──────────────────────────────┘
-```
-
----
-
-## 与内置工具的区别
-
-| 维度 | 内置工具 | MCP 工具 |
-|------|---------|---------|
-| 实现语言 | Rust（编译进二进制） | 任意语言（独立进程） |
-| 启动方式 | 无需额外启动 | 需要配置并启动子进程 |
-| 性能 | 极低延迟 | 有进程间通信开销（通常 <10ms） |
-| 生态 | blockcell 内置 50+ | 社区持续增长，已有数百个 |
-| 扩展方式 | 修改 Rust 代码 | 配置 `mcpServers` 即可 |
-
-**建议**：核心高频操作（读写文件、执行命令、网络请求）用内置工具；特定服务集成（GitHub、数据库、第三方平台）用 MCP。
-
----
-
-## 自定义 MCP Server
-
-如果现有 Server 不满足需求，可以自己实现一个。以 Python 为例：
-
-```python
-# my_server.py
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
-import mcp.types as types
-
-app = Server("my-tools")
-
-@app.list_tools()
-async def list_tools() -> list[Tool]:
-    return [
-        Tool(
-            name="hello",
-            description="向指定名字打招呼",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "名字"}
-                },
-                "required": ["name"]
-            }
-        )
-    ]
-
-@app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    if name == "hello":
-        return [TextContent(type="text", text=f"你好，{arguments['name']}！")]
-    raise ValueError(f"Unknown tool: {name}")
-
-async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
-```
-
-然后在 config.json 中配置：
-
-```json
-"my-tools": {
-  "command": "python",
-  "args": ["/path/to/my_server.py"]
-}
-```
-
-配置后对 Agent 说：
-> "用 my-tools 的 hello 工具，传入名字：世界"
-
----
+1. 读取 `mcp.json` 与 `mcp.d/*.json`
+2. 合并为运行时 `McpResolvedConfig`
+3. 自动启动 `enabled && autoStart` 的 server
+4. 获取 `tools/list`
+5. 根据 agent 的 MCP 权限视图，将可见工具注入该 agent 的 `ToolRegistry`
+6. 真正执行时，通过 `tools/call` 转发给目标 MCP server
 
 ## 故障排查
 
-### MCP Server 启动失败
+### 1. `blockcell mcp list` 看不到新 server
 
-查看 blockcell 日志：
+确认文件是否写到了：
 
-```
-ERROR Failed to start MCP server server=sqlite error=...
-```
+- `~/.blockcell/mcp.json`
+- `~/.blockcell/mcp.d/<name>.json`
 
-常见原因：
-- `uvx`/`npx` 未安装 → 安装 Python/Node.js
-- 包名拼写错误 → 先手动在终端测试命令
-- 权限问题 → 检查 `cwd` 和文件权限
+并检查 JSON 是否合法。
 
-### 工具未出现在列表中
+### 2. 配置已写入但工具列表里没有 MCP 工具
+
+MCP 变更默认需要重启后生效：
 
 ```bash
-# 确认 MCP Server 返回了工具
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | uvx mcp-server-sqlite --db-path /tmp/test.db
+blockcell agent
+# 或
+blockcell gateway
 ```
 
-### 工具调用返回错误
+### 3. server 启动失败
 
-MCP Server 返回 `isError: true` 时，blockcell 会将错误信息透传给 Agent，Agent 会自动尝试修正参数后重试。
+先单独手工验证命令：
 
----
+```bash
+uvx mcp-server-sqlite --db-path /tmp/test.db
+npx -y @modelcontextprotocol/server-github
+```
 
-## 相关文档
+### 4. agent 看不到某个 MCP 工具
 
-- [工具系统](./03_tools_system.md) — blockcell 内置工具总览
-- [架构深度解析](./12_architecture.md) — crate 结构与设计模式
-- [MCP 官方规范](https://spec.modelcontextprotocol.io) — 协议详细文档
-- [MCP Server 生态列表](https://github.com/modelcontextprotocol/servers) — 官方维护的 Server 列表
+检查该 agent 的：
+
+- `allowedMcpServers`
+- `allowedMcpTools`
+
+若未授权，工具不会进入该 agent 的可见 registry。
+
+## 建议
+
+- 高频、底层、平台无关能力继续做成内置工具
+- 第三方平台/数据库/专业系统接入优先走 MCP
+- 新手优先用 `blockcell mcp add <template>`
+- 复杂场景再直接编辑 `mcp.d/*.json`

@@ -22,8 +22,10 @@ use blockcell_providers::{Provider, ProviderPool};
 use blockcell_scheduler::CronService;
 use blockcell_skills::{is_builtin_tool, new_registry_handle, CoreEvolution};
 use blockcell_storage::MemoryStore;
+use blockcell_tools::mcp::manager::McpManager;
 use blockcell_tools::{
-    CapabilityRegistryHandle, CoreEvolutionHandle, MemoryStoreHandle, ToolRegistry,
+    build_tool_registry_for_agent_config, CapabilityRegistryHandle, CoreEvolutionHandle,
+    MemoryStoreHandle,
 };
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
@@ -101,10 +103,7 @@ const BUILTIN_TOOLS: &[(&str, &[(&str, &str)])] = &[
             ("message", "Channel messaging (Telegram/Slack/Discord)"),
         ],
     ),
-    (
-        "📅 Business Integration",
-        &[],
-    ),
+    ("📅 Business Integration", &[]),
     (
         "💰 Finance",
         &[
@@ -118,10 +117,7 @@ const BUILTIN_TOOLS: &[(&str, &[(&str, &str)])] = &[
             ),
         ],
     ),
-    (
-        "⛓️ Blockchain",
-        &[],
-    ),
+    ("⛓️ Blockchain", &[]),
     (
         "🔒 Security & Network",
         &[
@@ -278,6 +274,7 @@ pub async fn run(
     let paths = resolved.paths;
     paths.ensure_dirs()?;
     let mut config = resolved.config;
+    let mcp_manager = Arc::new(McpManager::load(&root_paths).await?);
     let provider_pool = build_pool_with_overrides(&mut config, model, provider)?;
 
     // Ensure builtin skills are extracted to workspace/skills/ (silent, skips existing)
@@ -341,14 +338,14 @@ pub async fn run(
 
     if let Some(msg) = message {
         // Single message mode — no need for CronService
-        let tool_registry = ToolRegistry::with_defaults();
+        let tool_registry =
+            build_tool_registry_for_agent_config(&config, Some(&mcp_manager)).await?;
         let mut runtime = AgentRuntime::new(
             config.clone(),
             paths.clone(),
             Arc::clone(&provider_pool),
             tool_registry,
         )?;
-        runtime.mount_mcp_servers().await;
         runtime.validate_intent_router()?;
         runtime.set_agent_id(Some(agent_id.clone()));
         runtime.set_task_manager(TaskManager::new());
@@ -482,14 +479,14 @@ pub async fn run(
         }
 
         // Create agent runtime with outbound channel (consumes config)
-        let tool_registry = ToolRegistry::with_defaults();
+        let tool_registry =
+            build_tool_registry_for_agent_config(&config, Some(&mcp_manager)).await?;
         let mut runtime = AgentRuntime::new(
             config.clone(),
             paths.clone(),
             Arc::clone(&provider_pool),
             tool_registry,
         )?;
-        runtime.mount_mcp_servers().await;
         runtime.validate_intent_router()?;
 
         // 如果配置了独立的 evolution_model 或 evolution_provider，创建独立的 evolution provider
@@ -1310,7 +1307,6 @@ fn format_timestamp(ts: i64) -> String {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1327,7 +1323,10 @@ mod tests {
 
         assert_eq!(resolved.agent_id, "default");
         assert_eq!(resolved.session, "cli:default");
-        assert_eq!(resolved.paths.workspace(), PathBuf::from("/tmp/blockcell/workspace"));
+        assert_eq!(
+            resolved.paths.workspace(),
+            PathBuf::from("/tmp/blockcell/workspace")
+        );
     }
 
     #[test]
@@ -1347,8 +1346,14 @@ mod tests {
 
         assert_eq!(resolved.agent_id, "ops");
         assert_eq!(resolved.session, "cli:ops");
-        assert_eq!(resolved.paths.workspace(), PathBuf::from("/tmp/blockcell/agents/ops/workspace"));
-        assert_eq!(resolved.config.agents.defaults.provider.as_deref(), Some("deepseek"));
+        assert_eq!(
+            resolved.paths.workspace(),
+            PathBuf::from("/tmp/blockcell/agents/ops/workspace")
+        );
+        assert_eq!(
+            resolved.config.agents.defaults.provider.as_deref(),
+            Some("deepseek")
+        );
         assert_eq!(resolved.config.agents.defaults.model, "deepseek-chat");
     }
 

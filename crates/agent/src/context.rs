@@ -288,7 +288,7 @@ impl ContextBuilder {
                 }
             }
             if tool_prompt_rules.is_empty() {
-                prompt.push_str("- **MCP (Model Context Protocol)**: blockcell **已内置 MCP 客户端支持**，可连接任意 MCP 服务器（SQLite、GitHub、文件系统、数据库等）。MCP 工具会以 `<serverName>__<toolName>` 格式出现在工具列表中。若用户询问 MCP 功能或当前工具列表中无 MCP 工具，说明尚未配置 MCP 服务器，请引导用户在 `~/.blockcell/config.json` 的 `mcpServers` 字段中添加配置，示例：`{\"mcpServers\": {\"sqlite\": {\"command\": \"uvx\", \"args\": [\"mcp-server-sqlite\", \"--db-path\", \"/tmp/test.db\"]}}}`，重启后即可使用。\n");
+                prompt.push_str("- **MCP (Model Context Protocol)**: blockcell **已内置 MCP 客户端支持**，可连接任意 MCP 服务器（SQLite、GitHub、文件系统、数据库等）。MCP 工具会以 `<serverName>__<toolName>` 格式出现在工具列表中。若用户询问 MCP 功能或当前工具列表中无 MCP 工具，说明尚未配置 MCP 服务器，请引导用户使用 `blockcell mcp add <template>` 快捷添加，或直接编辑 `~/.blockcell/mcp.json` / `~/.blockcell/mcp.d/*.json`。例如：`blockcell mcp add sqlite --db-path /tmp/test.db`，重启后即可使用。\n");
             }
             prompt.push('\n');
         }

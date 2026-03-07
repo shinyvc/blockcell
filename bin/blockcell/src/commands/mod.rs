@@ -10,6 +10,7 @@ pub mod evolve;
 pub mod gateway;
 pub mod knowledge_cmd;
 pub mod logs_cmd;
+pub mod mcp;
 pub mod memory;
 pub mod onboard;
 pub mod provider;

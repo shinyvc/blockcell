@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use blockcell_core::{Config, Paths};
-use blockcell_tools::ToolRegistry;
+use blockcell_tools::build_tool_registry_for_agent_config;
+use blockcell_tools::mcp::manager::McpManager;
 use serde_json::Value;
 
 #[derive(Debug)]
@@ -44,10 +47,12 @@ fn resolve_tool_context(
 
 /// Run a direct tool call, bypassing the LLM.
 pub async fn tool(tool_name: &str, params_json: &str, agent: Option<&str>) -> anyhow::Result<()> {
-    let registry = ToolRegistry::with_defaults();
     let root_paths = Paths::new();
     let root_config = Config::load_or_default(&root_paths)?;
     let resolved = resolve_tool_context(&root_config, &root_paths, agent)?;
+    let mcp_manager = Arc::new(McpManager::load(&root_paths).await?);
+    let registry =
+        build_tool_registry_for_agent_config(&resolved.config, Some(&mcp_manager)).await?;
     let _agent_id = resolved.agent_id.clone();
     let session_key = resolved.session_key;
     let config = resolved.config;
@@ -109,7 +114,6 @@ pub async fn message(msg: &str, session: &str, agent: Option<&str>) -> anyhow::R
     .await
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,7 +130,10 @@ mod tests {
 
         assert_eq!(resolved.agent_id, "default");
         assert_eq!(resolved.session_key, "cli:run");
-        assert_eq!(resolved.paths.workspace(), PathBuf::from("/tmp/blockcell/workspace"));
+        assert_eq!(
+            resolved.paths.workspace(),
+            PathBuf::from("/tmp/blockcell/workspace")
+        );
     }
 
     #[test]
@@ -146,8 +153,14 @@ mod tests {
 
         assert_eq!(resolved.agent_id, "ops");
         assert_eq!(resolved.session_key, "cli:run:ops");
-        assert_eq!(resolved.paths.workspace(), PathBuf::from("/tmp/blockcell/agents/ops/workspace"));
-        assert_eq!(resolved.config.agents.defaults.provider.as_deref(), Some("deepseek"));
+        assert_eq!(
+            resolved.paths.workspace(),
+            PathBuf::from("/tmp/blockcell/agents/ops/workspace")
+        );
+        assert_eq!(
+            resolved.config.agents.defaults.provider.as_deref(),
+            Some("deepseek")
+        );
     }
 
     #[test]

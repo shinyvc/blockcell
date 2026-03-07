@@ -1,7 +1,10 @@
 use blockcell_agent::intent::IntentToolResolver;
 use blockcell_channels::account::{channel_configured, listener_labels};
 use blockcell_core::{Config, Paths};
-use blockcell_tools::ToolRegistry;
+use std::sync::Arc;
+
+use blockcell_tools::build_tool_registry_with_all_mcp;
+use blockcell_tools::mcp::manager::McpManager;
 
 fn agent_owner_bindings(config: &Config, agent_id: &str) -> Vec<String> {
     let mut owners: Vec<String> = config
@@ -11,11 +14,16 @@ fn agent_owner_bindings(config: &Config, agent_id: &str) -> Vec<String> {
         .map(|(channel, _)| channel.clone())
         .collect();
 
-    owners.extend(config.channel_account_owners.iter().flat_map(|(channel, bindings)| {
-        bindings.iter().filter_map(move |(account_id, owner)| {
-            (owner.trim() == agent_id).then(|| format!("{}:{}", channel, account_id))
-        })
-    }));
+    owners.extend(
+        config
+            .channel_account_owners
+            .iter()
+            .flat_map(|(channel, bindings)| {
+                bindings.iter().filter_map(move |(account_id, owner)| {
+                    (owner.trim() == agent_id).then(|| format!("{}:{}", channel, account_id))
+                })
+            }),
+    );
 
     owners.sort();
     owners
@@ -180,9 +188,11 @@ pub async fn run() -> anyhow::Result<()> {
                 println!("  agent {} -> {}", agent.id, profile);
             }
 
-            let registry = ToolRegistry::with_defaults();
-            match IntentToolResolver::new(&config).validate(&registry) {
-                Ok(_) => println!("  validate:  ✓ builtin tools ok"),
+            let mcp_manager = Arc::new(McpManager::load(&paths).await?);
+            let registry = build_tool_registry_with_all_mcp(Some(&mcp_manager)).await?;
+            let mcp = blockcell_core::mcp_config::McpResolvedConfig::load_merged(&paths)?;
+            match IntentToolResolver::new(&config).validate_with_mcp(&registry, Some(&mcp)) {
+                Ok(_) => println!("  validate:  ✓ tools and MCP config ok"),
                 Err(err) => println!("  validate:  ✗ {}", err),
             }
         }
@@ -230,7 +240,9 @@ pub async fn run() -> anyhow::Result<()> {
         let account_suffix = channel_account_owner_suffix(&config, channel);
         match config.resolve_channel_owner(channel) {
             Some(owner) => format!(" (owner: {}{})", owner, account_suffix),
-            None if !account_suffix.is_empty() => format!(" ({} )", account_suffix.trim_start_matches(';').trim()),
+            None if !account_suffix.is_empty() => {
+                format!(" ({} )", account_suffix.trim_start_matches(';').trim())
+            }
             None => " ⚠ owner not set".to_string(),
         }
     };

@@ -25,7 +25,9 @@ use blockcell_scheduler::{
 use blockcell_skills::{new_registry_handle, CoreEvolution};
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig};
 use blockcell_storage::{MemoryStore, SessionStore};
+use blockcell_tools::mcp::manager::McpManager;
 use blockcell_tools::{
+    build_tool_registry_for_agent_config, build_tool_registry_with_all_mcp,
     CapabilityRegistryHandle, CoreEvolutionHandle, MemoryStoreHandle, ToolRegistry,
 };
 use std::collections::HashMap;
@@ -265,14 +267,62 @@ const EXTERNAL_CHANNELS: [&str; 8] = [
 
 fn known_channel_account_ids(config: &Config, channel: &str) -> Vec<String> {
     let mut ids = match channel {
-        "telegram" => config.channels.telegram.accounts.keys().cloned().collect::<Vec<_>>(),
-        "whatsapp" => config.channels.whatsapp.accounts.keys().cloned().collect::<Vec<_>>(),
-        "feishu" => config.channels.feishu.accounts.keys().cloned().collect::<Vec<_>>(),
-        "slack" => config.channels.slack.accounts.keys().cloned().collect::<Vec<_>>(),
-        "discord" => config.channels.discord.accounts.keys().cloned().collect::<Vec<_>>(),
-        "dingtalk" => config.channels.dingtalk.accounts.keys().cloned().collect::<Vec<_>>(),
-        "wecom" => config.channels.wecom.accounts.keys().cloned().collect::<Vec<_>>(),
-        "lark" => config.channels.lark.accounts.keys().cloned().collect::<Vec<_>>(),
+        "telegram" => config
+            .channels
+            .telegram
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "whatsapp" => config
+            .channels
+            .whatsapp
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "feishu" => config
+            .channels
+            .feishu
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "slack" => config
+            .channels
+            .slack
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "discord" => config
+            .channels
+            .discord
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "dingtalk" => config
+            .channels
+            .dingtalk
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "wecom" => config
+            .channels
+            .wecom
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        "lark" => config
+            .channels
+            .lark
+            .accounts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
         _ => Vec::new(),
     };
     ids.sort();
@@ -548,6 +598,7 @@ fn open_agent_memory_store(paths: &Paths) -> Option<MemoryStoreHandle> {
 async fn spawn_agent_runtime(
     config: &Config,
     paths: &Paths,
+    mcp_manager: Arc<McpManager>,
     agent_id: &str,
     outbound_tx: mpsc::Sender<OutboundMessage>,
     confirm_tx: mpsc::Sender<ConfirmRequest>,
@@ -598,13 +649,14 @@ async fn spawn_agent_runtime(
     let core_evo_adapter = CoreEvolutionAdapter::new(core_evo_raw.clone());
     let core_evo_handle: CoreEvolutionHandle = Arc::new(Mutex::new(core_evo_adapter));
 
+    let tool_registry =
+        build_tool_registry_for_agent_config(&agent_config, Some(&mcp_manager)).await?;
     let mut runtime = AgentRuntime::new(
         agent_config.clone(),
         agent_paths.clone(),
         Arc::clone(&provider_pool),
-        ToolRegistry::with_defaults(),
+        tool_registry,
     )?;
-    runtime.mount_mcp_servers().await;
     runtime.validate_intent_router()?;
 
     if agent_config.agents.defaults.evolution_model.is_some()
@@ -823,9 +875,11 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
 
     // ── Create shared task manager ──
     let task_manager = TaskManager::new();
+    let mcp_manager = Arc::new(McpManager::load(&paths).await?);
 
     // ── Create tool registry (shared for listing tools) ──
-    let tool_registry_shared = Arc::new(ToolRegistry::with_defaults());
+    let tool_registry_shared =
+        Arc::new(build_tool_registry_with_all_mcp(Some(&mcp_manager)).await?);
 
     // ── Set up path confirmation channel (channel-aware) ──
     // pending_ws_confirms: keyed by request_id, for WebUI (ws) confirmations
@@ -910,6 +964,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         let (agent_tx, agent_handle, memory_store_handle) = spawn_agent_runtime(
             &config,
             &paths,
+            Arc::clone(&mcp_manager),
             &agent_id,
             outbound_tx.clone(),
             confirm_tx.clone(),
@@ -1614,11 +1669,14 @@ mod tests {
                 proxy: None,
             },
         );
-        config.agents.list.push(blockcell_core::config::AgentProfileConfig {
-            id: "ops".to_string(),
-            enabled: true,
-            ..Default::default()
-        });
+        config
+            .agents
+            .list
+            .push(blockcell_core::config::AgentProfileConfig {
+                id: "ops".to_string(),
+                enabled: true,
+                ..Default::default()
+            });
         config.channel_account_owners.insert(
             "telegram".to_string(),
             std::collections::HashMap::from([
@@ -1632,7 +1690,8 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_channel_owner_bindings_requires_complete_account_owner_coverage_without_fallback() {
+    fn test_validate_channel_owner_bindings_requires_complete_account_owner_coverage_without_fallback(
+    ) {
         let mut config = Config::default();
         config.channels.telegram.enabled = true;
         config.channels.telegram.accounts.insert(
@@ -1661,7 +1720,8 @@ mod tests {
         let err = validate_channel_owner_bindings(&config)
             .expect_err("missing account owner coverage should fail without fallback owner");
         assert!(
-            err.to_string().contains("missing owner binding for enabled account 'bot2'"),
+            err.to_string()
+                .contains("missing owner binding for enabled account 'bot2'"),
             "unexpected error: {}",
             err
         );
@@ -1682,16 +1742,14 @@ mod tests {
         );
         config.channel_account_owners.insert(
             "telegram".to_string(),
-            std::collections::HashMap::from([(
-                "bot1".to_string(),
-                "ghost-agent".to_string(),
-            )]),
+            std::collections::HashMap::from([("bot1".to_string(), "ghost-agent".to_string())]),
         );
 
-        let err = validate_channel_owner_bindings(&config)
-            .expect_err("account owner agent must exist");
+        let err =
+            validate_channel_owner_bindings(&config).expect_err("account owner agent must exist");
         assert!(
-            err.to_string().contains("account owner 'ghost-agent' does not exist"),
+            err.to_string()
+                .contains("account owner 'ghost-agent' does not exist"),
             "unexpected error: {}",
             err
         );
@@ -1734,12 +1792,17 @@ mod tests {
                 proxy: None,
             },
         );
-        config.channel_owners.insert("telegram".to_string(), "default".to_string());
-        config.agents.list.push(blockcell_core::config::AgentProfileConfig {
-            id: "ops".to_string(),
-            enabled: true,
-            ..Default::default()
-        });
+        config
+            .channel_owners
+            .insert("telegram".to_string(), "default".to_string());
+        config
+            .agents
+            .list
+            .push(blockcell_core::config::AgentProfileConfig {
+                id: "ops".to_string(),
+                enabled: true,
+                ..Default::default()
+            });
         config.channel_account_owners.insert(
             "telegram".to_string(),
             std::collections::HashMap::from([("bot2".to_string(), "ops".to_string())]),
@@ -1789,6 +1852,8 @@ mod tests {
                 max_context_tokens: None,
                 evolution_model: None,
                 evolution_provider: None,
+                allowed_mcp_servers: None,
+                allowed_mcp_tools: None,
             });
 
         let msg = InboundMessage {

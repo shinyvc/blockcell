@@ -127,6 +127,12 @@ pub struct AgentDefaults {
     /// 若留空，则沿用旧的单 model + provider 配置（向后兼容）。
     #[serde(default)]
     pub model_pool: Vec<ModelEntry>,
+    /// Allowed MCP server names visible to this agent.
+    #[serde(default)]
+    pub allowed_mcp_servers: Vec<String>,
+    /// Allowed MCP tool names visible to this agent.
+    #[serde(default)]
+    pub allowed_mcp_tools: Vec<String>,
 }
 
 fn default_workspace() -> String {
@@ -161,6 +167,10 @@ fn default_max_context_tokens() -> u32 {
     32000
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for AgentDefaults {
     fn default() -> Self {
         Self {
@@ -176,6 +186,8 @@ impl Default for AgentDefaults {
             evolution_model: None,
             evolution_provider: None,
             model_pool: Vec::new(),
+            allowed_mcp_servers: Vec::new(),
+            allowed_mcp_tools: Vec::new(),
         }
     }
 }
@@ -284,6 +296,10 @@ pub struct AgentProfileConfig {
     pub evolution_model: Option<String>,
     #[serde(default)]
     pub evolution_provider: Option<String>,
+    #[serde(default)]
+    pub allowed_mcp_servers: Option<Vec<String>>,
+    #[serde(default)]
+    pub allowed_mcp_tools: Option<Vec<String>>,
 }
 
 fn default_agent_enabled() -> bool {
@@ -308,6 +324,8 @@ impl Default for AgentProfileConfig {
             max_context_tokens: None,
             evolution_model: None,
             evolution_provider: None,
+            allowed_mcp_servers: None,
+            allowed_mcp_tools: None,
         }
     }
 }
@@ -540,9 +558,7 @@ fn default_intent_router_profiles() -> HashMap<String, IntentToolProfileConfig> 
                 ),
                 (
                     "Lifestyle".to_string(),
-                    IntentToolEntryConfig::Tools(vec![
-                        "http_request".to_string(),
-                    ]),
+                    IntentToolEntryConfig::Tools(vec!["http_request".to_string()]),
                 ),
                 (
                     "Unknown".to_string(),
@@ -1100,46 +1116,6 @@ fn default_manifest_url() -> String {
     "https://github.com/blockcell-labs/blockcell/releases/latest/download/manifest.json".to_string()
 }
 
-/// MCP (Model Context Protocol) server configuration.
-/// Each entry describes one external MCP server process to launch at startup.
-///
-/// Example config.json:
-/// ```json
-/// "mcpServers": {
-///   "sqlite": {
-///     "command": "uvx",
-///     "args": ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
-///   },
-///   "github": {
-///     "command": "npx",
-///     "args": ["-y", "@modelcontextprotocol/server-github"],
-///     "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_xxx" }
-///   }
-/// }
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct McpServerConfig {
-    /// Executable to launch (e.g. "npx", "uvx", "python")
-    pub command: String,
-    /// Command-line arguments
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Extra environment variables for the child process
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    /// Working directory for the child process (optional)
-    #[serde(default)]
-    pub cwd: Option<String>,
-    /// Whether this server is enabled (default: true)
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -1170,9 +1146,6 @@ pub struct Config {
     pub intent_router: Option<IntentRouterConfig>,
     #[serde(default)]
     pub auto_upgrade: AutoUpgradeConfig,
-    /// MCP server definitions. Key = server name (used as tool name prefix).
-    #[serde(default)]
-    pub mcp_servers: HashMap<String, McpServerConfig>,
 }
 
 impl Default for Config {
@@ -1305,7 +1278,6 @@ impl Default for Config {
             tools: ToolsConfig::default(),
             intent_router: Some(IntentRouterConfig::default()),
             auto_upgrade: AutoUpgradeConfig::default(),
-            mcp_servers: HashMap::new(),
         }
     }
 }
@@ -1525,6 +1497,12 @@ impl Config {
             {
                 defaults.evolution_provider = Some(evolution_provider);
             }
+            if let Some(allowed_mcp_servers) = &agent.allowed_mcp_servers {
+                defaults.allowed_mcp_servers = allowed_mcp_servers.clone();
+            }
+            if let Some(allowed_mcp_tools) = &agent.allowed_mcp_tools {
+                defaults.allowed_mcp_tools = allowed_mcp_tools.clone();
+            }
         }
 
         Some(ResolvedAgentConfig {
@@ -1669,7 +1647,10 @@ mod tests {
 }"#;
         let cfg: Config = serde_json::from_str(raw).unwrap();
 
-        assert_eq!(cfg.resolve_channel_account_owner("telegram", "bot2"), Some("ops"));
+        assert_eq!(
+            cfg.resolve_channel_account_owner("telegram", "bot2"),
+            Some("ops")
+        );
         assert_eq!(
             cfg.resolve_effective_channel_owner("telegram", Some("bot2")),
             Some("ops")

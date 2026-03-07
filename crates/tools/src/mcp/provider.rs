@@ -70,6 +70,13 @@ impl McpToolProvider {
         }
     }
 
+    pub fn from_shared(server_name: String, client: Arc<McpClient>) -> Self {
+        Self {
+            server_name,
+            client,
+        }
+    }
+
     /// Return all tools from this provider as `Arc<dyn Tool>` instances.
     pub async fn tools(&self) -> Vec<Arc<dyn Tool>> {
         let mcp_tools = self.client.list_tools().await;

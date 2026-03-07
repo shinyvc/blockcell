@@ -723,7 +723,9 @@ impl AgentRuntime {
     }
 
     pub fn validate_intent_router(&self) -> Result<()> {
-        Ok(())
+        let resolver = crate::intent::IntentToolResolver::new(&self.config);
+        let mcp = blockcell_core::mcp_config::McpResolvedConfig::load_merged(&self.paths)?;
+        resolver.validate_with_mcp(&self.tool_registry, Some(&mcp))
     }
 
     /// 设置独立的自进化 LLM provider（可选覆盖，不影响主 pool）
@@ -751,31 +753,8 @@ impl AgentRuntime {
         self.core_evolution = Some(core_evo);
     }
 
-    /// Launch all configured MCP servers and register their tools into the tool registry.
-    /// Call this once after `new()` and before processing messages.
-    pub async fn mount_mcp_servers(&mut self) {
-        use blockcell_tools::mcp::{client::McpClient, provider::McpToolProvider};
-
-        for (name, cfg) in &self.config.mcp_servers {
-            if !cfg.enabled {
-                info!(server = %name, "MCP server disabled, skipping");
-                continue;
-            }
-            info!(server = %name, command = %cfg.command, "Starting MCP server");
-            match McpClient::start(name, &cfg.command, &cfg.args, &cfg.env, cfg.cwd.as_deref())
-                .await
-            {
-                Ok(client) => {
-                    let provider = McpToolProvider::new(name.clone(), client);
-                    self.tool_registry.register_mcp_provider(&provider).await;
-                    info!(server = %name, "MCP server mounted successfully");
-                }
-                Err(e) => {
-                    error!(server = %name, error = %e, "Failed to start MCP server");
-                }
-            }
-        }
-    }
+    /// Deprecated: MCP tools are now injected before runtime construction via the shared MCP manager.
+    pub async fn mount_mcp_servers(&mut self) {}
 
     /// Create a restricted tool registry for subagents (no spawn, no message, no cron).
     pub(crate) fn subagent_tool_registry() -> ToolRegistry {
@@ -1361,10 +1340,12 @@ impl AgentRuntime {
             intents: &mode_names,
         };
         let tool_name_refs: Vec<&str> = tool_names.iter().map(|s| s.as_str()).collect();
-        let mut tool_prompt_rules = self.tool_registry.get_prompt_rules(&tool_name_refs, &prompt_ctx);
+        let mut tool_prompt_rules = self
+            .tool_registry
+            .get_prompt_rules(&tool_name_refs, &prompt_ctx);
         // MCP meta-rule: inject if any loaded tool is an MCP tool (name contains "__")
         if tool_names.iter().any(|t| t.contains("__")) {
-            tool_prompt_rules.push("- **MCP (Model Context Protocol)**: blockcell **已内置 MCP 客户端支持**，可连接任意 MCP 服务器（SQLite、GitHub、文件系统、数据库等）。MCP 工具会以 `<serverName>__<toolName>` 格式出现在工具列表中。若用户询问 MCP 功能或当前工具列表中无 MCP 工具，说明尚未配置 MCP 服务器，请引导用户在 `~/.blockcell/config.json` 的 `mcpServers` 字段中添加配置，示例：`{\"mcpServers\": {\"sqlite\": {\"command\": \"uvx\", \"args\": [\"mcp-server-sqlite\", \"--db-path\", \"/tmp/test.db\"]}}}`，重启后即可使用。".to_string());
+            tool_prompt_rules.push("- **MCP (Model Context Protocol)**: blockcell **已内置 MCP 客户端支持**，可连接任意 MCP 服务器（SQLite、GitHub、文件系统、数据库等）。MCP 工具会以 `<serverName>__<toolName>` 格式出现在工具列表中。若用户询问 MCP 功能或当前工具列表中无 MCP 工具，说明尚未配置 MCP 服务器，请引导用户使用 `blockcell mcp add <template>` 快捷添加，或直接编辑 `~/.blockcell/mcp.json` / `~/.blockcell/mcp.d/*.json`。例如：`blockcell mcp add sqlite --db-path /tmp/test.db`，重启后即可使用。".to_string());
         }
 
         // Build messages for LLM with skill-first mode prompt.
@@ -1375,21 +1356,19 @@ impl AgentRuntime {
             .get("media_pending_intent")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let messages = self
-            .context_builder
-            .build_messages_for_mode_with_channel(
-                &history,
-                &msg.content,
-                &msg.media,
-                mode,
-                active_skill.as_ref(),
-                &disabled_skills,
-                &disabled_tools,
-                &msg.channel,
-                pending_intent,
-                &tool_names,
-                &tool_prompt_rules,
-            );
+        let messages = self.context_builder.build_messages_for_mode_with_channel(
+            &history,
+            &msg.content,
+            &msg.media,
+            mode,
+            active_skill.as_ref(),
+            &disabled_skills,
+            &disabled_tools,
+            &msg.channel,
+            pending_intent,
+            &tool_names,
+            &tool_prompt_rules,
+        );
 
         // Now add user message to history for session persistence
         history.push(ChatMessage::user(&msg.content));
@@ -1400,9 +1379,10 @@ impl AgentRuntime {
             vec![]
         } else {
             let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
-            let mut schemas = self
-                .tool_registry
-                .get_tiered_schemas(&tool_name_refs, blockcell_tools::registry::global_core_tool_names());
+            let mut schemas = self.tool_registry.get_tiered_schemas(
+                &tool_name_refs,
+                blockcell_tools::registry::global_core_tool_names(),
+            );
             if !disabled_tools.is_empty() {
                 schemas.retain(|schema| {
                     let name = schema
@@ -3024,7 +3004,8 @@ impl AgentRuntime {
             &self.task_manager,
             &mut active_chat_tasks,
             &mut active_message_tasks,
-        ).await;
+        )
+        .await;
         info!("AgentRuntime stopped");
     }
 }
@@ -3294,7 +3275,9 @@ mod tests {
 
     #[test]
     fn test_core_tools_contains_toggle_manage() {
-        assert!(global_core_tool_names().iter().any(|name| name == "toggle_manage"));
+        assert!(global_core_tool_names()
+            .iter()
+            .any(|name| name == "toggle_manage"));
     }
 
     #[test]
@@ -3398,12 +3381,25 @@ mod tests {
             fallback_message: None,
         };
 
-        let tool_names = active_tool_names_for_mode(InteractionMode::Skill, Some(&skill), &available);
+        let tool_names = resolve_effective_tool_names(
+            &Config::default(),
+            InteractionMode::Skill,
+            None,
+            Some(&skill),
+            &[IntentCategory::Unknown],
+            &available,
+        );
 
         assert!(tool_names.contains(&"finance_api".to_string()));
         assert!(tool_names.contains(&"memory_query".to_string()));
         assert!(tool_names.contains(&"toggle_manage".to_string()));
-        assert_eq!(tool_names.iter().filter(|name| name.as_str() == "finance_api").count(), 1);
+        assert_eq!(
+            tool_names
+                .iter()
+                .filter(|name| name.as_str() == "finance_api")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -3473,12 +3469,8 @@ mod tests {
             .map(str::to_string)
             .collect();
 
-        let tool_names = resolve_profile_tool_names(
-            &config,
-            None,
-            &[IntentCategory::Chat],
-            &available,
-        );
+        let tool_names =
+            resolve_profile_tool_names(&config, None, &[IntentCategory::Chat], &available);
 
         assert!(tool_names.is_empty());
     }

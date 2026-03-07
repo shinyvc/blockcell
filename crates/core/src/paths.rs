@@ -21,6 +21,18 @@ impl Paths {
         self.base.join("config.json")
     }
 
+    pub fn mcp_config_file(&self) -> PathBuf {
+        self.base.join("mcp.json")
+    }
+
+    pub fn mcp_dir(&self) -> PathBuf {
+        self.base.join("mcp.d")
+    }
+
+    pub fn mcp_state_file(&self) -> PathBuf {
+        self.base.join("mcp-state.json")
+    }
+
     pub fn for_agent(&self, agent_id: &str) -> Self {
         let agent_id = agent_id.trim();
         if agent_id.is_empty() || agent_id == "default" {
@@ -157,6 +169,7 @@ impl Paths {
         std::fs::create_dir_all(self.update_dir())?;
         std::fs::create_dir_all(self.bridge_dir())?;
         std::fs::create_dir_all(self.whatsapp_auth_dir())?;
+        std::fs::create_dir_all(self.mcp_dir())?;
         std::fs::create_dir_all(self.memory_dir())?;
         std::fs::create_dir_all(self.skills_dir())?;
         std::fs::create_dir_all(self.import_staging_skills_dir())?;

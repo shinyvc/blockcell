@@ -26,6 +26,7 @@ pub mod ocr;
 pub mod office;
 pub mod office_write;
 pub mod registry;
+pub mod registry_builder;
 pub mod skills;
 pub mod spawn;
 pub mod stream_subscribe;
@@ -46,6 +47,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
 pub use registry::ToolRegistry;
+pub use registry_builder::{
+    build_tool_registry_for_agent_config, build_tool_registry_with_all_mcp,
+};
 
 /// Truncate a string to at most `max_chars` characters, respecting UTF-8 char boundaries.
 /// Returns a borrowed slice if no truncation needed, or an owned String if truncated.
@@ -201,7 +205,14 @@ impl<'a> PromptContext<'a> {
     pub fn is_im_channel(&self) -> bool {
         matches!(
             self.channel,
-            "wecom" | "feishu" | "lark" | "telegram" | "slack" | "discord" | "dingtalk" | "whatsapp"
+            "wecom"
+                | "feishu"
+                | "lark"
+                | "telegram"
+                | "slack"
+                | "discord"
+                | "dingtalk"
+                | "whatsapp"
         )
     }
 
