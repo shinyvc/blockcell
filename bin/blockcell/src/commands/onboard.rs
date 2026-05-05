@@ -301,6 +301,8 @@ pub async fn run(
                 "priority": 1
             }
         ]);
+        json["agents"]["defaults"]["maxContextTokens"] =
+            serde_json::json!(default_max_context_tokens_for_provider(prov));
         if let Some(defaults) = json["agents"]["defaults"].as_object_mut() {
             defaults.remove("model");
             defaults.remove("provider");
@@ -391,7 +393,7 @@ pub async fn run(
     println!("  3. Run `blockcell agent` to start chatting");
     println!();
     println!("Quick setup examples:");
-    println!("  blockcell onboard --provider deepseek --api-key sk-xxx --model deepseek-chat");
+    println!("  blockcell onboard --provider deepseek --api-key sk-xxx --model deepseek-v4-pro");
     println!("  blockcell onboard --provider kimi --api-key sk-xxx --model kimi-k2.5");
     println!("  blockcell onboard --provider openai --api-key sk-xxx");
 
@@ -429,7 +431,7 @@ fn ensure_auto_upgrade_defaults(json: &mut serde_json::Value) {
 
 fn default_model_for_provider(provider: &str) -> &'static str {
     match provider.to_lowercase().as_str() {
-        "deepseek" => "deepseek-chat",
+        "deepseek" => "deepseek-v4-pro",
         "openai" => "gpt-4o",
         "anthropic" => "claude-sonnet-4-20250514",
         "kimi" | "moonshot" => "kimi-k2.5",
@@ -438,6 +440,20 @@ fn default_model_for_provider(provider: &str) -> &'static str {
         "zhipu" => "glm-4",
         "ollama" => "llama3",
         _ => "gpt-4o",
+    }
+}
+
+fn default_max_context_tokens_for_provider(provider: &str) -> u32 {
+    match provider.to_lowercase().as_str() {
+        "deepseek" => 1_048_576,     // 1M — DeepSeek V4 Pro
+        "anthropic" => 200_000,      // 200K — Claude Sonnet 4
+        "gemini" => 1_048_576,       // 1M — Gemini 1.5
+        "kimi" | "moonshot" => 262_144, // 256K — Kimi K2.6
+        "openai" => 131_072,         // 128K — GPT-4o
+        "groq" => 131_072,           // 128K
+        "zhipu" => 131_072,          // 128K — GLM-5
+        "ollama" => 8_192,           // 8K — depends on local model
+        _ => 131_072,                // 128K default
     }
 }
 
