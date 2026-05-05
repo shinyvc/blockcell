@@ -5351,6 +5351,33 @@ impl AgentRuntime {
             }
             schemas
         };
+
+        // 动态注入 agent_type_registry 中所有 agent 类型到 agent 工具的 description
+        // 让 LLM 看到自定义 agent（来自 workspace/agents/）的名称和用途
+        if let Some(agent_schema) = tools.iter_mut().find(|s| {
+            s.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                == Some("agent")
+        }) {
+            let mut type_list = String::from(
+                "Launch a new agent to handle complex, multi-step tasks autonomously.\n\n\
+                 Available agent types:\n",
+            );
+            for (name, def) in self.agent_type_registry.iter() {
+                type_list.push_str(&format!("- {}: {}\n", name, def.when_to_use));
+            }
+            type_list.push_str(
+                "\nOmit subagent_type for fork mode (inherits parent context, shares prompt cache, synchronous). \
+                 Specify subagent_type for typed agents (background execution, returns task_id).",
+            );
+            if let Some(func) = agent_schema.get_mut("function") {
+                if let Some(desc) = func.get_mut("description") {
+                    *desc = serde_json::Value::String(type_list);
+                }
+            }
+        }
+
         if let Some(schema) = build_activate_skill_tool_schema(&skill_cards) {
             tools.push(schema);
         }
