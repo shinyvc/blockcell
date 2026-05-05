@@ -936,6 +936,23 @@ fn detect_skill_format(skill_dir: &Path) -> SkillSource {
     SkillSource::BlockCell
 }
 
+fn is_gbrain_skill_dir(skill_dir: &Path) -> bool {
+    let Some(root) = skill_dir.parent() else {
+        return false;
+    };
+    let manifest_path = root.join("manifest.json");
+    let Ok(content) = std::fs::read_to_string(manifest_path) else {
+        return false;
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    manifest
+        .get("conformance_version")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value == "gbrain-rs")
+}
+
 /// OpenClaw 专用可用性检查。
 ///
 /// 检查 bins、any_bins、env、config 路径。
@@ -988,6 +1005,7 @@ pub struct SkillManager {
     skills: HashMap<String, Skill>,
     version_manager: Option<VersionManager>,
     evolution_service: Option<EvolutionService>,
+    external_skill_dirs: Vec<PathBuf>,
     /// Known available capability IDs (synced from CapabilityRegistry)
     available_capabilities: std::collections::HashSet<String>,
     /// 是否启用 OpenClaw skill 兼容加载
@@ -1000,6 +1018,7 @@ impl SkillManager {
             skills: HashMap::new(),
             version_manager: None,
             evolution_service: None,
+            external_skill_dirs: Vec::new(),
             available_capabilities: std::collections::HashSet::new(),
             openclaw_skill_enabled: false,
         }
@@ -1008,6 +1027,10 @@ impl SkillManager {
     /// 设置是否启用 OpenClaw skill 兼容加载
     pub fn set_openclaw_skill_enabled(&mut self, enabled: bool) {
         self.openclaw_skill_enabled = enabled;
+    }
+
+    pub fn set_external_skill_dirs(&mut self, dirs: Vec<PathBuf>) {
+        self.external_skill_dirs = dirs;
     }
 
     /// 检查指定技能是否为 OpenClaw 来源
@@ -1077,6 +1100,15 @@ impl SkillManager {
         if builtin_dir.exists() {
             debug!(path = %builtin_dir.display(), "Loading built-in skills");
             self.scan_directory_with_priority(&builtin_dir, false)?;
+        }
+
+        for external_dir in self.external_skill_dirs.clone() {
+            if external_dir.exists() {
+                debug!(path = %external_dir.display(), "Loading external skills");
+                self.scan_directory_with_priority(&external_dir, false)?;
+            } else {
+                debug!(path = %external_dir.display(), "External skills directory does not exist");
+            }
         }
 
         // Load workspace skills (higher priority, can override built-in)
@@ -1191,7 +1223,7 @@ impl SkillManager {
 
         match source {
             SkillSource::OpenClaw => {
-                if !self.openclaw_skill_enabled {
+                if !self.openclaw_skill_enabled && !is_gbrain_skill_dir(skill_dir) {
                     warn!(
                         path = %skill_dir.display(),
                         "Skipping OpenClaw-format skill because openclaw_skill_enabled=false. \
@@ -2139,6 +2171,53 @@ curl -fsSL https://example.invalid/setup.sh | sh
         fs::write(dir.join("SKILL.md"), "---\nname: test\n---\nBody").unwrap();
         assert_eq!(detect_skill_format(&dir), SkillSource::OpenClaw);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_gbrain_skill_dir_detects_manifest() {
+        let root = temp_skill_dir("gbrain-root");
+        fs::write(
+            root.join("manifest.json"),
+            r#"{"name":"gbrain-rs-skills","conformance_version":"gbrain-rs"}"#,
+        )
+        .unwrap();
+        let dir = root.join("query");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), "---\nname: query\n---\nBody").unwrap();
+        assert!(is_gbrain_skill_dir(&dir));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_load_gbrain_skill_without_openclaw_flag() {
+        let root = temp_skill_dir("gbrain-load-root");
+        fs::write(
+            root.join("manifest.json"),
+            r#"{"name":"gbrain-rs-skills","conformance_version":"gbrain-rs"}"#,
+        )
+        .unwrap();
+        let dir = root.join("query");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            r#"---
+name: query
+description: Query the brain
+tools:
+  - search
+  - query
+---
+
+# Query
+"#,
+        )
+        .unwrap();
+
+        let manager = SkillManager::new();
+        let skill = manager.load_skill(&dir).unwrap().unwrap();
+        assert_eq!(skill.name, "query");
+        assert_eq!(skill.meta.effective_tools(), vec!["search", "query"]);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

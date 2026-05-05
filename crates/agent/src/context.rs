@@ -5,7 +5,7 @@ use blockcell_skills::manager::SkillSource;
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig, LLMProvider, SkillManager};
 use blockcell_tools::MemoryStoreHandle;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +82,7 @@ You have a memory system for storing durable facts about the user and environmen
 
 pub struct ContextBuilder {
     paths: Paths,
+    external_skill_dirs: Vec<PathBuf>,
     skill_manager: Option<SkillManager>,
     ghost_learning_enabled: bool,
     file_memory_snapshots: Mutex<HashMap<String, FrozenFileMemorySnapshot>>,
@@ -130,14 +131,17 @@ fn replace_prompt_section(mut prompt: String, header: &str, replacement: Option<
 impl ContextBuilder {
     pub fn new(paths: Paths, config: Config) -> Self {
         let skills_dir = paths.skills_dir();
+        let external_skill_dirs = config.resolved_external_skill_dirs();
         let mut skill_manager = SkillManager::new()
             .with_versioning(skills_dir.clone())
             .with_evolution(skills_dir, EvolutionServiceConfig::default());
         skill_manager.set_openclaw_skill_enabled(config.openclaw_skill_enabled);
+        skill_manager.set_external_skill_dirs(external_skill_dirs.clone());
         let _ = skill_manager.load_from_paths(&paths);
 
         Self {
             paths,
+            external_skill_dirs,
             skill_manager: Some(skill_manager),
             ghost_learning_enabled: config.agents.ghost.learning.enabled,
             file_memory_snapshots: Mutex::new(HashMap::new()),
@@ -206,15 +210,20 @@ impl ContextBuilder {
             .skill_index_summary
             .write()
             .unwrap_or_else(|e| e.into_inner());
+        let mut dirs = self.external_skill_dirs.clone();
         if skills_dir.exists() {
-            let index = crate::skill_index::SkillIndex::build_from_dir(&skills_dir);
+            dirs.push(skills_dir);
+        }
+
+        if dirs.is_empty() {
+            *summary = None;
+        } else {
+            let index = crate::skill_index::SkillIndex::build_from_dirs(dirs);
             *summary = if index.entries().is_empty() {
                 None
             } else {
                 Some(index.to_prompt_summary())
             };
-        } else {
-            *summary = None;
         }
     }
 
