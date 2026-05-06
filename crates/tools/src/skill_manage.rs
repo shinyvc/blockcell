@@ -182,7 +182,7 @@ impl Tool for SkillManageTool {
 
         let skills_dir = ctx.workspace.join("skills");
         // 构建外部搜索目录 (builtin_skills_dir 等)
-        let mut external_dirs: Vec<PathBuf> = ctx
+        let external_dirs: Vec<PathBuf> = ctx
             .builtin_skills_dir
             .iter()
             .filter_map(|d| {
@@ -194,7 +194,6 @@ impl Tool for SkillManageTool {
                 }
             })
             .collect();
-        external_dirs.extend(ctx.config.resolved_external_skill_dirs());
 
         // 获取互斥锁守卫 (防止 TOCTOU 竞态: can_modify + acquire 分离)
         // 守卫在整个写操作期间持有, Drop 时自动释放

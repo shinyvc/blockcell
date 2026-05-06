@@ -228,7 +228,6 @@ impl Tool for ListSkillsTool {
         if let Some(builtin) = ctx.builtin_skills_dir.clone() {
             external_dirs.push(builtin);
         }
-        external_dirs.extend(ctx.config.resolved_external_skill_dirs());
 
         match query {
             "learned" | "available" | "all" => {

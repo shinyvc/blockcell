@@ -2393,10 +2393,6 @@ pub struct Config {
     /// 是否启用 OpenClaw skill 兼容加载（默认 false）
     #[serde(default)]
     pub openclaw_skill_enabled: bool,
-    /// Additional skill roots loaded after built-in skills and before workspace skills.
-    /// These roots may contain direct skill directories such as `foo/SKILL.md`.
-    #[serde(default)]
-    pub external_skill_dirs: Vec<String>,
     /// Self-Improve 配置 (Nudge + Review)
     #[serde(default)]
     pub self_improve: SelfImproveConfig,
@@ -2547,7 +2543,6 @@ impl Default for Config {
             default_timezone: None,
             cron_tick_interval_secs: default_cron_tick_interval(),
             openclaw_skill_enabled: false,
-            external_skill_dirs: Vec::new(),
             self_improve: SelfImproveConfig::default(),
         }
     }
@@ -2609,43 +2604,6 @@ fn expand_env_expr(expr: &str) -> String {
     }
 
     std::env::var(name).unwrap_or_default()
-}
-
-fn expand_home_path(raw: &str) -> std::path::PathBuf {
-    let trimmed = raw.trim();
-    if trimmed == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    }
-
-    if let Some(rest) = trimmed
-        .strip_prefix("~/")
-        .or_else(|| trimmed.strip_prefix("~\\"))
-    {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-
-    std::path::PathBuf::from(trimmed)
-}
-
-fn push_external_skill_dir(
-    raw: &str,
-    dirs: &mut Vec<std::path::PathBuf>,
-    seen: &mut std::collections::HashSet<String>,
-) {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-
-    let path = expand_home_path(trimmed);
-    let key = path.to_string_lossy().to_string();
-    if seen.insert(key) {
-        dirs.push(path);
-    }
 }
 
 pub fn parse_json5_str<T>(content: &str) -> Result<T>
@@ -2829,10 +2787,6 @@ impl Config {
                     tracing::info!("Adding missing openclawSkillEnabled field to config");
                     needs_save = true;
                 }
-                if !raw.contains("externalSkillDirs") {
-                    tracing::info!("Adding missing externalSkillDirs field to config");
-                    needs_save = true;
-                }
                 // Ensure loadAllTools field exists in intentRouter (if present)
                 if raw.contains("intentRouter") && !raw.contains("loadAllTools") {
                     tracing::info!("Adding missing loadAllTools field to intentRouter config");
@@ -2941,27 +2895,6 @@ impl Config {
         }
 
         Ok(self)
-    }
-
-    /// Resolve configured and environment-provided external skill roots.
-    ///
-    /// The environment variable uses the platform path-list syntax, for example
-    /// `C:\skills;D:\other-skills` on Windows or `/opt/skills:/srv/skills` on Unix.
-    pub fn resolved_external_skill_dirs(&self) -> Vec<std::path::PathBuf> {
-        let mut dirs = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        for raw in &self.external_skill_dirs {
-            push_external_skill_dir(raw, &mut dirs, &mut seen);
-        }
-
-        if let Ok(env_value) = std::env::var("BLOCKCELL_EXTERNAL_SKILLS_DIRS") {
-            for path in std::env::split_paths(&env_value) {
-                push_external_skill_dir(path.to_string_lossy().as_ref(), &mut dirs, &mut seen);
-            }
-        }
-
-        dirs
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {

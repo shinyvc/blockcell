@@ -2047,12 +2047,8 @@ impl AgentRuntime {
 
         // 构建 Skill 索引摘要并注入到系统提示词
         let skills_dir = paths.skills_dir();
-        let mut skill_index_dirs = config.resolved_external_skill_dirs();
         if skills_dir.exists() {
-            skill_index_dirs.push(skills_dir);
-        }
-        if !skill_index_dirs.is_empty() {
-            let index = crate::skill_index::SkillIndex::build_from_dirs(skill_index_dirs);
+            let index = crate::skill_index::SkillIndex::build_from_dir(&skills_dir);
             if !index.entries().is_empty() {
                 context_builder.set_skill_index_summary(index.to_prompt_summary());
             }
@@ -2751,9 +2747,7 @@ impl AgentRuntime {
         // 克隆一份供 ForkedAgent 使用（spawn_blocking 会 move 原始值）
         let skills_dir_clone = skills_dir.clone();
         let builtin_skills_dir = self.paths.builtin_skills_dir();
-        let mut external_skills_dirs = vec![builtin_skills_dir];
-        external_skills_dirs.extend(self.config.resolved_external_skill_dirs());
-        let config_clone = self.config.clone();
+        let external_skills_dirs = vec![builtin_skills_dir];
         let provider_pool = self.provider_pool.clone();
         let model = self.config.agents.defaults.model.clone();
         let max_review_rounds = self.config.self_improve.review.max_rounds;
@@ -2776,13 +2770,12 @@ impl AgentRuntime {
             let skill_summary = match mode_clone {
                 ReviewMode::Memory => String::new(),
                 ReviewMode::Skill | ReviewMode::Combined => {
-                    let config_for_index = config_clone.clone();
                     let index = match tokio::task::spawn_blocking(move || {
-                        let mut dirs = config_for_index.resolved_external_skill_dirs();
                         if skills_dir.exists() {
-                            dirs.push(skills_dir.clone());
+                            crate::skill_index::SkillIndex::build_from_dir(&skills_dir)
+                        } else {
+                            crate::skill_index::SkillIndex::new()
                         }
-                        crate::skill_index::SkillIndex::build_from_dirs(dirs)
                     })
                     .await
                     {
@@ -2899,11 +2892,11 @@ impl AgentRuntime {
                     // 与 Hermes 一致: 系统提示词在下次 LLM 调用时反映最新的 Skill 列表
                     if matches!(mode_clone, ReviewMode::Skill | ReviewMode::Combined) {
                         if let Ok(index) = tokio::task::spawn_blocking(move || {
-                            let mut dirs = config_clone.resolved_external_skill_dirs();
                             if skills_dir_clone.exists() {
-                                dirs.push(skills_dir_clone.clone());
+                                crate::skill_index::SkillIndex::build_from_dir(&skills_dir_clone)
+                            } else {
+                                crate::skill_index::SkillIndex::new()
                             }
-                            crate::skill_index::SkillIndex::build_from_dirs(dirs)
                         })
                         .await
                         {

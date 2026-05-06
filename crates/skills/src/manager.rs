@@ -1005,7 +1005,6 @@ pub struct SkillManager {
     skills: HashMap<String, Skill>,
     version_manager: Option<VersionManager>,
     evolution_service: Option<EvolutionService>,
-    external_skill_dirs: Vec<PathBuf>,
     /// Known available capability IDs (synced from CapabilityRegistry)
     available_capabilities: std::collections::HashSet<String>,
     /// 是否启用 OpenClaw skill 兼容加载
@@ -1018,7 +1017,6 @@ impl SkillManager {
             skills: HashMap::new(),
             version_manager: None,
             evolution_service: None,
-            external_skill_dirs: Vec::new(),
             available_capabilities: std::collections::HashSet::new(),
             openclaw_skill_enabled: false,
         }
@@ -1027,10 +1025,6 @@ impl SkillManager {
     /// 设置是否启用 OpenClaw skill 兼容加载
     pub fn set_openclaw_skill_enabled(&mut self, enabled: bool) {
         self.openclaw_skill_enabled = enabled;
-    }
-
-    pub fn set_external_skill_dirs(&mut self, dirs: Vec<PathBuf>) {
-        self.external_skill_dirs = dirs;
     }
 
     /// 检查指定技能是否为 OpenClaw 来源
@@ -1100,15 +1094,6 @@ impl SkillManager {
         if builtin_dir.exists() {
             debug!(path = %builtin_dir.display(), "Loading built-in skills");
             self.scan_directory_with_priority(&builtin_dir, false)?;
-        }
-
-        for external_dir in self.external_skill_dirs.clone() {
-            if external_dir.exists() {
-                debug!(path = %external_dir.display(), "Loading external skills");
-                self.scan_directory_with_priority(&external_dir, false)?;
-            } else {
-                debug!(path = %external_dir.display(), "External skills directory does not exist");
-            }
         }
 
         // Load workspace skills (higher priority, can override built-in)
