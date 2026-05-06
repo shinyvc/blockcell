@@ -20,8 +20,9 @@ use blockcell_channels::whatsapp::WhatsAppChannel;
 use blockcell_channels::ChannelManager;
 use blockcell_core::{Config, InboundMessage, Paths};
 use blockcell_providers::{Provider, ProviderPool};
-use blockcell_scheduler::{CronService, DreamService, DreamServiceConfig};
+use blockcell_scheduler::{CronService, DreamService, DreamServiceConfig, EvolutionWorker};
 use blockcell_skills::{new_registry_handle, CoreEvolution};
+use blockcell_storage::EvolutionWorkflowStore;
 use blockcell_tools::mcp::manager::McpManager;
 use blockcell_tools::{
     build_tool_registry_for_agent_config, CapabilityRegistryHandle, CoreEvolutionHandle,
@@ -407,6 +408,16 @@ pub async fn run(
     let core_evo_adapter = CoreEvolutionAdapter::new(core_evo_raw.clone());
     let core_evo_handle: CoreEvolutionHandle = Arc::new(Mutex::new(core_evo_adapter));
 
+    // 创建核心进化工作流存储和 worker（在 if/else 之前创建，两个分支都需要）
+    let evo_workflow_db = paths.workspace().join("evo_workflow.db");
+    let evo_workflow_store = EvolutionWorkflowStore::open(&evo_workflow_db)?;
+    let evo_workflow_store_arc = Arc::new(evo_workflow_store);
+    let evo_worker = EvolutionWorker::new(
+        (*evo_workflow_store_arc).clone(),
+        core_evo_raw.clone(),
+    );
+    let evo_worker_arc = Arc::new(evo_worker);
+
     if let Some(msg) = message {
         // Single message mode — no need for CronService
         let tool_registry =
@@ -451,6 +462,10 @@ pub async fn run(
 
         runtime.set_capability_registry(cap_registry_handle.clone());
         runtime.set_core_evolution(core_evo_handle.clone());
+
+        // 设置核心进化工作流存储和 worker
+        runtime.set_evolution_workflow_store(evo_workflow_store_arc.clone());
+        runtime.set_evolution_worker(evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>);
 
         // Initialize Layer 5 memory injector (7-layer memory system)
         if let Err(e) = runtime.init_memory_injector().await {
@@ -736,6 +751,10 @@ pub async fn run(
 
         runtime.set_capability_registry(cap_registry_handle.clone());
         runtime.set_core_evolution(core_evo_handle.clone());
+
+        // 设置核心进化工作流存储和 worker
+        runtime.set_evolution_workflow_store(evo_workflow_store_arc.clone());
+        runtime.set_evolution_worker(evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>);
 
         // Create shared ResponseCache for CLI and runtime
         // This allows the /clear command to clear the in-memory cache
@@ -1088,6 +1107,12 @@ pub async fn run(
                 }
             })
         };
+
+        // 启动核心进化 worker 后台任务
+        let evo_shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            evo_worker_arc.run_loop(evo_shutdown_rx).await;
+        });
 
         // Spawn runtime loop
         let runtime_handle = tokio::spawn(async move {

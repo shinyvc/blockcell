@@ -3,7 +3,8 @@ use blockcell_core::types::ChatMessage;
 use blockcell_core::{ProviderKind, Result};
 use blockcell_providers::Provider;
 use blockcell_skills::{CapabilityRegistry, CoreEvolution, LLMProvider};
-use blockcell_tools::{CapabilityRegistryOps, CoreEvolutionOps};
+use blockcell_storage::EvolutionWorkflowStore;
+use blockcell_tools::{CapabilityRegistryOps, CoreEvolutionOps, EvolutionWorkflowStoreOps};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -204,17 +205,6 @@ impl CoreEvolutionOps for CoreEvolutionAdapter {
         }))
     }
 
-    /// 处理单个待处理进化，避免长时间持有锁阻塞事件循环
-    async fn run_one_pending_evolution(&self) -> Result<usize> {
-        let core_evo = self.inner.lock().await;
-        core_evo.run_one_pending_evolution().await
-    }
-
-    async fn run_pending_evolutions(&self) -> Result<usize> {
-        let core_evo = self.inner.lock().await;
-        core_evo.run_pending_evolutions().await
-    }
-
     async fn unblock_capability(&self, capability_id: &str) -> Result<Value> {
         let core_evo = self.inner.lock().await;
         let unblocked = core_evo.unblock_capability(capability_id)?;
@@ -223,6 +213,70 @@ impl CoreEvolutionOps for CoreEvolutionAdapter {
             "unblocked": unblocked,
             "message": if unblocked > 0 {
                 format!("Capability '{}' has been unblocked ({} records). It can now be auto-triggered again.", capability_id, unblocked)
+            } else {
+                format!("Capability '{}' was not blocked.", capability_id)
+            }
+        }))
+    }
+}
+
+/// Trait for notifying the evolution worker to wake up and process pending workflows.
+///
+/// This trait breaks the circular dependency: `agent` crate defines it,
+/// `scheduler` crate's `EvolutionWorker` implements it, and the `bin` crate
+/// passes `Arc<EvolutionWorker>` as `Arc<dyn EvolutionNotifier + Send + Sync>`.
+pub trait EvolutionNotifier: Send + Sync {
+    /// Wake up the worker — lightweight, non-blocking call.
+    fn notify(&self);
+}
+
+/// Adapter: bridges `EvolutionWorkflowStore` (storage crate) → `EvolutionWorkflowStoreOps` (tools crate)
+pub struct EvolutionWorkflowStoreAdapter {
+    inner: EvolutionWorkflowStore,
+}
+
+impl EvolutionWorkflowStoreAdapter {
+    pub fn new(store: EvolutionWorkflowStore) -> Self {
+        Self { inner: store }
+    }
+}
+
+impl EvolutionWorkflowStoreOps for EvolutionWorkflowStoreAdapter {
+    fn list_workflows_json(&self, status_filter: Option<&str>) -> Result<Value> {
+        let workflows = self.inner.list_workflows(status_filter)?;
+        Ok(serde_json::to_value(&workflows).unwrap_or(json!([])))
+    }
+
+    fn get_workflow_json(&self, workflow_id: &str) -> Result<Value> {
+        let workflow = self.inner.get_workflow(workflow_id)?;
+        match workflow {
+            Some(w) => Ok(serde_json::to_value(&w).unwrap_or(json!(null))),
+            None => Ok(json!({"error": "workflow not found", "id": workflow_id})),
+        }
+    }
+
+    fn get_workflow_steps_json(&self, workflow_id: &str) -> Result<Value> {
+        let steps = self.inner.get_steps(workflow_id)?;
+        Ok(serde_json::to_value(&steps).unwrap_or(json!([])))
+    }
+
+    fn cancel_workflow(&self, workflow_id: &str) -> Result<Value> {
+        self.inner.cancel_workflow(workflow_id)?;
+        Ok(json!({"workflow_id": workflow_id, "status": "Cancelled"}))
+    }
+
+    fn retry_workflow(&self, workflow_id: &str) -> Result<Value> {
+        self.inner.retry_workflow(workflow_id)?;
+        Ok(json!({"workflow_id": workflow_id, "status": "Requested"}))
+    }
+
+    fn unblock_capability(&self, capability_id: &str) -> Result<Value> {
+        let count = self.inner.unblock_capability(capability_id)?;
+        Ok(json!({
+            "capability_id": capability_id,
+            "unblocked": count,
+            "message": if count > 0 {
+                format!("Capability '{}' has been unblocked ({} workflows).", capability_id, count)
             } else {
                 format!("Capability '{}' was not blocked.", capability_id)
             }

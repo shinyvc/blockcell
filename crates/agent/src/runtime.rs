@@ -20,11 +20,11 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
+use crate::capability_adapter::EvolutionWorkflowStoreAdapter;
 use crate::context::{ActiveSkillContext, ContextBuilder, InteractionMode};
 use crate::error::{
     classify_tool_failure, dangerous_exec_denied, dangerous_file_ops_denied, disabled_skill_result,
@@ -1961,6 +1961,10 @@ pub struct AgentRuntime {
     capability_registry: Option<CapabilityRegistryHandle>,
     /// Core evolution engine handle for tools.
     core_evolution: Option<CoreEvolutionHandle>,
+    /// 核心进化工作流 worker — 后台独立运行，tick 只做轻量 notify
+    evolution_worker: Option<Arc<dyn crate::capability_adapter::EvolutionNotifier>>,
+    /// 核心进化工作流存储 — 快速入队，不拿 engine mutex
+    evolution_workflow_store: Option<Arc<blockcell_storage::EvolutionWorkflowStore>>,
     /// Broadcast sender for streaming events to WebSocket clients (gateway mode).
     event_tx: Option<broadcast::Sender<String>>,
     /// In-memory store for structured system events emitted by runtime producers.
@@ -2097,6 +2101,8 @@ impl AgentRuntime {
             skill_file_store: None,
             capability_registry: None,
             core_evolution: None,
+            evolution_worker: None,
+            evolution_workflow_store: None,
             event_tx: None,
             system_event_store,
             system_event_orchestrator,
@@ -3178,6 +3184,14 @@ impl AgentRuntime {
         self.core_evolution = Some(core_evo);
     }
 
+    pub fn set_evolution_worker(&mut self, worker: Arc<dyn crate::capability_adapter::EvolutionNotifier>) {
+        self.evolution_worker = Some(worker);
+    }
+
+    pub fn set_evolution_workflow_store(&mut self, store: Arc<blockcell_storage::EvolutionWorkflowStore>) {
+        self.evolution_workflow_store = Some(store);
+    }
+
     /// Deprecated: MCP tools are now injected before runtime construction via the shared MCP manager.
     pub async fn mount_mcp_servers(&mut self) {}
 
@@ -3678,6 +3692,7 @@ impl AgentRuntime {
             response_cache: None,
             skill_mutex: None,
             agent_type_registry: None,
+            evolution_workflow_store: None,
             runtime_handle: self.runtime_handle.clone(),
             agent_identity: blockcell_core::current_agent_context(),
         })
@@ -7137,6 +7152,10 @@ impl AgentRuntime {
             ),
             agent_type_registry: Some(Arc::new(self.agent_type_registry.clone())
                 as blockcell_tools::AgentTypeRegistryHandle),
+            evolution_workflow_store: self.evolution_workflow_store.clone().map(|store| {
+                Arc::new(EvolutionWorkflowStoreAdapter::new((*store).clone()))
+                    as blockcell_tools::EvolutionWorkflowStoreHandle
+            }),
         };
 
         // Emit tool_call_start event to WebSocket clients
@@ -7611,6 +7630,7 @@ impl AgentRuntime {
         let capability_registry = self.capability_registry.clone();
         let core_evolution = self.core_evolution.clone();
         let event_emitter = self.system_event_emitter.clone();
+        let evolution_workflow_store = self.evolution_workflow_store.clone();
 
         let tool_executor =
             move |tool_name: &str, params: serde_json::Value| -> Result<serde_json::Value> {
@@ -7697,6 +7717,10 @@ impl AgentRuntime {
                     agent_identity: None,
                     skill_mutex: None,
                     agent_type_registry: None,
+                    evolution_workflow_store: evolution_workflow_store.clone().map(|store| {
+                        Arc::new(EvolutionWorkflowStoreAdapter::new((*store).clone()))
+                            as blockcell_tools::EvolutionWorkflowStoreHandle
+                    }),
                 };
 
                 // Execute tool synchronously via a new tokio runtime handle
@@ -7785,8 +7809,7 @@ impl AgentRuntime {
     ) {
         info!("AgentRuntime started");
 
-        // 核心进化后台运行标记：防止并发执行，确保 select! 循环不被阻塞
-        static CORE_EVOLUTION_RUNNING: AtomicBool = AtomicBool::new(false);
+
 
         // 启动灰度发布调度器（每 60 秒 tick 一次）
         let has_evolution = self.context_builder.evolution_service().is_some();
@@ -8132,29 +8155,9 @@ impl AgentRuntime {
                         }
                     }
 
-                    // 处理待处理的核心进化 — 后台执行，每次只处理 1 个，防止阻塞 select! 循环
-                    if let Some(ref core_evo_handle) = self.core_evolution {
-                        // AtomicBool 防止并发：上一个进化还在跑时跳过本次
-                        if !CORE_EVOLUTION_RUNNING.load(Ordering::Relaxed) {
-                            CORE_EVOLUTION_RUNNING.store(true, Ordering::Relaxed);
-                            let handle = core_evo_handle.clone();
-                            tokio::spawn(async move {
-                                let core_evo = handle.lock().await;
-                                // 每次只处理 1 个进化请求，避免长时间持有锁
-                                match core_evo.run_one_pending_evolution().await {
-                                    Ok(n) if n > 0 => {
-                                        info!(count = n, "🧬 [核心进化] 后台处理了 1 个待处理进化");
-                                    }
-                                    Err(e) => {
-                                        warn!(error = %e, "🧬 [核心进化] 后台处理待处理进化出错");
-                                    }
-                                    _ => {}
-                                }
-                                CORE_EVOLUTION_RUNNING.store(false, Ordering::Relaxed);
-                            });
-                        } else {
-                            debug!("🧬 [核心进化] 上一次进化仍在运行，跳过本次 tick");
-                        }
+                    // 唤醒核心进化 worker — 轻量操作，不执行长任务，不拿 mutex
+                    if let Some(ref worker) = self.evolution_worker {
+                        worker.notify();
                     }
 
                     // Periodic skill hot-reload (picks up skills created by chat)
@@ -8180,43 +8183,62 @@ impl AgentRuntime {
                         self.context_builder.sync_capabilities(cap_ids);
                     }
 
-                    // Auto-trigger Capability evolution for missing skill dependencies
-                    // With 24h cooldown per capability to prevent repeated requests
-                    if let Some(ref core_evo_handle) = self.core_evolution {
+                    // 自动触发缺失能力的进化 — 通过 workflow store 快速入队，不拿 engine mutex
+                    // 24 小时冷却，防止重复请求
+                    if let Some(ref workflow_store) = self.evolution_workflow_store {
                         let missing = self.context_builder.get_missing_capabilities();
                         let now = chrono::Utc::now().timestamp();
-                        const COOLDOWN_SECS: i64 = 86400; // 24 hours
+                        const COOLDOWN_SECS: i64 = 86400; // 24 小时
 
                         for (skill_name, cap_id) in missing {
-                            // Cooldown check: skip if requested within 24h
+                            // 冷却检查：24 小时内不重复请求
                             if let Some(&last_request) = self.cap_request_cooldown.get(&cap_id) {
                                 if now - last_request < COOLDOWN_SECS {
                                     continue;
                                 }
                             }
 
+                            // 检查是否已有活跃或阻塞的工作流
+                            match workflow_store.is_active_or_blocked(&cap_id) {
+                                Ok(true) => {
+                                    debug!(
+                                        capability_id = %cap_id,
+                                        "🧬 能力 '{}' 已有活跃/阻塞工作流，跳过",
+                                        cap_id
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "检查工作流状态失败");
+                                    continue;
+                                }
+                                _ => {}
+                            }
+
                             let description = format!(
                                 "Auto-requested: required by skill '{}'",
                                 skill_name
                             );
-                            let core_evo = core_evo_handle.lock().await;
-                            match core_evo.request_capability(&cap_id, &description, "script").await {
+                            match workflow_store.enqueue(&cap_id, &description, "script") {
                                 Ok(_) => {
                                     self.cap_request_cooldown.insert(cap_id.clone(), now);
                                     info!(
                                         capability_id = %cap_id,
                                         skill = %skill_name,
-                                        "🧬 Auto-requested missing capability '{}' for skill '{}'",
+                                        "🧬 自动入队缺失能力 '{}' (skill '{}')",
                                         cap_id, skill_name
                                     );
+                                    // 唤醒 worker 处理新入队的工作流
+                                    if let Some(ref worker) = self.evolution_worker {
+                                        worker.notify();
+                                    }
                                 }
                                 Err(e) => {
-                                    // Also record cooldown on error (blocked/failed) to avoid retrying immediately
                                     self.cap_request_cooldown.insert(cap_id.clone(), now);
                                     debug!(
                                         capability_id = %cap_id,
                                         error = %e,
-                                        "Failed to auto-request capability (cooldown set)"
+                                        "入队能力进化失败（已设冷却）"
                                     );
                                 }
                             }
@@ -11076,6 +11098,7 @@ mod tests {
             skill_mutex: Some(Arc::new(crate::skill_mutex::SkillMutex::new())
                 as blockcell_tools::SkillMutexHandle),
             agent_type_registry: None,
+            evolution_workflow_store: None,
         };
 
         assert!(ctx.event_emitter.is_some());

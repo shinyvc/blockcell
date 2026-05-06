@@ -23,12 +23,13 @@ use blockcell_channels::whatsapp::WhatsAppChannel;
 use blockcell_channels::ChannelManager;
 use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths};
 use blockcell_scheduler::{
-    CronJob, CronService, DreamService, DreamServiceConfig, GhostMaintenanceService,
+    CronJob, CronService, DreamService, DreamServiceConfig, EvolutionWorker, GhostMaintenanceService,
     GhostMaintenanceServiceConfig, HeartbeatService, JobPayload, JobSchedule, JobState,
     ScheduleKind,
 };
 use blockcell_skills::{new_registry_handle, CoreEvolution};
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig};
+use blockcell_storage::EvolutionWorkflowStore;
 use blockcell_tools::mcp::manager::McpManager;
 use blockcell_tools::{
     build_tool_registry_for_agent_config, build_tool_registry_with_all_mcp,
@@ -846,6 +847,25 @@ async fn spawn_agent_runtime(
 
     runtime.set_capability_registry(cap_registry_handle);
     runtime.set_core_evolution(core_evo_handle);
+
+    // 创建核心进化工作流存储和 worker
+    let evo_workflow_db = agent_paths.workspace().join("evo_workflow.db");
+    let evo_workflow_store = EvolutionWorkflowStore::open(&evo_workflow_db)?;
+    let evo_workflow_store_arc = Arc::new(evo_workflow_store);
+    let evo_worker = EvolutionWorker::new(
+        (*evo_workflow_store_arc).clone(),
+        core_evo_raw.clone(),
+    );
+    let evo_worker_arc = Arc::new(evo_worker);
+    runtime.set_evolution_workflow_store(evo_workflow_store_arc);
+    runtime.set_evolution_worker(evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>);
+
+    // 启动核心进化 worker 后台任务
+    let evo_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        evo_worker_arc.run_loop(evo_shutdown_rx).await;
+    });
+
     runtime.set_event_tx(ws_broadcast_tx);
 
     // Create shared ResponseCache and register it

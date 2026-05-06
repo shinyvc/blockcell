@@ -11,6 +11,7 @@ pub mod cron;
 pub mod data_process;
 pub mod email;
 pub mod encrypt;
+pub mod evolution_workflow;
 pub mod exec;
 pub mod exec_local;
 pub mod exec_skill_script;
@@ -181,6 +182,10 @@ pub type SkillMutexGuard = Arc<dyn Send + Sync>;
 /// This avoids a circular dependency between tools and agent crates.
 pub type SkillMutexHandle = Arc<dyn SkillMutexOps + Send + Sync>;
 
+/// Opaque handle to the evolution workflow store, passed through ToolContext.
+/// This avoids a circular dependency between tools and storage crates.
+pub type EvolutionWorkflowStoreHandle = Arc<dyn EvolutionWorkflowStoreOps + Send + Sync>;
+
 /// Trait abstracting skill mutex operations needed by tools.
 #[async_trait]
 pub trait SkillMutexOps: Send + Sync {
@@ -242,12 +247,25 @@ pub trait CoreEvolutionOps: Send + Sync {
     async fn list_records_json(&self) -> Result<Value>;
     /// Get a specific evolution record.
     async fn get_record_json(&self, evolution_id: &str) -> Result<Value>;
-    /// 处理单个待处理进化，返回处理数量（0 或 1）
-    async fn run_one_pending_evolution(&self) -> Result<usize>;
-    /// Process all pending evolutions. Returns number processed.
-    async fn run_pending_evolutions(&self) -> Result<usize>;
     /// Unblock a previously blocked capability.
     async fn unblock_capability(&self, capability_id: &str) -> Result<Value>;
+}
+
+/// Trait abstracting evolution workflow store operations needed by tools.
+/// This avoids a circular dependency between tools and storage crates.
+pub trait EvolutionWorkflowStoreOps: Send + Sync {
+    /// List workflows, optionally filtered by status.
+    fn list_workflows_json(&self, status_filter: Option<&str>) -> Result<Value>;
+    /// Get a specific workflow by ID.
+    fn get_workflow_json(&self, workflow_id: &str) -> Result<Value>;
+    /// Get steps for a workflow.
+    fn get_workflow_steps_json(&self, workflow_id: &str) -> Result<Value>;
+    /// Cancel a workflow.
+    fn cancel_workflow(&self, workflow_id: &str) -> Result<Value>;
+    /// Retry a failed or blocked workflow.
+    fn retry_workflow(&self, workflow_id: &str) -> Result<Value>;
+    /// Unblock a capability.
+    fn unblock_capability(&self, capability_id: &str) -> Result<Value>;
 }
 
 /// Trait abstracting memory store operations needed by tools.
@@ -368,6 +386,8 @@ pub struct ToolContext {
     pub skill_mutex: Option<SkillMutexHandle>,
     /// Agent 类型注册表 (用于 AgentTool 动态 schema 和验证)
     pub agent_type_registry: Option<AgentTypeRegistryHandle>,
+    /// Evolution workflow store handle for workflow management tools.
+    pub evolution_workflow_store: Option<EvolutionWorkflowStoreHandle>,
 }
 
 impl ToolContext {

@@ -17,7 +17,7 @@ pub use capability_provider::{
 pub use capability_versioning::{
     CapabilityVersion, CapabilityVersionHistory, CapabilityVersionManager, CapabilityVersionSource,
 };
-pub use core_evolution::CoreEvolution;
+pub use core_evolution::{CoreEvolution, EvolutionStep};
 pub use dispatcher::{SkillDispatchResult, SkillDispatcher, ToolCallRecord};
 pub use engine::{EngineConfig, ExecutionResult, RhaiEngine, SkillExecutor};
 pub use evolution::{
