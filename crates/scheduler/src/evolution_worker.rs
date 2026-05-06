@@ -12,7 +12,8 @@ use blockcell_skills::{CoreEvolution, EvolutionStep};
 use blockcell_storage::evolution_workflow::WorkflowRecord;
 use blockcell_storage::EvolutionWorkflowStore;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::{broadcast, oneshot, Mutex, Notify};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 /// Default poll interval in seconds.
@@ -54,7 +55,8 @@ impl EvolutionWorker {
 
     /// Run the worker main loop. Blocks until shutdown signal received.
     pub async fn run_loop(self: Arc<Self>, mut shutdown: broadcast::Receiver<()>) {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(self.poll_interval_secs));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(self.poll_interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         info!(worker_id = %self.worker_id, "EvolutionWorker started");
@@ -85,7 +87,10 @@ impl EvolutionWorker {
         }
 
         // 2. Claim next workflow
-        let workflow = match self.store.claim_next(&self.worker_id, self.lease_duration_secs) {
+        let workflow = match self
+            .store
+            .claim_next(&self.worker_id, self.lease_duration_secs)
+        {
             Ok(Some(w)) => w,
             Ok(None) => {
                 debug!(worker_id = %self.worker_id, "No workflow to claim");
@@ -109,7 +114,12 @@ impl EvolutionWorker {
             for event in &events {
                 if event.event_type == "cancel" {
                     info!(workflow_id = %workflow.id, "Workflow cancelled by event");
-                    let _ = self.store.update_workflow_status(&workflow.id, "Cancelled", None);
+                    let _ = self.store.update_workflow_status_if_owned(
+                        &workflow.id,
+                        &self.worker_id,
+                        "Cancelled",
+                        None,
+                    );
                     let _ = self.store.release_lease(&workflow.id, &self.worker_id);
                     return;
                 }
@@ -117,22 +127,30 @@ impl EvolutionWorker {
         }
 
         // 4. Renew lease before running step (heartbeat)
-        if let Err(e) = self.store.renew_lease(&workflow.id, &self.worker_id, self.lease_duration_secs) {
-            warn!(workflow_id = %workflow.id, error = %e, "Failed to renew lease before step");
-            // Continue anyway — the step may still complete within the original lease
+        match self
+            .store
+            .renew_lease(&workflow.id, &self.worker_id, self.lease_duration_secs)
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(workflow_id = %workflow.id, "Lost workflow lease before step; skipping");
+                return;
+            }
+            Err(e) => {
+                warn!(workflow_id = %workflow.id, error = %e, "Failed to renew lease before step");
+                return;
+            }
         }
 
         // 5. Determine next step to run
         let next_step = self.determine_next_step(&workflow);
 
+        let mut wake_after_release = false;
+
         match next_step {
             Some(step) => {
                 // Insert step record
-                let step_id = match self.store.insert_step(
-                    &workflow.id,
-                    step.name(),
-                    None,
-                ) {
+                let step_id = match self.store.insert_step(&workflow.id, step.name(), None) {
                     Ok(id) => id,
                     Err(e) => {
                         error!(workflow_id = %workflow.id, error = %e, "Failed to insert step record");
@@ -148,11 +166,30 @@ impl EvolutionWorker {
                 );
 
                 // 6. Run the step via the engine
+                let (heartbeat_stop, heartbeat_handle) = self.spawn_lease_heartbeat(&workflow.id);
                 let result = self.run_step(&workflow, step).await;
+                let _ = heartbeat_stop.send(());
+                if let Err(e) = heartbeat_handle.await {
+                    if !e.is_cancelled() {
+                        warn!(workflow_id = %workflow.id, error = %e, "Lease heartbeat task failed");
+                    }
+                }
 
                 // 7. Renew lease after step completes (keep lease alive for next tick)
-                if let Err(e) = self.store.renew_lease(&workflow.id, &self.worker_id, self.lease_duration_secs) {
-                    warn!(workflow_id = %workflow.id, error = %e, "Failed to renew lease after step");
+                match self.store.renew_lease(
+                    &workflow.id,
+                    &self.worker_id,
+                    self.lease_duration_secs,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!(workflow_id = %workflow.id, "Lost workflow lease after step; discarding step result");
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(workflow_id = %workflow.id, error = %e, "Failed to renew lease after step");
+                        return;
+                    }
                 }
 
                 // 8. Record step result
@@ -163,13 +200,62 @@ impl EvolutionWorker {
                             step = step.name(),
                             "Step completed"
                         );
-                        let _ = self.store.complete_step(&step_id, Some(&output_json));
+                        match self.store.complete_step_if_owned(
+                            &workflow.id,
+                            &step_id,
+                            &self.worker_id,
+                            Some(&output_json),
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(workflow_id = %workflow.id, step = step.name(), "Lost workflow lease before completing step");
+                                return;
+                            }
+                            Err(e) => {
+                                warn!(workflow_id = %workflow.id, step = step.name(), error = %e, "Failed to complete step");
+                                return;
+                            }
+                        }
 
                         // Check if this was the last step
                         if EvolutionStep::next_after(step.name()).is_none() {
                             // All steps done — mark workflow as Promoted
                             info!(workflow_id = %workflow.id, "All steps completed, workflow promoted");
-                            let _ = self.store.update_workflow_status(&workflow.id, "Promoted", None);
+                            match self.store.update_workflow_status_if_owned(
+                                &workflow.id,
+                                &self.worker_id,
+                                "Promoted",
+                                None,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    warn!(workflow_id = %workflow.id, "Lost workflow lease before marking promoted");
+                                    return;
+                                }
+                                Err(e) => {
+                                    warn!(workflow_id = %workflow.id, error = %e, "Failed to mark workflow promoted");
+                                    return;
+                                }
+                            }
+                        } else {
+                            match self.store.update_workflow_status_if_owned(
+                                &workflow.id,
+                                &self.worker_id,
+                                "Requested",
+                                None,
+                            ) {
+                                Ok(true) => {
+                                    wake_after_release = true;
+                                }
+                                Ok(false) => {
+                                    warn!(workflow_id = %workflow.id, step = step.name(), "Lost workflow lease before requeueing next step");
+                                    return;
+                                }
+                                Err(e) => {
+                                    warn!(workflow_id = %workflow.id, error = %e, "Failed to requeue workflow for next step");
+                                    return;
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -179,16 +265,39 @@ impl EvolutionWorker {
                             error = %e,
                             "Step failed"
                         );
-                        let _ = self.store.fail_step(&step_id, &e.to_string());
-
-                        // Increment attempt
-                        let _ = self.store.increment_attempt(&workflow.id);
-
-                        // Schedule retry with backoff
-                        let _ = self.store.schedule_retry(
+                        match self.store.fail_step_if_owned(
                             &workflow.id,
+                            &step_id,
+                            &self.worker_id,
+                            &e.to_string(),
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(workflow_id = %workflow.id, step = step.name(), "Lost workflow lease before failing step");
+                                return;
+                            }
+                            Err(err) => {
+                                warn!(workflow_id = %workflow.id, step = step.name(), error = %err, "Failed to mark step failed");
+                                return;
+                            }
+                        }
+
+                        // Increment attempt and schedule retry with backoff.
+                        match self.store.schedule_retry_if_owned(
+                            &workflow.id,
+                            &self.worker_id,
                             Some(&format!("[{}] {}", step.name(), e)),
-                        );
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(workflow_id = %workflow.id, step = step.name(), "Lost workflow lease before scheduling retry");
+                                return;
+                            }
+                            Err(err) => {
+                                warn!(workflow_id = %workflow.id, step = step.name(), error = %err, "Failed to schedule retry");
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -197,13 +306,28 @@ impl EvolutionWorker {
                 // This can happen if all steps were already completed.
                 debug!(workflow_id = %workflow.id, "No pending step found, workflow may be complete");
                 // Ensure status is Promoted if not already terminal
-                let _ = self.store.update_workflow_status(&workflow.id, "Promoted", None);
+                let _ = self.store.update_workflow_status_if_owned(
+                    &workflow.id,
+                    &self.worker_id,
+                    "Promoted",
+                    None,
+                );
             }
         }
 
         // 9. Release lease
-        if let Err(e) = self.store.release_lease(&workflow.id, &self.worker_id) {
-            warn!(workflow_id = %workflow.id, error = %e, "Failed to release lease");
+        match self.store.release_lease(&workflow.id, &self.worker_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(workflow_id = %workflow.id, "Workflow lease already released or moved");
+            }
+            Err(e) => {
+                warn!(workflow_id = %workflow.id, error = %e, "Failed to release lease");
+            }
+        }
+
+        if wake_after_release {
+            self.wakeup.notify_one();
         }
     }
 
@@ -270,6 +394,46 @@ impl EvolutionWorker {
         } else {
             engine.run_step(&workflow.id, step).await
         }
+    }
+
+    fn spawn_lease_heartbeat(&self, workflow_id: &str) -> (oneshot::Sender<()>, JoinHandle<()>) {
+        let store = self.store.clone();
+        let workflow_id = workflow_id.to_string();
+        let worker_id = self.worker_id.clone();
+        let lease_duration_secs = self.lease_duration_secs;
+        let heartbeat_secs = std::cmp::max(5, std::cmp::min(60, lease_duration_secs / 3)) as u64;
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+
+        let handle = tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => {
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        match store.renew_lease(&workflow_id, &worker_id, lease_duration_secs) {
+                            Ok(true) => {
+                                debug!(workflow_id = %workflow_id, worker_id = %worker_id, "Renewed evolution workflow lease");
+                            }
+                            Ok(false) => {
+                                warn!(workflow_id = %workflow_id, worker_id = %worker_id, "Lost evolution workflow lease during heartbeat");
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(workflow_id = %workflow_id, worker_id = %worker_id, error = %e, "Failed to heartbeat evolution workflow lease");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        (stop_tx, handle)
     }
 
     /// Recover workflows with expired leases and retry-eligible workflows.

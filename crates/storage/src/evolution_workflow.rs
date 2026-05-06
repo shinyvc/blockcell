@@ -9,7 +9,7 @@
 
 use blockcell_core::Result;
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -172,58 +172,69 @@ impl EvolutionWorkflowStore {
 
     /// Atomically claim the next available workflow.
     /// Returns None if no workflow is available.
-    pub fn claim_next(&self, worker_id: &str, lease_duration_secs: i64) -> Result<Option<WorkflowRecord>> {
-        let conn = lock_conn(&self.inner);
+    pub fn claim_next(
+        &self,
+        worker_id: &str,
+        lease_duration_secs: i64,
+    ) -> Result<Option<WorkflowRecord>> {
+        let mut conn = lock_conn(&self.inner);
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let lease_until = (now + chrono::Duration::seconds(lease_duration_secs)).to_rfc3339();
 
-        // Find first claimable workflow
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, capability_id, description, provider_kind, status, attempt, max_attempts,
-                        priority, created_at, updated_at, lease_owner, lease_until, last_error
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+
+        let workflow_id: Option<String> = tx
+            .query_row(
+                "SELECT id
                  FROM evo_workflows
                  WHERE status IN ('Requested', 'RetryScheduled')
+                   AND attempt < max_attempts
                    AND (lease_until IS NULL OR lease_until < ?1)
                  ORDER BY priority DESC, created_at ASC
                  LIMIT 1",
+                params![now_str],
+                |row| row.get(0),
             )
-            .map_err(map_sqlite_error)?;
-
-        let record = stmt
-            .query_row(params![now_str], |row| {
-                Ok(WorkflowRecord {
-                    id: row.get(0)?,
-                    capability_id: row.get(1)?,
-                    description: row.get(2)?,
-                    provider_kind: row.get(3)?,
-                    status: row.get(4)?,
-                    attempt: row.get(5)?,
-                    max_attempts: row.get(6)?,
-                    priority: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                    lease_owner: row.get(10)?,
-                    lease_until: row.get(11)?,
-                    last_error: row.get(12)?,
-                })
-            })
             .optional()
             .map_err(map_sqlite_error)?;
 
-        let Some(record) = record else { return Ok(None) };
+        let Some(workflow_id) = workflow_id else {
+            tx.commit().map_err(map_sqlite_error)?;
+            return Ok(None);
+        };
 
-        // Claim it
-        conn.execute(
-            "UPDATE evo_workflows
-             SET status = 'Claimed', lease_owner = ?1, lease_until = ?2, updated_at = ?3
-             WHERE id = ?4",
-            params![worker_id, lease_until, now_str, record.id],
-        )
-        .map_err(map_sqlite_error)?;
+        let updated = tx
+            .execute(
+                "UPDATE evo_workflows
+                 SET status = 'Claimed', lease_owner = ?1, lease_until = ?2, updated_at = ?3
+                 WHERE id = ?4
+                   AND status IN ('Requested', 'RetryScheduled')
+                   AND attempt < max_attempts
+                   AND (lease_until IS NULL OR lease_until < ?3)",
+                params![worker_id, lease_until, now_str, workflow_id],
+            )
+            .map_err(map_sqlite_error)?;
 
-        let mut claimed = record;
+        if updated != 1 {
+            tx.commit().map_err(map_sqlite_error)?;
+            return Ok(None);
+        }
+
+        let mut claimed = tx
+            .query_row(
+                "SELECT id, capability_id, description, provider_kind, status, attempt, max_attempts,
+                        priority, created_at, updated_at, lease_owner, lease_until, last_error
+                 FROM evo_workflows
+                 WHERE id = ?1",
+                params![workflow_id],
+                workflow_from_row,
+            )
+            .map_err(map_sqlite_error)?;
+
+        tx.commit().map_err(map_sqlite_error)?;
         claimed.status = "Claimed".to_string();
         claimed.lease_owner = Some(worker_id.to_string());
         claimed.lease_until = Some(lease_until);
@@ -231,31 +242,38 @@ impl EvolutionWorkflowStore {
     }
 
     /// Renew the lease on a claimed workflow.
-    pub fn renew_lease(&self, workflow_id: &str, worker_id: &str, lease_duration_secs: i64) -> Result<()> {
+    pub fn renew_lease(
+        &self,
+        workflow_id: &str,
+        worker_id: &str,
+        lease_duration_secs: i64,
+    ) -> Result<bool> {
         let conn = lock_conn(&self.inner);
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let lease_until = (now + chrono::Duration::seconds(lease_duration_secs)).to_rfc3339();
-        conn.execute(
-            "UPDATE evo_workflows SET lease_until = ?1, updated_at = ?2
+        let updated = conn
+            .execute(
+                "UPDATE evo_workflows SET lease_until = ?1, updated_at = ?2
              WHERE id = ?3 AND lease_owner = ?4",
-            params![lease_until, now_str, workflow_id, worker_id],
-        )
-        .map_err(map_sqlite_error)?;
-        Ok(())
+                params![lease_until, now_str, workflow_id, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(updated == 1)
     }
 
     /// Release the lease on a workflow (after completion or error).
-    pub fn release_lease(&self, workflow_id: &str, worker_id: &str) -> Result<()> {
+    pub fn release_lease(&self, workflow_id: &str, worker_id: &str) -> Result<bool> {
         let conn = lock_conn(&self.inner);
         let now_str = now_rfc3339();
-        conn.execute(
-            "UPDATE evo_workflows SET lease_owner = NULL, lease_until = NULL, updated_at = ?1
+        let updated = conn
+            .execute(
+                "UPDATE evo_workflows SET lease_owner = NULL, lease_until = NULL, updated_at = ?1
              WHERE id = ?2 AND lease_owner = ?3",
-            params![now_str, workflow_id, worker_id],
-        )
-        .map_err(map_sqlite_error)?;
-        Ok(())
+                params![now_str, workflow_id, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(updated == 1)
     }
 
     /// Recover workflows with expired leases (crash recovery).
@@ -438,6 +456,32 @@ impl EvolutionWorkflowStore {
         Ok(())
     }
 
+    /// Mark a step as completed only if the worker still owns the workflow lease.
+    pub fn complete_step_if_owned(
+        &self,
+        workflow_id: &str,
+        step_id: &str,
+        worker_id: &str,
+        output_json: Option<&str>,
+    ) -> Result<bool> {
+        let conn = lock_conn(&self.inner);
+        let now = now_rfc3339();
+        let updated = conn
+            .execute(
+                "UPDATE evo_workflow_steps
+                 SET status = 'Completed', output_json = ?1, finished_at = ?2
+                 WHERE id = ?3
+                   AND workflow_id = ?4
+                   AND EXISTS (
+                       SELECT 1 FROM evo_workflows
+                       WHERE id = ?4 AND lease_owner = ?5
+                   )",
+                params![output_json, now, step_id, workflow_id, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(updated == 1)
+    }
+
     /// Mark a step as failed.
     pub fn fail_step(&self, step_id: &str, error: &str) -> Result<()> {
         let conn = lock_conn(&self.inner);
@@ -449,6 +493,32 @@ impl EvolutionWorkflowStore {
         )
         .map_err(map_sqlite_error)?;
         Ok(())
+    }
+
+    /// Mark a step as failed only if the worker still owns the workflow lease.
+    pub fn fail_step_if_owned(
+        &self,
+        workflow_id: &str,
+        step_id: &str,
+        worker_id: &str,
+        error: &str,
+    ) -> Result<bool> {
+        let conn = lock_conn(&self.inner);
+        let now = now_rfc3339();
+        let updated = conn
+            .execute(
+                "UPDATE evo_workflow_steps
+                 SET status = 'Failed', error = ?1, finished_at = ?2
+                 WHERE id = ?3
+                   AND workflow_id = ?4
+                   AND EXISTS (
+                       SELECT 1 FROM evo_workflows
+                       WHERE id = ?4 AND lease_owner = ?5
+                   )",
+                params![error, now, step_id, workflow_id, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(updated == 1)
     }
 
     /// Get the last completed step for a workflow.
@@ -505,6 +575,27 @@ impl EvolutionWorkflowStore {
         Ok(())
     }
 
+    /// Update workflow status only if the worker still owns the workflow lease.
+    pub fn update_workflow_status_if_owned(
+        &self,
+        workflow_id: &str,
+        worker_id: &str,
+        status: &str,
+        last_error: Option<&str>,
+    ) -> Result<bool> {
+        let conn = lock_conn(&self.inner);
+        let now = now_rfc3339();
+        let updated = conn
+            .execute(
+                "UPDATE evo_workflows
+                 SET status = ?1, last_error = ?2, updated_at = ?3
+                 WHERE id = ?4 AND lease_owner = ?5",
+                params![status, last_error, now, workflow_id, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(updated == 1)
+    }
+
     /// Increment the attempt counter.
     pub fn increment_attempt(&self, workflow_id: &str) -> Result<()> {
         let conn = lock_conn(&self.inner);
@@ -516,6 +607,71 @@ impl EvolutionWorkflowStore {
         )
         .map_err(map_sqlite_error)?;
         Ok(())
+    }
+
+    /// Increment attempt and schedule retry only if the worker still owns the workflow lease.
+    pub fn schedule_retry_if_owned(
+        &self,
+        workflow_id: &str,
+        worker_id: &str,
+        last_error: Option<&str>,
+    ) -> Result<bool> {
+        let mut conn = lock_conn(&self.inner);
+        let now_str = now_rfc3339();
+        let tx = conn.transaction().map_err(map_sqlite_error)?;
+
+        let updated = tx
+            .execute(
+                "UPDATE evo_workflows
+                 SET attempt = attempt + 1, updated_at = ?1
+                 WHERE id = ?2 AND lease_owner = ?3",
+                params![now_str, workflow_id, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+
+        if updated != 1 {
+            tx.commit().map_err(map_sqlite_error)?;
+            return Ok(false);
+        }
+
+        let attempt: i32 = tx
+            .query_row(
+                "SELECT attempt FROM evo_workflows WHERE id = ?1 AND lease_owner = ?2",
+                params![workflow_id, worker_id],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+
+        let (status, backoff_secs): (&str, i64) = match attempt {
+            0 => ("RetryScheduled", 60),
+            1 => ("RetryScheduled", 300),
+            2 => ("RetryScheduled", 1800),
+            _ => ("Blocked", 0),
+        };
+
+        if status == "Blocked" {
+            tx.execute(
+                "UPDATE evo_workflows
+                 SET status = 'Blocked', last_error = ?1, lease_owner = NULL,
+                     lease_until = NULL, updated_at = ?2
+                 WHERE id = ?3 AND lease_owner = ?4",
+                params![last_error, now_str, workflow_id, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        } else {
+            let lease_until = (Utc::now() + chrono::Duration::seconds(backoff_secs)).to_rfc3339();
+            tx.execute(
+                "UPDATE evo_workflows
+                 SET status = 'RetryScheduled', last_error = ?1, lease_owner = NULL,
+                     lease_until = ?2, updated_at = ?3
+                 WHERE id = ?4 AND lease_owner = ?5",
+                params![last_error, lease_until, now_str, workflow_id, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        }
+
+        tx.commit().map_err(map_sqlite_error)?;
+        Ok(true)
     }
 
     // ── Events ──────────────────────────────────────────────────────────
@@ -702,13 +858,133 @@ impl EvolutionWorkflowStore {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn lock_conn(inner: &Arc<Mutex<Connection>>) -> std::sync::MutexGuard<'_, Connection> {
-    inner.lock().expect("evolution_workflow store mutex poisoned")
+    inner
+        .lock()
+        .expect("evolution_workflow store mutex poisoned")
 }
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
 }
 
+fn workflow_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRecord> {
+    Ok(WorkflowRecord {
+        id: row.get(0)?,
+        capability_id: row.get(1)?,
+        description: row.get(2)?,
+        provider_kind: row.get(3)?,
+        status: row.get(4)?,
+        attempt: row.get(5)?,
+        max_attempts: row.get(6)?,
+        priority: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+        lease_owner: row.get(10)?,
+        lease_until: row.get(11)?,
+        last_error: row.get(12)?,
+    })
+}
+
 fn map_sqlite_error(e: rusqlite::Error) -> blockcell_core::Error {
     blockcell_core::Error::Storage(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn open_temp_store() -> (TempDir, EvolutionWorkflowStore) {
+        let dir = TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("evolution.db");
+        let store = EvolutionWorkflowStore::open(&db_path).expect("open store");
+        (dir, store)
+    }
+
+    #[test]
+    fn claim_next_claims_workflow_once_across_store_handles() {
+        let (dir, first_store) = open_temp_store();
+        let db_path = dir.path().join("evolution.db");
+        let second_store = EvolutionWorkflowStore::open(&db_path).expect("open second store");
+
+        let workflow_id = first_store
+            .enqueue("cap.test", "test capability", "process")
+            .expect("enqueue");
+
+        let claimed = first_store
+            .claim_next("worker-a", 60)
+            .expect("claim")
+            .expect("claimed workflow");
+        assert_eq!(claimed.id, workflow_id);
+        assert_eq!(claimed.lease_owner.as_deref(), Some("worker-a"));
+
+        let second_claim = second_store.claim_next("worker-b", 60).expect("claim");
+        assert!(second_claim.is_none());
+
+        let stored = first_store
+            .get_workflow(&workflow_id)
+            .expect("get workflow")
+            .expect("workflow exists");
+        assert_eq!(stored.lease_owner.as_deref(), Some("worker-a"));
+    }
+
+    #[test]
+    fn owned_step_updates_reject_stale_workers() {
+        let (_dir, store) = open_temp_store();
+        let workflow_id = store
+            .enqueue("cap.test", "test capability", "process")
+            .expect("enqueue");
+        let claimed = store
+            .claim_next("worker-a", 60)
+            .expect("claim")
+            .expect("claimed workflow");
+        let step_id = store
+            .insert_step(&claimed.id, "BuildPrompt", None)
+            .expect("insert step");
+
+        let stale_update = store
+            .complete_step_if_owned(&workflow_id, &step_id, "worker-b", Some("{}"))
+            .expect("complete as stale worker");
+        assert!(!stale_update);
+
+        let owner_update = store
+            .complete_step_if_owned(&workflow_id, &step_id, "worker-a", Some("{}"))
+            .expect("complete as owner");
+        assert!(owner_update);
+
+        let steps = store.get_steps(&workflow_id).expect("steps");
+        assert_eq!(steps[0].status, "Completed");
+    }
+
+    #[test]
+    fn completed_non_terminal_step_can_be_requeued_and_reclaimed() {
+        let (_dir, store) = open_temp_store();
+        let workflow_id = store
+            .enqueue("cap.test", "test capability", "process")
+            .expect("enqueue");
+        let claimed = store
+            .claim_next("worker-a", 60)
+            .expect("claim")
+            .expect("claimed workflow");
+        let step_id = store
+            .insert_step(&claimed.id, "BuildPrompt", None)
+            .expect("insert step");
+
+        assert!(store
+            .complete_step_if_owned(&workflow_id, &step_id, "worker-a", Some("{}"))
+            .expect("complete step"));
+        assert!(store
+            .update_workflow_status_if_owned(&workflow_id, "worker-a", "Requested", None)
+            .expect("requeue workflow"));
+        assert!(store
+            .release_lease(&workflow_id, "worker-a")
+            .expect("release lease"));
+
+        let reclaimed = store
+            .claim_next("worker-b", 60)
+            .expect("reclaim")
+            .expect("workflow should be claimable again");
+        assert_eq!(reclaimed.id, workflow_id);
+        assert_eq!(reclaimed.lease_owner.as_deref(), Some("worker-b"));
+    }
 }
