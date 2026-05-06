@@ -3184,11 +3184,17 @@ impl AgentRuntime {
         self.core_evolution = Some(core_evo);
     }
 
-    pub fn set_evolution_worker(&mut self, worker: Arc<dyn crate::capability_adapter::EvolutionNotifier>) {
+    pub fn set_evolution_worker(
+        &mut self,
+        worker: Arc<dyn crate::capability_adapter::EvolutionNotifier>,
+    ) {
         self.evolution_worker = Some(worker);
     }
 
-    pub fn set_evolution_workflow_store(&mut self, store: Arc<blockcell_storage::EvolutionWorkflowStore>) {
+    pub fn set_evolution_workflow_store(
+        &mut self,
+        store: Arc<blockcell_storage::EvolutionWorkflowStore>,
+    ) {
         self.evolution_workflow_store = Some(store);
     }
 
@@ -7808,8 +7814,6 @@ impl AgentRuntime {
         mut shutdown_rx: Option<broadcast::Receiver<()>>,
     ) {
         info!("AgentRuntime started");
-
-
 
         // 启动灰度发布调度器（每 60 秒 tick 一次）
         let has_evolution = self.context_builder.evolution_service().is_some();

@@ -329,11 +329,7 @@ pub fn sanitize_thinking_mode_messages(
     // 注入空 reasoning_content 占位符以避免 400 错误
     for msg in messages.iter_mut() {
         if msg.role == "assistant" {
-            if msg
-                .tool_calls
-                .as_ref()
-                .is_some_and(|tc| !tc.is_empty())
-            {
+            if msg.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()) {
                 if msg.reasoning_content.is_none() {
                     msg.reasoning_content = Some(String::new());
                 }

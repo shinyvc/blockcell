@@ -445,15 +445,15 @@ fn default_model_for_provider(provider: &str) -> &'static str {
 
 fn default_max_context_tokens_for_provider(provider: &str) -> u32 {
     match provider.to_lowercase().as_str() {
-        "deepseek" => 1_048_576,     // 1M — DeepSeek V4 Pro
-        "anthropic" => 200_000,      // 200K — Claude Sonnet 4
-        "gemini" => 1_048_576,       // 1M — Gemini 1.5
+        "deepseek" => 1_048_576,        // 1M — DeepSeek V4 Pro
+        "anthropic" => 200_000,         // 200K — Claude Sonnet 4
+        "gemini" => 1_048_576,          // 1M — Gemini 1.5
         "kimi" | "moonshot" => 262_144, // 256K — Kimi K2.6
-        "openai" => 131_072,         // 128K — GPT-4o
-        "groq" => 131_072,           // 128K
-        "zhipu" => 131_072,          // 128K — GLM-5
-        "ollama" => 8_192,           // 8K — depends on local model
-        _ => 131_072,                // 128K default
+        "openai" => 131_072,            // 128K — GPT-4o
+        "groq" => 131_072,              // 128K
+        "zhipu" => 131_072,             // 128K — GLM-5
+        "ollama" => 8_192,              // 8K — depends on local model
+        _ => 131_072,                   // 128K default
     }
 }
 

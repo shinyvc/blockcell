@@ -320,11 +320,7 @@ impl CoreEvolution {
     /// as the CoreEvolutionRecord ID for traceability.
     ///
     /// Returns `Ok(step_output_json)` on success, `Err` on failure.
-    pub async fn run_step(
-        &self,
-        evolution_id: &str,
-        step: EvolutionStep,
-    ) -> Result<String> {
+    pub async fn run_step(&self, evolution_id: &str, step: EvolutionStep) -> Result<String> {
         // For BuildPrompt, ensure the CoreEvolutionRecord exists.
         // If the record doesn't exist yet, create it.
         if step == EvolutionStep::BuildPrompt {
@@ -364,9 +360,10 @@ impl CoreEvolution {
 
             EvolutionStep::GenerateCode => {
                 // Call LLM to generate code.
-                let provider = self.llm_provider.as_ref().ok_or_else(|| {
-                    Error::Evolution("No LLM provider configured".to_string())
-                })?;
+                let provider = self
+                    .llm_provider
+                    .as_ref()
+                    .ok_or_else(|| Error::Evolution("No LLM provider configured".to_string()))?;
 
                 info!(
                     evolution_id = %evolution_id,
@@ -1089,7 +1086,9 @@ impl CoreEvolution {
                         .arg(&script_path)
                         .output()
                         .await
-                        .map_err(|e| Error::Evolution(format!("Failed to check bash syntax: {}", e)))?;
+                        .map_err(|e| {
+                            Error::Evolution(format!("Failed to check bash syntax: {}", e))
+                        })?;
 
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);

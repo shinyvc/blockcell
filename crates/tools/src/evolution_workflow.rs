@@ -68,7 +68,11 @@ impl Tool for EvolutionWorkflowTool {
                 }
             }
             "unblock" => {
-                if params.get("capability_id").and_then(|v| v.as_str()).is_none() {
+                if params
+                    .get("capability_id")
+                    .and_then(|v| v.as_str())
+                    .is_none()
+                {
                     return Err(Error::Validation(
                         "Missing 'capability_id' parameter for action 'unblock'".to_string(),
                     ));

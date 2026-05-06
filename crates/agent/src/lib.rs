@@ -62,7 +62,9 @@ pub use auto_memory::{
     ExtractionCursor, ExtractionCursorManager, ExtractionParams, ExtractionResult, MemoryType,
 };
 pub use bus::MessageBus;
-pub use capability_adapter::{CapabilityRegistryAdapter, CoreEvolutionAdapter, EvolutionNotifier, ProviderLLMBridge};
+pub use capability_adapter::{
+    CapabilityRegistryAdapter, CoreEvolutionAdapter, EvolutionNotifier, ProviderLLMBridge,
+};
 pub use compact::{
     generate_compact_summary, CompactHookRegistry, CompactSummary, CompactSummarySection,
     PostCompactHook, PreCompactHook, RecoveryBudget,

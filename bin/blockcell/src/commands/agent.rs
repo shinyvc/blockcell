@@ -412,10 +412,7 @@ pub async fn run(
     let evo_workflow_db = paths.workspace().join("evo_workflow.db");
     let evo_workflow_store = EvolutionWorkflowStore::open(&evo_workflow_db)?;
     let evo_workflow_store_arc = Arc::new(evo_workflow_store);
-    let evo_worker = EvolutionWorker::new(
-        (*evo_workflow_store_arc).clone(),
-        core_evo_raw.clone(),
-    );
+    let evo_worker = EvolutionWorker::new((*evo_workflow_store_arc).clone(), core_evo_raw.clone());
     let evo_worker_arc = Arc::new(evo_worker);
 
     if let Some(msg) = message {
@@ -465,7 +462,9 @@ pub async fn run(
 
         // 设置核心进化工作流存储和 worker
         runtime.set_evolution_workflow_store(evo_workflow_store_arc.clone());
-        runtime.set_evolution_worker(evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>);
+        runtime.set_evolution_worker(
+            evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>
+        );
 
         // Initialize Layer 5 memory injector (7-layer memory system)
         if let Err(e) = runtime.init_memory_injector().await {
@@ -754,7 +753,9 @@ pub async fn run(
 
         // 设置核心进化工作流存储和 worker
         runtime.set_evolution_workflow_store(evo_workflow_store_arc.clone());
-        runtime.set_evolution_worker(evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>);
+        runtime.set_evolution_worker(
+            evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>
+        );
 
         // Create shared ResponseCache for CLI and runtime
         // This allows the /clear command to clear the in-memory cache

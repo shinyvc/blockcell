@@ -23,9 +23,9 @@ use blockcell_channels::whatsapp::WhatsAppChannel;
 use blockcell_channels::ChannelManager;
 use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths};
 use blockcell_scheduler::{
-    CronJob, CronService, DreamService, DreamServiceConfig, EvolutionWorker, GhostMaintenanceService,
-    GhostMaintenanceServiceConfig, HeartbeatService, JobPayload, JobSchedule, JobState,
-    ScheduleKind,
+    CronJob, CronService, DreamService, DreamServiceConfig, EvolutionWorker,
+    GhostMaintenanceService, GhostMaintenanceServiceConfig, HeartbeatService, JobPayload,
+    JobSchedule, JobState, ScheduleKind,
 };
 use blockcell_skills::{new_registry_handle, CoreEvolution};
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig};
@@ -852,10 +852,7 @@ async fn spawn_agent_runtime(
     let evo_workflow_db = agent_paths.workspace().join("evo_workflow.db");
     let evo_workflow_store = EvolutionWorkflowStore::open(&evo_workflow_db)?;
     let evo_workflow_store_arc = Arc::new(evo_workflow_store);
-    let evo_worker = EvolutionWorker::new(
-        (*evo_workflow_store_arc).clone(),
-        core_evo_raw.clone(),
-    );
+    let evo_worker = EvolutionWorker::new((*evo_workflow_store_arc).clone(), core_evo_raw.clone());
     let evo_worker_arc = Arc::new(evo_worker);
     runtime.set_evolution_workflow_store(evo_workflow_store_arc);
     runtime.set_evolution_worker(evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>);
