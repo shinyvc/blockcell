@@ -160,7 +160,7 @@ impl EvolutionWorkflowStore {
             .query_row(
                 "SELECT COUNT(*) FROM evo_workflows
                  WHERE capability_id = ?1
-                   AND status IN ('Requested', 'Claimed', 'Generating', 'Compiling', 'Validating', 'Loading', 'Blocked')",
+                   AND status IN ('Requested', 'Claimed', 'RetryScheduled', 'Generating', 'Compiling', 'Validating', 'Loading', 'Blocked')",
                 params![capability_id],
                 |row| row.get(0),
             )

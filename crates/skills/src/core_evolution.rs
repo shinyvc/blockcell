@@ -1382,7 +1382,7 @@ impl CoreEvolution {
         }
 
         // Create version snapshot for rollback support
-        if let Err(e) = self.version_manager.create_version(
+        if let Err(e) = self.version_manager.create_version_if_new_artifact(
             &record.capability_id,
             artifact_path,
             CapabilityVersionSource::Evolution,

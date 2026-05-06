@@ -104,6 +104,45 @@ impl CapabilityVersionManager {
         Ok(cap_version)
     }
 
+    /// Create a version snapshot unless an identical artifact hash already exists.
+    ///
+    /// Used by durable workflows when a promotion step may be replayed after a
+    /// crash between the external side effect and the step checkpoint.
+    pub fn create_version_if_new_artifact(
+        &self,
+        capability_id: &str,
+        artifact_path: &str,
+        source: CapabilityVersionSource,
+        changelog: Option<String>,
+    ) -> Result<CapabilityVersion> {
+        let artifact_content = std::fs::read(artifact_path)
+            .map_err(|e| Error::Other(format!("Failed to read artifact: {}", e)))?;
+        let hash = simple_hash(&artifact_content);
+
+        let mut history = self.get_history(capability_id)?;
+        if let Some(existing) = history
+            .versions
+            .iter()
+            .rev()
+            .find(|version| version.artifact_hash == hash)
+            .cloned()
+        {
+            if history.current_version != existing.version {
+                history.current_version = existing.version.clone();
+                self.save_history(&history)?;
+            }
+            info!(
+                capability_id = %capability_id,
+                version = %existing.version,
+                "📝 [能力版本] 复用已有 artifact 版本快照: {} -> {}",
+                capability_id, existing.version
+            );
+            return Ok(existing);
+        }
+
+        self.create_version(capability_id, artifact_path, source, changelog)
+    }
+
     /// Rollback to the previous version. Returns the artifact path of the restored version.
     pub fn rollback(&self, capability_id: &str) -> Result<Option<String>> {
         let mut history = self.get_history(capability_id)?;
@@ -276,6 +315,57 @@ mod tests {
         assert_eq!(v2.version, "v2");
 
         let versions = vm.list_versions("test.cap").unwrap();
+        assert_eq!(versions.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_create_version_if_new_artifact_reuses_existing_hash() {
+        let tmp = std::env::temp_dir().join("test_cap_ver_reuse_hash");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let vm = CapabilityVersionManager::new(tmp.clone());
+        let artifacts_dir = tmp.join("tool_artifacts");
+        std::fs::create_dir_all(&artifacts_dir).unwrap();
+        let artifact = artifacts_dir.join("reuse_cap.sh");
+        std::fs::write(&artifact, "#!/bin/bash\necho same").unwrap();
+
+        let v1 = vm
+            .create_version_if_new_artifact(
+                "reuse.cap",
+                artifact.to_str().unwrap(),
+                CapabilityVersionSource::Evolution,
+                Some("first".to_string()),
+            )
+            .unwrap();
+        let v1_again = vm
+            .create_version_if_new_artifact(
+                "reuse.cap",
+                artifact.to_str().unwrap(),
+                CapabilityVersionSource::Evolution,
+                Some("replay".to_string()),
+            )
+            .unwrap();
+
+        assert_eq!(v1.version, "v1");
+        assert_eq!(v1_again.version, "v1");
+        let versions = vm.list_versions("reuse.cap").unwrap();
+        assert_eq!(versions.len(), 1);
+
+        std::fs::write(&artifact, "#!/bin/bash\necho changed").unwrap();
+        let v2 = vm
+            .create_version_if_new_artifact(
+                "reuse.cap",
+                artifact.to_str().unwrap(),
+                CapabilityVersionSource::Evolution,
+                Some("changed".to_string()),
+            )
+            .unwrap();
+        assert_eq!(v2.version, "v2");
+
+        let versions = vm.list_versions("reuse.cap").unwrap();
         assert_eq!(versions.len(), 2);
 
         let _ = std::fs::remove_dir_all(&tmp);
