@@ -204,6 +204,12 @@ impl CoreEvolutionOps for CoreEvolutionAdapter {
         }))
     }
 
+    /// 处理单个待处理进化，避免长时间持有锁阻塞事件循环
+    async fn run_one_pending_evolution(&self) -> Result<usize> {
+        let core_evo = self.inner.lock().await;
+        core_evo.run_one_pending_evolution().await
+    }
+
     async fn run_pending_evolutions(&self) -> Result<usize> {
         let core_evo = self.inner.lock().await;
         core_evo.run_pending_evolutions().await

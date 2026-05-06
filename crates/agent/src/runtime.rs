@@ -20,6 +20,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
@@ -7784,6 +7785,9 @@ impl AgentRuntime {
     ) {
         info!("AgentRuntime started");
 
+        // 核心进化后台运行标记：防止并发执行，确保 select! 循环不被阻塞
+        static CORE_EVOLUTION_RUNNING: AtomicBool = AtomicBool::new(false);
+
         // 启动灰度发布调度器（每 60 秒 tick 一次）
         let has_evolution = self.context_builder.evolution_service().is_some();
         if has_evolution {
@@ -8128,17 +8132,28 @@ impl AgentRuntime {
                         }
                     }
 
-                    // Process pending core evolutions
+                    // 处理待处理的核心进化 — 后台执行，每次只处理 1 个，防止阻塞 select! 循环
                     if let Some(ref core_evo_handle) = self.core_evolution {
-                        let core_evo = core_evo_handle.lock().await;
-                        match core_evo.run_pending_evolutions().await {
-                            Ok(n) if n > 0 => {
-                                info!(count = n, "🧬 [核心进化] 处理了 {} 个待处理进化", n);
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "🧬 [核心进化] 处理待处理进化出错");
-                            }
-                            _ => {}
+                        // AtomicBool 防止并发：上一个进化还在跑时跳过本次
+                        if !CORE_EVOLUTION_RUNNING.load(Ordering::Relaxed) {
+                            CORE_EVOLUTION_RUNNING.store(true, Ordering::Relaxed);
+                            let handle = core_evo_handle.clone();
+                            tokio::spawn(async move {
+                                let core_evo = handle.lock().await;
+                                // 每次只处理 1 个进化请求，避免长时间持有锁
+                                match core_evo.run_one_pending_evolution().await {
+                                    Ok(n) if n > 0 => {
+                                        info!(count = n, "🧬 [核心进化] 后台处理了 1 个待处理进化");
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "🧬 [核心进化] 后台处理待处理进化出错");
+                                    }
+                                    _ => {}
+                                }
+                                CORE_EVOLUTION_RUNNING.store(false, Ordering::Relaxed);
+                            });
+                        } else {
+                            debug!("🧬 [核心进化] 上一次进化仍在运行，跳过本次 tick");
                         }
                     }
 

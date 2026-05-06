@@ -154,6 +154,53 @@ impl CoreEvolution {
         self.llm_provider = Some(provider);
     }
 
+    /// 处理单个待处理（Requested）进化请求，返回处理数量（0 或 1）。
+    ///
+    /// 与 `run_pending_evolutions`（处理所有待处理请求，可能阻塞事件循环数分钟）不同，
+    /// 此方法每次调用只处理 1 个请求，保持每个 tick 轻量且响应迅速。
+    pub async fn run_one_pending_evolution(&self) -> Result<usize> {
+        let provider = match &self.llm_provider {
+            Some(p) => p.clone(),
+            None => {
+                debug!("🧬 [核心进化] 无 LLM provider，跳过待处理进化");
+                return Ok(0);
+            }
+        };
+
+        let records = self.list_records()?;
+        let pending: Vec<_> = records
+            .iter()
+            .filter(|r| r.status == CoreEvolutionStatus::Requested)
+            .collect();
+
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        // 只处理第一个待处理进化
+        let record = &pending[0];
+        info!(
+            remaining = pending.len(),
+            "🧬 [核心进化] 发现 {} 个待处理请求，本次处理 1 个",
+            pending.len()
+        );
+
+        match self.run_evolution(&record.id, provider.as_ref()).await {
+            Ok(success) => {
+                if success {
+                    info!(id = %record.id, "🧬 [核心进化] ✅ 进化成功: {}", record.capability_id);
+                } else {
+                    warn!(id = %record.id, "🧬 [核心进化] ❌ 进化失败: {}", record.capability_id);
+                }
+                Ok(1)
+            }
+            Err(e) => {
+                warn!(id = %record.id, error = %e, "🧬 [核心进化] 进化出错: {}", record.capability_id);
+                Ok(0)
+            }
+        }
+    }
+
     /// Process all pending (Requested) evolutions using the configured LLM provider.
     /// Returns the number of evolutions processed.
     pub async fn run_pending_evolutions(&self) -> Result<usize> {
@@ -739,11 +786,11 @@ impl CoreEvolution {
 
         match record.provider_kind {
             ProviderKind::Process | ProviderKind::BuiltIn => {
-                // Shell script — just write to file and make executable
+                // Shell script — 写入文件并设置可执行权限
                 let script_path = self.artifacts_dir.join(format!("{}.sh", safe_id));
                 std::fs::write(&script_path, code)?;
 
-                // Make executable
+                // 设置可执行权限（仅 Unix）
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -752,27 +799,41 @@ impl CoreEvolution {
                     std::fs::set_permissions(&script_path, perms)?;
                 }
 
-                // Validate syntax with bash -n
-                let output = tokio::process::Command::new("bash")
-                    .arg("-n")
-                    .arg(&script_path)
-                    .output()
-                    .await
-                    .map_err(|e| Error::Evolution(format!("Failed to check bash syntax: {}", e)))?;
+                // 语法验证：Unix 用 bash -n，Windows 跳过（bash 不可用）
+                #[cfg(unix)]
+                {
+                    let output = tokio::process::Command::new("bash")
+                        .arg("-n")
+                        .arg(&script_path)
+                        .output()
+                        .await
+                        .map_err(|e| Error::Evolution(format!("Failed to check bash syntax: {}", e)))?;
 
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(Error::Evolution(format!("Bash syntax error: {}", stderr)));
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Err(Error::Evolution(format!("Bash syntax error: {}", stderr)));
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    // Windows 上 bash 不可用，跳过语法检查
+                    // 脚本将在实际执行时由 Git Bash 或 WSL 解释
+                    debug!(
+                        path = %script_path.display(),
+                        "🧬 [核心进化] Windows 环境，跳过 bash 语法检查"
+                    );
                 }
 
-                Ok(script_path.to_string_lossy().to_string())
+                // 返回路径时统一使用正斜杠，避免 Windows 反斜杠在其他上下文中被吞掉
+                let path_str = script_path.to_string_lossy().replace('\\', "/");
+                Ok(path_str)
             }
             ProviderKind::ExternalApi => {
-                // Python script
+                // Python 脚本
                 let script_path = self.artifacts_dir.join(format!("{}.py", safe_id));
                 std::fs::write(&script_path, code)?;
 
-                // Validate syntax with python3 -m py_compile
+                // 使用 python3 -m py_compile 验证语法
                 let output = tokio::process::Command::new("python3")
                     .arg("-m")
                     .arg("py_compile")
@@ -786,8 +847,8 @@ impl CoreEvolution {
                         return Err(Error::Evolution(format!("Python syntax error: {}", stderr)));
                     }
                     Err(e) => {
-                        // python3 not available, skip syntax check
-                        warn!("python3 not available for syntax check: {}", e);
+                        // python3 不可用，跳过语法检查
+                        warn!("python3 不可用，跳过语法检查: {}", e);
                     }
                     _ => {}
                 }

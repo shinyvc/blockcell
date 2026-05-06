@@ -242,6 +242,8 @@ pub trait CoreEvolutionOps: Send + Sync {
     async fn list_records_json(&self) -> Result<Value>;
     /// Get a specific evolution record.
     async fn get_record_json(&self, evolution_id: &str) -> Result<Value>;
+    /// 处理单个待处理进化，返回处理数量（0 或 1）
+    async fn run_one_pending_evolution(&self) -> Result<usize>;
     /// Process all pending evolutions. Returns number processed.
     async fn run_pending_evolutions(&self) -> Result<usize>;
     /// Unblock a previously blocked capability.
