@@ -401,7 +401,7 @@ impl EvolutionWorker {
         let workflow_id = workflow_id.to_string();
         let worker_id = self.worker_id.clone();
         let lease_duration_secs = self.lease_duration_secs;
-        let heartbeat_secs = std::cmp::max(5, std::cmp::min(60, lease_duration_secs / 3)) as u64;
+        let heartbeat_secs = (lease_duration_secs / 3).clamp(5, 60) as u64;
         let (stop_tx, mut stop_rx) = oneshot::channel();
 
         let handle = tokio::spawn(async move {

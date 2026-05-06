@@ -642,10 +642,12 @@ impl EvolutionWorkflowStore {
             )
             .map_err(map_sqlite_error)?;
 
+        // After increment, attempt values are 1,2,3 (pre-increment was 0,1,2).
+        // Backoff schedule: pre-increment 0→60s, 1→300s, 2→1800s, then Blocked.
         let (status, backoff_secs): (&str, i64) = match attempt {
-            0 => ("RetryScheduled", 60),
-            1 => ("RetryScheduled", 300),
-            2 => ("RetryScheduled", 1800),
+            1 => ("RetryScheduled", 60),
+            2 => ("RetryScheduled", 300),
+            3 => ("RetryScheduled", 1800),
             _ => ("Blocked", 0),
         };
 

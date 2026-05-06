@@ -323,21 +323,19 @@ impl CoreEvolution {
     pub async fn run_step(&self, evolution_id: &str, step: EvolutionStep) -> Result<String> {
         // For BuildPrompt, ensure the CoreEvolutionRecord exists.
         // If the record doesn't exist yet, create it.
-        if step == EvolutionStep::BuildPrompt {
-            if self.load_record(evolution_id).is_err() {
-                // Record doesn't exist — we need to create it.
-                // The workflow store's enqueue() already has capability_id and description,
-                // but CoreEvolutionRecord needs them. We'll create a minimal record.
-                // The worker will pass these via a separate method.
-                warn!(
-                    evolution_id = %evolution_id,
-                    "CoreEvolutionRecord does not exist for BuildPrompt step. \
-                     Use run_step_with_context() instead."
-                );
-                return Err(Error::Evolution(
-                    "CoreEvolutionRecord not found. Use run_step_with_context().".to_string(),
-                ));
-            }
+        if step == EvolutionStep::BuildPrompt && self.load_record(evolution_id).is_err() {
+            // Record doesn't exist — we need to create it.
+            // The workflow store's enqueue() already has capability_id and description,
+            // but CoreEvolutionRecord needs them. We'll create a minimal record.
+            // The worker will pass these via a separate method.
+            warn!(
+                evolution_id = %evolution_id,
+                "CoreEvolutionRecord does not exist for BuildPrompt step. \
+                 Use run_step_with_context() instead."
+            );
+            return Err(Error::Evolution(
+                "CoreEvolutionRecord not found. Use run_step_with_context().".to_string(),
+            ));
         }
 
         let mut record = self.load_record(evolution_id)?;

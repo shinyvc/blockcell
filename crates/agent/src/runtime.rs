@@ -8150,11 +8150,22 @@ impl AgentRuntime {
                         .process_system_event_tick(chrono::Utc::now().timestamp_millis())
                         .await;
 
-                    // Evolution rollout tick
+                    // Evolution rollout tick — use timeout to prevent blocking select! loop
+                    // (tick() runs LLM calls that can take seconds to minutes;
+                    //  a 30s timeout prevents it from indefinitely blocking user input)
                     if has_evolution {
                         if let Some(evo_service) = self.context_builder.evolution_service() {
-                            if let Err(e) = evo_service.tick().await {
-                                warn!(error = %e, "Evolution rollout tick error");
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                evo_service.tick(),
+                            ).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    warn!(error = %e, "Evolution rollout tick error");
+                                }
+                                Err(_) => {
+                                    warn!("Evolution rollout tick timed out after 30s, will retry next tick");
+                                }
                             }
                         }
                     }

@@ -78,7 +78,7 @@ pub enum ToolCallMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelEntry {
-    /// 模型名称，例如 "deepseek-v4-pro"、"claude-3-5-sonnet"
+    /// 模型名称，例如 "deepseek-chat-pro"、"claude-3-5-sonnet"
     pub model: String,
     /// 对应 providers 表中的 key，例如 "deepseek"、"anthropic"
     pub provider: String,
@@ -201,7 +201,7 @@ fn default_llm_retry_delay_ms() -> u64 {
 }
 
 fn default_max_context_tokens() -> u32 {
-    1_048_576 // 1M 上下文，适配 DeepSeek V4 Pro 等 1M 上下文模型
+    1_048_576 // 1M 上下文
 }
 
 fn default_true() -> bool {

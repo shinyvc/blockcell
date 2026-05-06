@@ -2238,7 +2238,10 @@ ls -la
 /// NVIDIA NIM 使用 `chat_template_kwargs` 而非顶层 `thinking`/`reasoning_effort`。
 fn is_nvidia_nim(provider_name: &str) -> bool {
     let lower = provider_name.to_ascii_lowercase();
-    lower.contains("nvidia") || lower.contains("nim")
+    lower.contains("nvidia")
+        || lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|token| token == "nim")
 }
 
 /// 判断 provider 是否支持 thinking/reasoning 模式参数。
