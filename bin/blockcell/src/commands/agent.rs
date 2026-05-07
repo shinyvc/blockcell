@@ -45,6 +45,35 @@ use tracing::{info, warn};
 use super::memory_store::open_memory_store;
 use super::slash_commands::{CommandContext, CommandResult, SLASH_COMMAND_HANDLER};
 
+fn create_skill_evolution_llm_provider(
+    config: &Config,
+    provider_pool: &ProviderPool,
+) -> Option<Arc<dyn blockcell_skills::LLMProvider>> {
+    let provider: Option<Arc<dyn Provider>> = if config.agents.defaults.evolution_model.is_some()
+        || config.agents.defaults.evolution_provider.is_some()
+    {
+        match super::provider::create_evolution_provider(config) {
+            Ok(evo_provider) => {
+                info!("Skill evolution provider configured with independent model");
+                Some(Arc::from(evo_provider))
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to create skill evolution provider: {}, using main provider",
+                    e
+                );
+                provider_pool.acquire().map(|(_, p)| p)
+            }
+        }
+    } else {
+        provider_pool.acquire().map(|(_, p)| p)
+    };
+
+    provider.map(|p| {
+        Arc::new(SkillEvolutionLLMBridge::new_arc(p)) as Arc<dyn blockcell_skills::LLMProvider>
+    })
+}
+
 /// Built-in tools grouped by category for /tools display.
 /// This must include ALL tools registered in ToolRegistry::with_defaults().
 const BUILTIN_TOOLS: &[(&str, &[(&str, &str)])] = &[
@@ -417,9 +446,7 @@ pub async fn run(
     let evo_worker = EvolutionWorker::new((*evo_workflow_store_arc).clone(), core_evo_raw.clone());
     let evo_worker_arc = Arc::new(evo_worker);
 
-    let skill_evo_llm_provider = provider_pool.acquire().map(|(_, p)| {
-        Arc::new(SkillEvolutionLLMBridge::new_arc(p)) as Arc<dyn blockcell_skills::LLMProvider>
-    });
+    let skill_evo_llm_provider = create_skill_evolution_llm_provider(&config, &provider_pool);
     let skill_evo_workflow_db = paths.workspace().join("skill_evolution_workflow.db");
     let skill_evo_workflow_store = EvolutionWorkflowStore::open(&skill_evo_workflow_db)?;
     let skill_evo_worker = SkillEvolutionWorker::new(

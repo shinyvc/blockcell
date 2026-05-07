@@ -196,12 +196,20 @@ impl SkillEvolutionWorker {
                     &self.worker_id,
                     &message,
                 );
-                let _ = self.store.update_workflow_status_if_owned(
-                    &workflow.id,
-                    &self.worker_id,
-                    "Failed",
-                    Some(&message),
-                );
+                if self.skill_record_is_terminal(&workflow) {
+                    let _ = self.store.update_workflow_status_if_owned(
+                        &workflow.id,
+                        &self.worker_id,
+                        "Failed",
+                        Some(&message),
+                    );
+                } else {
+                    let _ = self.store.schedule_retry_if_owned(
+                        &workflow.id,
+                        &self.worker_id,
+                        Some(&message),
+                    );
+                }
             }
         }
 
@@ -220,10 +228,9 @@ impl SkillEvolutionWorker {
 
         let existing = self.store.list_workflows(None)?;
         for (skill_name, evolution_id) in pending {
-            if existing
-                .iter()
-                .any(|workflow| workflow.description == evolution_id)
-            {
+            if existing.iter().any(|workflow| {
+                workflow.description == evolution_id && Self::workflow_blocks_enqueue(workflow)
+            }) {
                 continue;
             }
 
@@ -238,6 +245,13 @@ impl SkillEvolutionWorker {
         }
 
         Ok(())
+    }
+
+    fn workflow_blocks_enqueue(workflow: &WorkflowRecord) -> bool {
+        !matches!(
+            workflow.status.as_str(),
+            "Promoted" | "Failed" | "Cancelled"
+        )
     }
 
     async fn run_skill_workflow(&self, workflow: &WorkflowRecord) -> Result<String> {
@@ -265,6 +279,22 @@ impl SkillEvolutionWorker {
                 other
             ))),
         }
+    }
+
+    fn skill_record_is_terminal(&self, workflow: &WorkflowRecord) -> bool {
+        self.service
+            .evolution()
+            .load_record(&workflow.description)
+            .map(|record| {
+                matches!(
+                    *record.status.normalize(),
+                    EvolutionStatus::Completed
+                        | EvolutionStatus::Failed
+                        | EvolutionStatus::RolledBack
+                        | EvolutionStatus::Observing
+                )
+            })
+            .unwrap_or(false)
     }
 
     fn complete_step(

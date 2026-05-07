@@ -314,16 +314,8 @@ pub struct EvolutionService {
 
 impl EvolutionService {
     fn is_in_progress_status(status: &EvolutionStatus) -> bool {
-        matches!(
-            *status.normalize(),
-            EvolutionStatus::Triggered
-                | EvolutionStatus::Generating
-                | EvolutionStatus::Generated
-                | EvolutionStatus::Auditing
-                | EvolutionStatus::AuditPassed
-                | EvolutionStatus::CompilePassed
-                | EvolutionStatus::Observing
-        )
+        Self::is_pipeline_runnable_status(status)
+            || matches!(*status.normalize(), EvolutionStatus::Observing)
     }
 
     fn is_pipeline_runnable_status(status: &EvolutionStatus) -> bool {
@@ -1748,18 +1740,8 @@ impl EvolutionService {
                 Err(_) => continue,
             };
 
-            // Only adopt records that are in an active pipeline state
-            let dominated = matches!(
-                record.status,
-                EvolutionStatus::Triggered
-                    | EvolutionStatus::Generating
-                    | EvolutionStatus::Generated
-                    | EvolutionStatus::Auditing
-                    | EvolutionStatus::AuditPassed
-                    | EvolutionStatus::CompilePassed
-                    | EvolutionStatus::Observing
-                    | EvolutionStatus::RollingOut
-            );
+            // Adopt every state the durable worker can resume, plus observation.
+            let dominated = Self::is_in_progress_status(&record.status);
             if !dominated {
                 continue;
             }

@@ -60,6 +60,37 @@ use tower_http::cors::CorsLayer;
 
 use super::memory_store::open_memory_store;
 
+fn create_skill_evolution_llm_provider(
+    config: &Config,
+    provider_pool: &blockcell_providers::ProviderPool,
+    agent_id: &str,
+) -> Option<Arc<dyn blockcell_skills::LLMProvider>> {
+    let provider: Option<Arc<dyn blockcell_providers::Provider>> = if config
+        .agents
+        .defaults
+        .evolution_model
+        .is_some()
+        || config.agents.defaults.evolution_provider.is_some()
+    {
+        match super::provider::create_evolution_provider(config) {
+            Ok(evo_provider) => {
+                info!(agent_id = %agent_id, "Skill evolution provider configured with independent model");
+                Some(Arc::from(evo_provider))
+            }
+            Err(e) => {
+                warn!(agent_id = %agent_id, error = %e, "Failed to create skill evolution provider; using main provider");
+                provider_pool.acquire().map(|(_, p)| p)
+            }
+        }
+    } else {
+        provider_pool.acquire().map(|(_, p)| p)
+    };
+
+    provider.map(|p| {
+        Arc::new(SkillEvolutionLLMBridge::new_arc(p)) as Arc<dyn blockcell_skills::LLMProvider>
+    })
+}
+
 mod alerts;
 mod banner;
 mod capabilities;
@@ -857,9 +888,8 @@ async fn spawn_agent_runtime(
     runtime.set_evolution_workflow_store(evo_workflow_store_arc);
     runtime.set_evolution_worker(evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>);
 
-    let skill_evo_llm_provider = provider_pool.acquire().map(|(_, p)| {
-        Arc::new(SkillEvolutionLLMBridge::new_arc(p)) as Arc<dyn blockcell_skills::LLMProvider>
-    });
+    let skill_evo_llm_provider =
+        create_skill_evolution_llm_provider(&agent_config, &provider_pool, agent_id);
     let skill_evo_workflow_db = agent_paths.workspace().join("skill_evolution_workflow.db");
     let skill_evo_workflow_store = EvolutionWorkflowStore::open(&skill_evo_workflow_db)?;
     let skill_evo_worker = SkillEvolutionWorker::new(
