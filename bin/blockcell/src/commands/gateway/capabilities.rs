@@ -28,6 +28,15 @@ pub(super) async fn handle_tools(State(state): State<GatewayState>) -> impl Into
     }))
 }
 
+/// 判断目录是否包含 skill 标识文件
+fn is_skill_dir(path: &std::path::Path) -> bool {
+    path.join("SKILL.md").exists()
+        || path.join("meta.yaml").exists()
+        || path.join("meta.json").exists()
+        || path.join("SKILL.rhai").exists()
+        || path.join("SKILL.py").exists()
+}
+
 /// 递归扫描技能目录，收集 skill 信息（支持 skill 包目录）
 fn collect_skill_entries(
     dir: &std::path::Path,
@@ -45,51 +54,51 @@ fn collect_skill_entries(
                 continue;
             }
 
-            // skill 包目录：包含 manifest.json，递归扫描子目录
-            if path.join("manifest.json").exists() {
-                collect_skill_entries(&path, source, disabled_skills, out);
-                continue;
-            }
+            // 目录本身是 skill：优先加载自身
+            if is_skill_dir(&path) {
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                let meta_path = path.join("meta.yaml");
+                let has_rhai = path.join("SKILL.rhai").exists();
+                let has_py = path.join("SKILL.py").exists();
+                let has_md = path.join("SKILL.md").exists();
+                let enabled = !disabled_skills.contains(&name);
 
-            // 跳过没有 skill 标识文件的目录
-            if !path.join("SKILL.md").exists()
-                && !path.join("meta.yaml").exists()
-                && !path.join("meta.json").exists()
-            {
-                continue;
-            }
+                let mut skill_info = serde_json::json!({
+                    "name": name,
+                    "source": source,
+                    "has_rhai": has_rhai,
+                    "has_py": has_py,
+                    "has_md": has_md,
+                    "enabled": enabled,
+                });
 
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            let meta_path = path.join("meta.yaml");
-            let has_rhai = path.join("SKILL.rhai").exists();
-            let has_py = path.join("SKILL.py").exists();
-            let has_md = path.join("SKILL.md").exists();
-            let enabled = !disabled_skills.contains(&name);
-
-            let mut skill_info = serde_json::json!({
-                "name": name,
-                "source": source,
-                "has_rhai": has_rhai,
-                "has_py": has_py,
-                "has_md": has_md,
-                "enabled": enabled,
-            });
-
-            if meta_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                    if let Ok(parsed) = serde_yaml::from_str::<serde_json::Value>(&content) {
-                        if let Some(desc) = parsed.get("description") {
-                            skill_info["description"] = desc.clone();
+                if meta_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&meta_path) {
+                        if let Ok(parsed) = serde_yaml::from_str::<serde_json::Value>(&content) {
+                            if let Some(desc) = parsed.get("description") {
+                                skill_info["description"] = desc.clone();
+                            }
+                            skill_info["meta"] = parsed;
                         }
-                        skill_info["meta"] = parsed;
                     }
                 }
+
+                out.push(skill_info);
+
+                // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
+                if path.join("manifest.json").exists() {
+                    collect_skill_entries(&path, source, disabled_skills, out);
+                }
+                continue;
             }
 
-            out.push(skill_info);
+            // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
+            if path.join("manifest.json").exists() {
+                collect_skill_entries(&path, source, disabled_skills, out);
+            }
         }
     }
 }
@@ -112,55 +121,54 @@ fn collect_skill_entries_filtered(
                 continue;
             }
 
-            // skill 包目录：包含 manifest.json，递归扫描子目录
+            // 目录本身是 skill：优先加载自身
+            if is_skill_dir(&path) {
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+
+                if !existing_names.contains(name.as_str()) {
+                    let meta_path = path.join("meta.yaml");
+                    let has_rhai = path.join("SKILL.rhai").exists();
+                    let has_py = path.join("SKILL.py").exists();
+                    let has_md = path.join("SKILL.md").exists();
+                    let enabled = !disabled_skills.contains(&name);
+
+                    let mut skill_info = serde_json::json!({
+                        "name": name,
+                        "source": source,
+                        "has_rhai": has_rhai,
+                        "has_py": has_py,
+                        "has_md": has_md,
+                        "enabled": enabled,
+                    });
+
+                    if meta_path.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&meta_path) {
+                            if let Ok(parsed) = serde_yaml::from_str::<serde_json::Value>(&content) {
+                                if let Some(desc) = parsed.get("description") {
+                                    skill_info["description"] = desc.clone();
+                                }
+                                skill_info["meta"] = parsed;
+                            }
+                        }
+                    }
+
+                    out.push(skill_info);
+                }
+
+                // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
+                if path.join("manifest.json").exists() {
+                    collect_skill_entries_filtered(&path, source, disabled_skills, existing_names, out);
+                }
+                continue;
+            }
+
+            // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
             if path.join("manifest.json").exists() {
                 collect_skill_entries_filtered(&path, source, disabled_skills, existing_names, out);
-                continue;
             }
-
-            // 跳过没有 skill 标识文件的目录
-            if !path.join("SKILL.md").exists()
-                && !path.join("meta.yaml").exists()
-                && !path.join("meta.json").exists()
-            {
-                continue;
-            }
-
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            if existing_names.contains(name.as_str()) {
-                continue;
-            }
-
-            let meta_path = path.join("meta.yaml");
-            let has_rhai = path.join("SKILL.rhai").exists();
-            let has_py = path.join("SKILL.py").exists();
-            let has_md = path.join("SKILL.md").exists();
-            let enabled = !disabled_skills.contains(&name);
-
-            let mut skill_info = serde_json::json!({
-                "name": name,
-                "source": source,
-                "has_rhai": has_rhai,
-                "has_py": has_py,
-                "has_md": has_md,
-                "enabled": enabled,
-            });
-
-            if meta_path.exists() {
-                if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                    if let Ok(parsed) = serde_yaml::from_str::<serde_json::Value>(&content) {
-                        if let Some(desc) = parsed.get("description") {
-                            skill_info["description"] = desc.clone();
-                        }
-                        skill_info["meta"] = parsed;
-                    }
-                }
-            }
-
-            out.push(skill_info);
         }
     }
 }
@@ -183,22 +191,21 @@ fn collect_skill_search_entries(
                 continue;
             }
 
-            // skill 包目录：包含 manifest.json，递归扫描子目录
+            // 目录本身是 skill：优先检查自身
+            if is_skill_dir(&path) {
+                if let Some(result) = check_skill(&path, source) {
+                    out.push(result);
+                }
+                // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
+                if path.join("manifest.json").exists() {
+                    collect_skill_search_entries(&path, source, query, check_skill, out);
+                }
+                continue;
+            }
+
+            // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
             if path.join("manifest.json").exists() {
                 collect_skill_search_entries(&path, source, query, check_skill, out);
-                continue;
-            }
-
-            // 跳过没有 skill 标识文件的目录
-            if !path.join("SKILL.md").exists()
-                && !path.join("meta.yaml").exists()
-                && !path.join("meta.json").exists()
-            {
-                continue;
-            }
-
-            if let Some(result) = check_skill(&path, source) {
-                out.push(result);
             }
         }
     }
@@ -223,32 +230,31 @@ fn collect_skill_search_entries_filtered(
                 continue;
             }
 
-            // skill 包目录：包含 manifest.json，递归扫描子目录
+            // 目录本身是 skill：优先检查自身
+            if is_skill_dir(&path) {
+                let name = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                if !existing_names.contains(name.as_str()) {
+                    if let Some(result) = check_skill(&path, source) {
+                        out.push(result);
+                    }
+                }
+                // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
+                if path.join("manifest.json").exists() {
+                    collect_skill_search_entries_filtered(
+                        &path, source, query, existing_names, check_skill, out,
+                    );
+                }
+                continue;
+            }
+
+            // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
             if path.join("manifest.json").exists() {
                 collect_skill_search_entries_filtered(
                     &path, source, query, existing_names, check_skill, out,
                 );
-                continue;
-            }
-
-            // 跳过没有 skill 标识文件的目录
-            if !path.join("SKILL.md").exists()
-                && !path.join("meta.yaml").exists()
-                && !path.join("meta.json").exists()
-            {
-                continue;
-            }
-
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            if existing_names.contains(name.as_str()) {
-                continue;
-            }
-
-            if let Some(result) = check_skill(&path, source) {
-                out.push(result);
             }
         }
     }

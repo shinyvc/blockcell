@@ -98,6 +98,15 @@ impl SlashCommand for SkillsCommand {
     }
 }
 
+/// 判断目录是否包含 skill 标识文件
+fn is_skill_dir(path: &std::path::Path) -> bool {
+    path.join("SKILL.md").exists()
+        || path.join("meta.yaml").exists()
+        || path.join("meta.json").exists()
+        || path.join("SKILL.rhai").exists()
+        || path.join("SKILL.py").exists()
+}
+
 /// 扫描技能目录（支持 skill 包递归）
 fn scan_skill_dirs(dir: &std::path::Path) -> Vec<(String, String)> {
     let mut skills = Vec::new();
@@ -111,24 +120,23 @@ fn scan_skill_dirs(dir: &std::path::Path) -> Vec<(String, String)> {
                 continue;
             }
 
-            // skill 包目录：包含 manifest.json，递归扫描子目录
+            // 目录本身是 skill：优先加载自身
+            if is_skill_dir(&path) {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    let desc = read_skill_description(&path);
+                    skills.push((name.to_string(), desc));
+                }
+                // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
+                if path.join("manifest.json").exists() {
+                    skills.extend(scan_skill_dirs(&path));
+                }
+                continue;
+            }
+
+            // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
             if path.join("manifest.json").exists() {
                 skills.extend(scan_skill_dirs(&path));
                 continue;
-            }
-
-            // 跳过没有 skill 标识文件的目录
-            if !path.join("SKILL.md").exists()
-                && !path.join("meta.yaml").exists()
-                && !path.join("meta.json").exists()
-            {
-                continue;
-            }
-
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                // 尝试从 SKILL.md 或 README.md 读取描述
-                let desc = read_skill_description(&path);
-                skills.push((name.to_string(), desc));
             }
         }
     }
