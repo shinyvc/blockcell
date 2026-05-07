@@ -72,10 +72,41 @@ struct OpenClawInstallSpecRaw {
 // 公开 API
 // ---------------------------------------------------------------------------
 
-/// 从 skill 目录读取描述，优先从 SKILL.md frontmatter 提取，
-/// 然后尝试 meta.yaml / meta.json。返回空字符串表示无描述。
+/// 从 skill 目录读取描述。优先级：
+/// 1. meta.yaml / meta.json（BlockCell 原生格式，短描述）
+/// 2. SKILL.md frontmatter（OpenClaw 格式）
+/// 3. SKILL.md 正文首行（fallback）
+/// 返回空字符串表示无描述。
 pub fn read_skill_description(skill_dir: &Path) -> String {
-    // 1. SKILL.md（OpenClaw frontmatter 或纯 Markdown）
+    // 1. meta.yaml（BlockCell 原生格式优先）
+    let meta_yaml = skill_dir.join("meta.yaml");
+    if meta_yaml.exists() {
+        if let Ok(content) = std::fs::read_to_string(&meta_yaml) {
+            if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(&content) {
+                if let Some(desc) = val.get("description").and_then(|v| v.as_str()) {
+                    if !desc.is_empty() {
+                        return desc.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. meta.json
+    let meta_json = skill_dir.join("meta.json");
+    if meta_json.exists() {
+        if let Ok(content) = std::fs::read_to_string(&meta_json) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(desc) = val.get("description").and_then(|v| v.as_str()) {
+                    if !desc.is_empty() {
+                        return desc.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. SKILL.md（OpenClaw frontmatter 或纯 Markdown fallback）
     let skill_md = skill_dir.join("SKILL.md");
     if skill_md.exists() {
         if let Ok(content) = std::fs::read_to_string(&skill_md) {
@@ -89,7 +120,9 @@ pub fn read_skill_description(skill_dir: &Path) -> String {
                     let yaml = rest[..end].trim();
                     if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(yaml) {
                         if let Some(desc) = val.get("description").and_then(|v| v.as_str()) {
-                            return desc.to_string();
+                            if !desc.is_empty() {
+                                return desc.to_string();
+                            }
                         }
                     }
                 }
@@ -106,30 +139,6 @@ pub fn read_skill_description(skill_dir: &Path) -> String {
                     return trimmed.chars().take(40).collect();
                 }
                 return trimmed.to_string();
-            }
-        }
-    }
-
-    // 2. meta.yaml
-    let meta_yaml = skill_dir.join("meta.yaml");
-    if meta_yaml.exists() {
-        if let Ok(content) = std::fs::read_to_string(&meta_yaml) {
-            if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(&content) {
-                if let Some(desc) = val.get("description").and_then(|v| v.as_str()) {
-                    return desc.to_string();
-                }
-            }
-        }
-    }
-
-    // 3. meta.json
-    let meta_json = skill_dir.join("meta.json");
-    if meta_json.exists() {
-        if let Ok(content) = std::fs::read_to_string(&meta_json) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(desc) = val.get("description").and_then(|v| v.as_str()) {
-                    return desc.to_string();
-                }
             }
         }
     }
