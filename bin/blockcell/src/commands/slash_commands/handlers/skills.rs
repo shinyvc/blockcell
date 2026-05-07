@@ -98,7 +98,7 @@ impl SlashCommand for SkillsCommand {
     }
 }
 
-/// 扫描技能目录
+/// 扫描技能目录（支持 skill 包递归）
 fn scan_skill_dirs(dir: &std::path::Path) -> Vec<(String, String)> {
     let mut skills = Vec::new();
     if !dir.exists() {
@@ -107,30 +107,103 @@ fn scan_skill_dirs(dir: &std::path::Path) -> Vec<(String, String)> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    // 尝试读取描述
-                    let desc_path = path.join("README.md");
-                    let desc = if desc_path.exists() {
-                        if let Ok(content) = std::fs::read_to_string(&desc_path) {
-                            // 提取第一行作为描述
-                            content
-                                .lines()
-                                .next()
-                                .map(|s| s.trim_start_matches('#').trim().to_string())
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        }
-                    } else {
-                        String::new()
-                    };
-                    skills.push((name.to_string(), desc));
-                }
+            if !path.is_dir() {
+                continue;
+            }
+
+            // skill 包目录：包含 manifest.json，递归扫描子目录
+            if path.join("manifest.json").exists() {
+                skills.extend(scan_skill_dirs(&path));
+                continue;
+            }
+
+            // 跳过没有 skill 标识文件的目录
+            if !path.join("SKILL.md").exists()
+                && !path.join("meta.yaml").exists()
+                && !path.join("meta.json").exists()
+            {
+                continue;
+            }
+
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                // 尝试从 SKILL.md 或 README.md 读取描述
+                let desc = read_skill_description(&path);
+                skills.push((name.to_string(), desc));
             }
         }
     }
     skills
+}
+
+/// 从 SKILL.md（OpenClaw frontmatter）或 meta.yaml 读取技能描述
+fn read_skill_description(dir: &std::path::Path) -> String {
+    // 优先从 SKILL.md 的 frontmatter 提取 description
+    let skill_md = dir.join("SKILL.md");
+    if skill_md.exists() {
+        if let Ok(content) = std::fs::read_to_string(&skill_md) {
+            // OpenClaw 格式：--- frontmatter --- 中有 description 字段
+            if content.starts_with("---") {
+                if let Some(end) = content[3..].find("---") {
+                    let frontmatter = &content[3..3 + end];
+                    for line in frontmatter.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("description:") {
+                            return trimmed
+                                .trim_start_matches("description:")
+                                .trim()
+                                .trim_matches('"')
+                                .trim_matches('\'')
+                                .to_string();
+                        }
+                    }
+                }
+            }
+            // 非 frontmatter：取第一个非标题行作为描述
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let char_count = trimmed.chars().count();
+                if char_count > 40 {
+                    return trimmed.chars().take(40).collect();
+                }
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    // 从 meta.yaml 读取 description
+    let meta_yaml = dir.join("meta.yaml");
+    if meta_yaml.exists() {
+        if let Ok(content) = std::fs::read_to_string(&meta_yaml) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("description:") {
+                    return trimmed
+                        .trim_start_matches("description:")
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string();
+                }
+            }
+        }
+    }
+
+    // 从 meta.json 读取 description
+    let meta_json = dir.join("meta.json");
+    if meta_json.exists() {
+        if let Ok(content) = std::fs::read_to_string(&meta_json) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(desc) = val.get("description").and_then(|v| v.as_str()) {
+                    return desc.to_string();
+                }
+            }
+        }
+    }
+
+    String::new()
 }
 
 /// 判断是否为内置工具
