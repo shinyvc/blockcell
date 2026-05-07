@@ -336,29 +336,23 @@ pub(super) async fn handle_skills_search(
             matched_fields.push("name".to_string());
         }
 
-        // Match against meta.yaml text, with description treated as the strongest signal.
+        // 统一描述读取：SKILL.md frontmatter / meta.yaml / meta.json
+        let description = read_skill_description(dir);
+        if description.to_lowercase().contains(&query) {
+            score += 8;
+            matched_fields.push("description".to_string());
+        }
+
+        // Match against meta.yaml text
         let mut meta_val = serde_json::Value::Null;
-        let mut description = String::new();
         if meta_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&meta_path) {
                 if content.to_lowercase().contains(&query) {
                     score += 2;
                     matched_fields.push("meta".to_string());
                 }
-
-                // Extract description line
-                for line in content.lines() {
-                    if line.starts_with("description:") {
-                        description = line.trim_start_matches("description:").trim().to_string();
-                        if description.to_lowercase().contains(&query) {
-                            score += 8;
-                            matched_fields.push("description".to_string());
-                        }
-                        break;
-                    }
-                }
                 // Try parse as JSON for meta field
-                if let Ok(m) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Ok(m) = serde_yaml::from_str::<serde_json::Value>(&content) {
                     meta_val = m;
                 }
             }
