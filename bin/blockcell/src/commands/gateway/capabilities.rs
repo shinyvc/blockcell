@@ -1,4 +1,5 @@
 use super::*;
+use blockcell_skills::read_skill_description;
 // ---------------------------------------------------------------------------
 // P1: Tools / Skills / Evolution endpoints
 // ---------------------------------------------------------------------------
@@ -75,12 +76,16 @@ fn collect_skill_entries(
                     "enabled": enabled,
                 });
 
+                // 统一描述读取：支持 SKILL.md frontmatter / meta.yaml / meta.json
+                let desc = read_skill_description(&path);
+                if !desc.is_empty() {
+                    skill_info["description"] = serde_json::Value::String(desc);
+                }
+
+                // meta.yaml 额外提供完整 meta 字段
                 if meta_path.exists() {
                     if let Ok(content) = std::fs::read_to_string(&meta_path) {
                         if let Ok(parsed) = serde_yaml::from_str::<serde_json::Value>(&content) {
-                            if let Some(desc) = parsed.get("description") {
-                                skill_info["description"] = desc.clone();
-                            }
                             skill_info["meta"] = parsed;
                         }
                     }
@@ -144,12 +149,16 @@ fn collect_skill_entries_filtered(
                         "enabled": enabled,
                     });
 
+                    // 统一描述读取：支持 SKILL.md frontmatter / meta.yaml / meta.json
+                    let desc = read_skill_description(&path);
+                    if !desc.is_empty() {
+                        skill_info["description"] = serde_json::Value::String(desc);
+                    }
+
+                    // meta.yaml 额外提供完整 meta 字段
                     if meta_path.exists() {
                         if let Ok(content) = std::fs::read_to_string(&meta_path) {
                             if let Ok(parsed) = serde_yaml::from_str::<serde_json::Value>(&content) {
-                                if let Some(desc) = parsed.get("description") {
-                                    skill_info["description"] = desc.clone();
-                                }
                                 skill_info["meta"] = parsed;
                             }
                         }

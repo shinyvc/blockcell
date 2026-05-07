@@ -72,6 +72,71 @@ struct OpenClawInstallSpecRaw {
 // 公开 API
 // ---------------------------------------------------------------------------
 
+/// 从 skill 目录读取描述，优先从 SKILL.md frontmatter 提取，
+/// 然后尝试 meta.yaml / meta.json。返回空字符串表示无描述。
+pub fn read_skill_description(skill_dir: &Path) -> String {
+    // 1. SKILL.md（OpenClaw frontmatter 或纯 Markdown）
+    let skill_md = skill_dir.join("SKILL.md");
+    if skill_md.exists() {
+        if let Ok(content) = std::fs::read_to_string(&skill_md) {
+            let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+            let content = content.replace("\r\n", "\n");
+
+            // OpenClaw 格式：用 serde_yaml 解析 frontmatter
+            if content.starts_with("---") {
+                let rest = &content[3..];
+                if let Some(end) = rest.find("\n---") {
+                    let yaml = rest[..end].trim();
+                    if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(yaml) {
+                        if let Some(desc) = val.get("description").and_then(|v| v.as_str()) {
+                            return desc.to_string();
+                        }
+                    }
+                }
+            }
+
+            // 非 frontmatter：取第一个非标题非空行
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let char_count = trimmed.chars().count();
+                if char_count > 40 {
+                    return trimmed.chars().take(40).collect();
+                }
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    // 2. meta.yaml
+    let meta_yaml = skill_dir.join("meta.yaml");
+    if meta_yaml.exists() {
+        if let Ok(content) = std::fs::read_to_string(&meta_yaml) {
+            if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(&content) {
+                if let Some(desc) = val.get("description").and_then(|v| v.as_str()) {
+                    return desc.to_string();
+                }
+            }
+        }
+    }
+
+    // 3. meta.json
+    let meta_json = skill_dir.join("meta.json");
+    if meta_json.exists() {
+        if let Ok(content) = std::fs::read_to_string(&meta_json) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(desc) = val.get("description").and_then(|v| v.as_str()) {
+                    return desc.to_string();
+                }
+            }
+        }
+    }
+
+    String::new()
+}
+
 /// 解析 OpenClaw SKILL.md 的 YAML frontmatter，返回 (SkillMeta, prompt 正文)。
 ///
 /// `skill_dir` 用于：

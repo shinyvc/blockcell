@@ -32,3 +32,4 @@ pub use service::{
     SkillRecordSummary,
 };
 pub use versioning::{SkillVersion, VersionHistory, VersionManager, VersionSource};
+pub use openclaw_parser::read_skill_description;

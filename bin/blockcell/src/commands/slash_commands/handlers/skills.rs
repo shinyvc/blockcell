@@ -4,6 +4,7 @@
 
 use crate::commands::slash_commands::*;
 use blockcell_skills::evolution::EvolutionRecord;
+use blockcell_skills::read_skill_description;
 use std::collections::{BTreeMap, HashSet};
 
 /// 技能分类
@@ -143,76 +144,6 @@ fn scan_skill_dirs(dir: &std::path::Path) -> Vec<(String, String)> {
     skills
 }
 
-/// 从 SKILL.md（OpenClaw frontmatter）或 meta.yaml 读取技能描述
-fn read_skill_description(dir: &std::path::Path) -> String {
-    // 优先从 SKILL.md 的 frontmatter 提取 description
-    let skill_md = dir.join("SKILL.md");
-    if skill_md.exists() {
-        if let Ok(content) = std::fs::read_to_string(&skill_md) {
-            // OpenClaw 格式：--- frontmatter --- 中有 description 字段
-            if content.starts_with("---") {
-                if let Some(end) = content[3..].find("---") {
-                    let frontmatter = &content[3..3 + end];
-                    for line in frontmatter.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.starts_with("description:") {
-                            return trimmed
-                                .trim_start_matches("description:")
-                                .trim()
-                                .trim_matches('"')
-                                .trim_matches('\'')
-                                .to_string();
-                        }
-                    }
-                }
-            }
-            // 非 frontmatter：取第一个非标题行作为描述
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') {
-                    continue;
-                }
-                let char_count = trimmed.chars().count();
-                if char_count > 40 {
-                    return trimmed.chars().take(40).collect();
-                }
-                return trimmed.to_string();
-            }
-        }
-    }
-
-    // 从 meta.yaml 读取 description
-    let meta_yaml = dir.join("meta.yaml");
-    if meta_yaml.exists() {
-        if let Ok(content) = std::fs::read_to_string(&meta_yaml) {
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("description:") {
-                    return trimmed
-                        .trim_start_matches("description:")
-                        .trim()
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_string();
-                }
-            }
-        }
-    }
-
-    // 从 meta.json 读取 description
-    let meta_json = dir.join("meta.json");
-    if meta_json.exists() {
-        if let Ok(content) = std::fs::read_to_string(&meta_json) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(desc) = val.get("description").and_then(|v| v.as_str()) {
-                    return desc.to_string();
-                }
-            }
-        }
-    }
-
-    String::new()
-}
 
 /// 判断是否为内置工具
 fn is_builtin_tool(name: &str) -> bool {
