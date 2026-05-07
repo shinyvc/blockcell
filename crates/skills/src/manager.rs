@@ -1189,6 +1189,15 @@ impl SkillManager {
                 continue;
             }
 
+            // 跳过没有 skill 标识文件的目录，避免将资料目录（如 conventions/）
+            // 误注册为空 skill。
+            if !path.join("SKILL.md").exists()
+                && !path.join("meta.yaml").exists()
+                && !path.join("meta.json").exists()
+            {
+                continue;
+            }
+
             if let Some(skill) = self.load_skill(&path)? {
                 let skill_name = skill.name.clone();
 
