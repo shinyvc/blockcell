@@ -64,6 +64,7 @@ pub use auto_memory::{
 pub use bus::MessageBus;
 pub use capability_adapter::{
     CapabilityRegistryAdapter, CoreEvolutionAdapter, EvolutionNotifier, ProviderLLMBridge,
+    SkillEvolutionLLMBridge,
 };
 pub use compact::{
     generate_compact_summary, CompactHookRegistry, CompactSummary, CompactSummarySection,

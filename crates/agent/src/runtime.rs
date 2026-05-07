@@ -1963,6 +1963,8 @@ pub struct AgentRuntime {
     core_evolution: Option<CoreEvolutionHandle>,
     /// 核心进化工作流 worker — 后台独立运行，tick 只做轻量 notify
     evolution_worker: Option<Arc<dyn crate::capability_adapter::EvolutionNotifier>>,
+    /// Skill evolution worker — runtime only triggers and notifies it.
+    skill_evolution_worker: Option<Arc<dyn crate::capability_adapter::EvolutionNotifier>>,
     /// 核心进化工作流存储 — 快速入队，不拿 engine mutex
     evolution_workflow_store: Option<Arc<blockcell_storage::EvolutionWorkflowStore>>,
     /// Broadcast sender for streaming events to WebSocket clients (gateway mode).
@@ -2102,6 +2104,7 @@ impl AgentRuntime {
             capability_registry: None,
             core_evolution: None,
             evolution_worker: None,
+            skill_evolution_worker: None,
             evolution_workflow_store: None,
             event_tx: None,
             system_event_store,
@@ -3189,6 +3192,13 @@ impl AgentRuntime {
         worker: Arc<dyn crate::capability_adapter::EvolutionNotifier>,
     ) {
         self.evolution_worker = Some(worker);
+    }
+
+    pub fn set_skill_evolution_worker(
+        &mut self,
+        worker: Arc<dyn crate::capability_adapter::EvolutionNotifier>,
+    ) {
+        self.skill_evolution_worker = Some(worker);
     }
 
     pub fn set_evolution_workflow_store(
@@ -5636,9 +5646,16 @@ impl AgentRuntime {
                     warn!(error = %e, iteration = ?tool_call_counts, retries = max_retries, "LLM call failed after all retries");
                     final_response = llm_exhausted_error(max_retries, &e);
                     if let Some(evo_service) = self.context_builder.evolution_service() {
-                        let _ = evo_service
+                        if let Ok(report) = evo_service
                             .report_error("__llm_provider__", &format!("{}", e), None, vec![])
-                            .await;
+                            .await
+                        {
+                            if report.evolution_triggered.is_some() {
+                                if let Some(ref worker) = self.skill_evolution_worker {
+                                    worker.notify();
+                                }
+                            }
+                        }
                     }
                     // Preserve reasoning_content: None here since this is a synthetic error
                     // message, not an LLM response. DeepSeek requires consistent reasoning_content
@@ -7283,6 +7300,9 @@ impl AgentRuntime {
                     {
                         Ok(report) => {
                             if report.evolution_triggered.is_some() {
+                                if let Some(ref worker) = self.skill_evolution_worker {
+                                    worker.notify();
+                                }
                                 learning_hint = Some(format!(
                                     "[系统] 技能 `{}` 执行失败，已自动触发进化学习。\
                                 请向用户坦诚说明：你暂时还不具备这个技能，但已经开始学习，\
@@ -7815,10 +7835,8 @@ impl AgentRuntime {
     ) {
         info!("AgentRuntime started");
 
-        // 启动灰度发布调度器（每 60 秒 tick 一次）
-        let has_evolution = self.context_builder.evolution_service().is_some();
-        if has_evolution {
-            info!("Evolution rollout scheduler enabled");
+        if self.skill_evolution_worker.is_some() {
+            info!("Skill evolution durable workflow scheduler enabled");
         }
 
         let tick_secs = self.config.tools.tick_interval_secs.clamp(10, 300) as u64;
@@ -8150,24 +8168,10 @@ impl AgentRuntime {
                         .process_system_event_tick(chrono::Utc::now().timestamp_millis())
                         .await;
 
-                    // Evolution rollout tick — use timeout to prevent blocking select! loop
-                    // (tick() runs LLM calls that can take seconds to minutes;
-                    //  a 30s timeout prevents it from indefinitely blocking user input)
-                    if has_evolution {
-                        if let Some(evo_service) = self.context_builder.evolution_service() {
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(30),
-                                evo_service.tick(),
-                            ).await {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => {
-                                    warn!(error = %e, "Evolution rollout tick error");
-                                }
-                                Err(_) => {
-                                    warn!("Evolution rollout tick timed out after 30s, will retry next tick");
-                                }
-                            }
-                        }
+                    // Wake skill evolution worker. The worker owns the long LLM/audit/compile
+                    // pipeline, so this select branch stays responsive.
+                    if let Some(ref worker) = self.skill_evolution_worker {
+                        worker.notify();
                     }
 
                     // 唤醒核心进化 worker — 轻量操作，不执行长任务，不拿 mutex

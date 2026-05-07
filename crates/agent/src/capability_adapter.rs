@@ -40,6 +40,32 @@ impl LLMProvider for ProviderLLMBridge {
 }
 
 /// Adapter: bridges `CapabilityRegistry` (skills crate) → `CapabilityRegistryOps` (tools crate)
+/// Bridge for skill evolution prompts. Skill evolution can request patches,
+/// audits, and structured feedback, so it must not force code-only output.
+pub struct SkillEvolutionLLMBridge {
+    provider: Arc<dyn Provider>,
+}
+
+impl SkillEvolutionLLMBridge {
+    pub fn new_arc(provider: Arc<dyn Provider>) -> Self {
+        Self { provider }
+    }
+}
+
+#[async_trait]
+impl LLMProvider for SkillEvolutionLLMBridge {
+    async fn generate(&self, prompt: &str) -> Result<String> {
+        let messages = vec![
+            ChatMessage::system(
+                "You are a skill evolution assistant. Follow the requested output format exactly.",
+            ),
+            ChatMessage::user(prompt),
+        ];
+        let response = self.provider.chat(&messages, &[]).await?;
+        Ok(response.content.unwrap_or_default())
+    }
+}
+
 pub struct CapabilityRegistryAdapter {
     inner: Arc<Mutex<CapabilityRegistry>>,
 }

@@ -5,6 +5,7 @@ pub mod evolution_worker;
 pub mod ghost;
 pub mod heartbeat;
 pub mod job;
+pub mod skill_evolution_worker;
 
 pub use consolidator::{
     check_gates, DreamConsolidator, DreamError, DreamState, GateCheckResult,
@@ -16,3 +17,4 @@ pub use evolution_worker::EvolutionWorker;
 pub use ghost::{GhostMaintenanceService, GhostMaintenanceServiceConfig};
 pub use heartbeat::HeartbeatService;
 pub use job::{CronJob, JobPayload, JobSchedule, JobState, ScheduleKind};
+pub use skill_evolution_worker::SkillEvolutionWorker;

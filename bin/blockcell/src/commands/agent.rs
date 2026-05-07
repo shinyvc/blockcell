@@ -1,7 +1,7 @@
 use blockcell_agent::{
     AgentRuntime, CapabilityRegistryAdapter, CheckpointManager, ConfirmRequest,
     CoreEvolutionAdapter, MemoryStoreAdapter, MessageBus, ProviderLLMBridge, ResponseCache,
-    ResponseCacheConfig, TaskManager,
+    ResponseCacheConfig, SkillEvolutionLLMBridge, TaskManager,
 };
 #[cfg(feature = "dingtalk")]
 use blockcell_channels::dingtalk::DingTalkChannel;
@@ -20,8 +20,10 @@ use blockcell_channels::whatsapp::WhatsAppChannel;
 use blockcell_channels::ChannelManager;
 use blockcell_core::{Config, InboundMessage, Paths};
 use blockcell_providers::{Provider, ProviderPool};
-use blockcell_scheduler::{CronService, DreamService, DreamServiceConfig, EvolutionWorker};
-use blockcell_skills::{new_registry_handle, CoreEvolution};
+use blockcell_scheduler::{
+    CronService, DreamService, DreamServiceConfig, EvolutionWorker, SkillEvolutionWorker,
+};
+use blockcell_skills::{new_registry_handle, CoreEvolution, EvolutionServiceConfig};
 use blockcell_storage::EvolutionWorkflowStore;
 use blockcell_tools::mcp::manager::McpManager;
 use blockcell_tools::{
@@ -415,6 +417,19 @@ pub async fn run(
     let evo_worker = EvolutionWorker::new((*evo_workflow_store_arc).clone(), core_evo_raw.clone());
     let evo_worker_arc = Arc::new(evo_worker);
 
+    let skill_evo_llm_provider = provider_pool.acquire().map(|(_, p)| {
+        Arc::new(SkillEvolutionLLMBridge::new_arc(p)) as Arc<dyn blockcell_skills::LLMProvider>
+    });
+    let skill_evo_workflow_db = paths.workspace().join("skill_evolution_workflow.db");
+    let skill_evo_workflow_store = EvolutionWorkflowStore::open(&skill_evo_workflow_db)?;
+    let skill_evo_worker = SkillEvolutionWorker::new(
+        skill_evo_workflow_store,
+        paths.skills_dir(),
+        EvolutionServiceConfig::default(),
+        skill_evo_llm_provider,
+    );
+    let skill_evo_worker_arc = Arc::new(skill_evo_worker);
+
     if let Some(msg) = message {
         // Single message mode — no need for CronService
         let tool_registry =
@@ -464,6 +479,9 @@ pub async fn run(
         runtime.set_evolution_workflow_store(evo_workflow_store_arc.clone());
         runtime.set_evolution_worker(
             evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>
+        );
+        runtime.set_skill_evolution_worker(
+            skill_evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>
         );
 
         // Initialize Layer 5 memory injector (7-layer memory system)
@@ -755,6 +773,9 @@ pub async fn run(
         runtime.set_evolution_workflow_store(evo_workflow_store_arc.clone());
         runtime.set_evolution_worker(
             evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>
+        );
+        runtime.set_skill_evolution_worker(
+            skill_evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>
         );
 
         // Create shared ResponseCache for CLI and runtime
@@ -1113,6 +1134,10 @@ pub async fn run(
         let evo_shutdown_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             evo_worker_arc.run_loop(evo_shutdown_rx).await;
+        });
+        let skill_evo_shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            skill_evo_worker_arc.run_loop(skill_evo_shutdown_rx).await;
         });
 
         // Spawn runtime loop

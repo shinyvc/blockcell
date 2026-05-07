@@ -2,7 +2,7 @@ use anyhow::Context;
 use blockcell_agent::{
     AgentRuntime, CapabilityRegistryAdapter, CheckpointManager, ConfirmRequest,
     CoreEvolutionAdapter, MemoryStoreAdapter, MessageBus, ProviderLLMBridge, ResponseCacheConfig,
-    TaskManager,
+    SkillEvolutionLLMBridge, TaskManager,
 };
 #[cfg(feature = "dingtalk")]
 use blockcell_channels::dingtalk::DingTalkChannel;
@@ -25,7 +25,7 @@ use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths};
 use blockcell_scheduler::{
     CronJob, CronService, DreamService, DreamServiceConfig, EvolutionWorker,
     GhostMaintenanceService, GhostMaintenanceServiceConfig, HeartbeatService, JobPayload,
-    JobSchedule, JobState, ScheduleKind,
+    JobSchedule, JobState, ScheduleKind, SkillEvolutionWorker,
 };
 use blockcell_skills::{new_registry_handle, CoreEvolution};
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig};
@@ -857,10 +857,30 @@ async fn spawn_agent_runtime(
     runtime.set_evolution_workflow_store(evo_workflow_store_arc);
     runtime.set_evolution_worker(evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>);
 
+    let skill_evo_llm_provider = provider_pool.acquire().map(|(_, p)| {
+        Arc::new(SkillEvolutionLLMBridge::new_arc(p)) as Arc<dyn blockcell_skills::LLMProvider>
+    });
+    let skill_evo_workflow_db = agent_paths.workspace().join("skill_evolution_workflow.db");
+    let skill_evo_workflow_store = EvolutionWorkflowStore::open(&skill_evo_workflow_db)?;
+    let skill_evo_worker = SkillEvolutionWorker::new(
+        skill_evo_workflow_store,
+        agent_paths.skills_dir(),
+        EvolutionServiceConfig::default(),
+        skill_evo_llm_provider,
+    );
+    let skill_evo_worker_arc = Arc::new(skill_evo_worker);
+    runtime.set_skill_evolution_worker(
+        skill_evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>
+    );
+
     // 启动核心进化 worker 后台任务
     let evo_shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(async move {
         evo_worker_arc.run_loop(evo_shutdown_rx).await;
+    });
+    let skill_evo_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        skill_evo_worker_arc.run_loop(skill_evo_shutdown_rx).await;
     });
 
     runtime.set_event_tx(ws_broadcast_tx);
