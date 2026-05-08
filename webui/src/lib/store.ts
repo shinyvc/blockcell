@@ -440,18 +440,35 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'thinking': {
         // 直接使用 set() 并在回调中获取最新状态，确保流式追加正确
         set((s) => {
+          const delta = event.content || '';
+          if (!delta) return {};
+
           const lastMsg = s.messages[s.messages.length - 1];
           if (lastMsg?.role === 'assistant' && lastMsg.streaming) {
             const msgs = [...s.messages];
             for (let i = msgs.length - 1; i >= 0; i--) {
               if (msgs[i].role === 'assistant') {
-                msgs[i] = { ...msgs[i], reasoning: (msgs[i].reasoning || '') + (event.content || '') };
+                msgs[i] = { ...msgs[i], reasoning: (msgs[i].reasoning || '') + delta };
                 break;
               }
             }
             return { messages: msgs };
           }
-          return {}; // 无变化
+
+          // thinking 先于 token 到达时，创建 assistant streaming message
+          return {
+            messages: [
+              ...s.messages,
+              {
+                id: nextMsgId(),
+                role: 'assistant',
+                content: '',
+                reasoning: delta,
+                timestamp: Date.now(),
+                streaming: true,
+              },
+            ],
+          };
         });
         break;
       }

@@ -142,7 +142,8 @@ impl SkillIndex {
                 // 判断: 如果该目录直接包含 skill 标识文件, 则它是一个 skill
                 if Self::is_skill_dir(&path) {
                     let entry = Self::build_entry(&dir_name, category, &path);
-                    self.entries.insert(composite_key(category, &dir_name), entry);
+                    self.entries
+                        .insert(composite_key(category, &dir_name), entry);
                     // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
                     if path.join("manifest.json").exists() {
                         self.scan_dir_recursive(&path, &sub_category);

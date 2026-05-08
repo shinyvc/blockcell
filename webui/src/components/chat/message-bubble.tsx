@@ -37,7 +37,7 @@ export const MessageBubble = memo(function MessageBubble({ message }: { message:
       <div className={cn('flex flex-col gap-1 max-w-[80%] min-w-0', isUser ? 'items-end' : 'items-start')}>
         {/* Reasoning (thinking) */}
         {message.reasoning && (
-          <CollapsibleSection title="Thinking" defaultOpen={false}>
+          <CollapsibleSection title="Thinking" defaultOpen={!!message.streaming}>
             <div className="text-xs text-muted-foreground whitespace-pre-wrap">{message.reasoning}</div>
           </CollapsibleSection>
         )}
