@@ -220,6 +220,17 @@ impl SkillIndex {
                                 .filter_map(|v| v.as_str().map(String::from))
                                 .collect();
                         }
+                        // Legacy fallback: capabilities → tools (same as SkillMeta::effective_tools)
+                        if tools.is_empty() {
+                            if let Some(arr) =
+                                yaml.get("capabilities").and_then(|v| v.as_sequence())
+                            {
+                                tools = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect();
+                            }
+                        }
                     }
                     if !always {
                         always = yaml
@@ -252,6 +263,15 @@ impl SkillIndex {
                                 .iter()
                                 .filter_map(|v| v.as_str().map(String::from))
                                 .collect();
+                        }
+                        // Legacy fallback: capabilities → tools (same as SkillMeta::effective_tools)
+                        if tools.is_empty() {
+                            if let Some(c) = meta.get("capabilities").and_then(|v| v.as_array()) {
+                                tools = c
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect();
+                            }
                         }
                     }
                     if !always {
@@ -423,8 +443,14 @@ impl SkillIndex {
             .get(name)
             .or_else(|| self.entries.values().find(|e| e.name == name))?;
 
-        // 按优先级尝试读取 skill 文件
-        for file_name in &["SKILL.md", "SKILL.rhai", "SKILL.py"] {
+        // 按优先级尝试读取 skill 文件；meta-only skill 至少应能加载元信息。
+        for file_name in &[
+            "SKILL.md",
+            "SKILL.rhai",
+            "SKILL.py",
+            "meta.yaml",
+            "meta.json",
+        ] {
             let file_path = entry.path.join(file_name);
             if file_path.exists() {
                 let content = match std::fs::read_to_string(&file_path) {
@@ -956,5 +982,81 @@ tools:
         let content = "---\nversion: 3.0.1\n---\n\n# Title";
         let version = SkillIndex::extract_version(content);
         assert_eq!(version, "3.0.1");
+    }
+
+    #[test]
+    fn test_capabilities_fallback_in_meta_yaml() {
+        let dir = temp_skills_dir();
+        let skill_dir = dir.join("general").join("legacy-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // meta.yaml with capabilities but no tools
+        std::fs::write(
+            skill_dir.join("meta.yaml"),
+            "name: legacy-skill\ndescription: Legacy skill with capabilities\ncapabilities:\n  - web_fetch\n  - web_search\n",
+        ).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Legacy Skill").unwrap();
+
+        let index = SkillIndex::build_from_dir(&dir);
+        let entry = index.entries().get("general/legacy-skill").unwrap();
+        assert_eq!(entry.tools, vec!["web_fetch", "web_search"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_meta_only_skill() {
+        let dir = temp_skills_dir();
+        let skill_dir = dir.join("general").join("metadata-only");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("meta.yaml"),
+            "name: metadata-only\ndescription: Metadata only skill\n",
+        )
+        .unwrap();
+
+        let mut index = SkillIndex::build_from_dir(&dir);
+        let content = index.load_skill("general/metadata-only").unwrap();
+        assert!(content.contains("Metadata only skill"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_capabilities_fallback_in_meta_json() {
+        let dir = temp_skills_dir();
+        let skill_dir = dir.join("general").join("json-legacy-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // meta.json with capabilities but no tools
+        std::fs::write(
+            skill_dir.join("meta.json"),
+            r#"{"description":"JSON legacy skill","capabilities":["exec","read_file"]}"#,
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# JSON Legacy Skill").unwrap();
+
+        let index = SkillIndex::build_from_dir(&dir);
+        let entry = index.entries().get("general/json-legacy-skill").unwrap();
+        assert_eq!(entry.tools, vec!["exec", "read_file"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tools_preferred_over_capabilities() {
+        let dir = temp_skills_dir();
+        let skill_dir = dir.join("general").join("both-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // meta.yaml with both tools and capabilities — tools should win
+        std::fs::write(
+            skill_dir.join("meta.yaml"),
+            "name: both-skill\ndescription: Skill with both\ntools:\n  - finance_api\n  - chart_generate\ncapabilities:\n  - web_fetch\n",
+        ).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Both Skill").unwrap();
+
+        let index = SkillIndex::build_from_dir(&dir);
+        let entry = index.entries().get("general/both-skill").unwrap();
+        assert_eq!(entry.tools, vec!["finance_api", "chart_generate"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

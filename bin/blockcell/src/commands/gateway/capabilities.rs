@@ -38,37 +38,60 @@ fn is_skill_dir(path: &std::path::Path) -> bool {
         || path.join("SKILL.py").exists()
 }
 
-/// 递归扫描技能目录，收集 skill 信息（支持 skill 包目录）
+/// 递归扫描技能目录，收集 skill 信息（支持 skill 包目录和 category 目录）
 fn collect_skill_entries(
     dir: &std::path::Path,
     source: &str,
     disabled_skills: &std::collections::HashSet<String>,
     out: &mut Vec<serde_json::Value>,
 ) {
+    collect_skill_entries_recursive(dir, source, "", disabled_skills, out);
+}
+
+fn collect_skill_entries_recursive(
+    dir: &std::path::Path,
+    source: &str,
+    category: &str,
+    disabled_skills: &std::collections::HashSet<String>,
+    out: &mut Vec<serde_json::Value>,
+) {
     if !dir.exists() {
         return;
     }
+
+    const EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
+
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() {
                 continue;
             }
+            let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            if EXCLUDED_DIRS.contains(&dir_name.as_str()) {
+                continue;
+            }
 
             // 目录本身是 skill：优先加载自身
             if is_skill_dir(&path) {
-                let name = match path.file_name().and_then(|n| n.to_str()) {
-                    Some(n) => n.to_string(),
-                    None => continue,
+                let composite_name = if category.is_empty() {
+                    dir_name.clone()
+                } else {
+                    format!("{}/{}", category, dir_name)
                 };
                 let meta_path = path.join("meta.yaml");
                 let has_rhai = path.join("SKILL.rhai").exists();
                 let has_py = path.join("SKILL.py").exists();
                 let has_md = path.join("SKILL.md").exists();
-                let enabled = !disabled_skills.contains(&name);
+                let enabled = !disabled_skills.contains(&composite_name);
 
                 let mut skill_info = serde_json::json!({
-                    "name": name,
+                    "name": composite_name,
+                    "category": category,
                     "source": source,
                     "has_rhai": has_rhai,
                     "has_py": has_py,
@@ -95,20 +118,24 @@ fn collect_skill_entries(
 
                 // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
                 if path.join("manifest.json").exists() {
-                    collect_skill_entries(&path, source, disabled_skills, out);
+                    collect_skill_entries_recursive(&path, source, category, disabled_skills, out);
                 }
                 continue;
             }
 
             // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
             if path.join("manifest.json").exists() {
-                collect_skill_entries(&path, source, disabled_skills, out);
+                collect_skill_entries_recursive(&path, source, category, disabled_skills, out);
+                continue;
             }
+
+            // 否则：视为 category 目录，递归扫描子目录
+            collect_skill_entries_recursive(&path, source, &dir_name, disabled_skills, out);
         }
     }
 }
 
-/// 递归扫描技能目录，收集 skill 信息（跳过已存在的名称）
+/// 递归扫描技能目录，收集 skill 信息（跳过已存在的名称，支持 category 目录）
 fn collect_skill_entries_filtered(
     dir: &std::path::Path,
     source: &str,
@@ -116,32 +143,56 @@ fn collect_skill_entries_filtered(
     existing_names: &std::collections::HashSet<&str>,
     out: &mut Vec<serde_json::Value>,
 ) {
+    collect_skill_entries_filtered_recursive(dir, source, "", disabled_skills, existing_names, out);
+}
+
+fn collect_skill_entries_filtered_recursive(
+    dir: &std::path::Path,
+    source: &str,
+    category: &str,
+    disabled_skills: &std::collections::HashSet<String>,
+    existing_names: &std::collections::HashSet<&str>,
+    out: &mut Vec<serde_json::Value>,
+) {
     if !dir.exists() {
         return;
     }
+
+    const EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
+
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() {
                 continue;
             }
+            let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            if EXCLUDED_DIRS.contains(&dir_name.as_str()) {
+                continue;
+            }
 
             // 目录本身是 skill：优先加载自身
             if is_skill_dir(&path) {
-                let name = match path.file_name().and_then(|n| n.to_str()) {
-                    Some(n) => n.to_string(),
-                    None => continue,
+                let composite_name = if category.is_empty() {
+                    dir_name.clone()
+                } else {
+                    format!("{}/{}", category, dir_name)
                 };
 
-                if !existing_names.contains(name.as_str()) {
+                if !existing_names.contains(composite_name.as_str()) {
                     let meta_path = path.join("meta.yaml");
                     let has_rhai = path.join("SKILL.rhai").exists();
                     let has_py = path.join("SKILL.py").exists();
                     let has_md = path.join("SKILL.md").exists();
-                    let enabled = !disabled_skills.contains(&name);
+                    let enabled = !disabled_skills.contains(&composite_name);
 
                     let mut skill_info = serde_json::json!({
-                        "name": name,
+                        "name": composite_name,
+                        "category": category,
                         "source": source,
                         "has_rhai": has_rhai,
                         "has_py": has_py,
@@ -158,7 +209,8 @@ fn collect_skill_entries_filtered(
                     // meta.yaml 额外提供完整 meta 字段
                     if meta_path.exists() {
                         if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                            if let Ok(parsed) = serde_yaml::from_str::<serde_json::Value>(&content) {
+                            if let Ok(parsed) = serde_yaml::from_str::<serde_json::Value>(&content)
+                            {
                                 skill_info["meta"] = parsed;
                             }
                         }
@@ -169,91 +221,13 @@ fn collect_skill_entries_filtered(
 
                 // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
                 if path.join("manifest.json").exists() {
-                    collect_skill_entries_filtered(&path, source, disabled_skills, existing_names, out);
-                }
-                continue;
-            }
-
-            // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
-            if path.join("manifest.json").exists() {
-                collect_skill_entries_filtered(&path, source, disabled_skills, existing_names, out);
-            }
-        }
-    }
-}
-
-/// 递归扫描技能目录，收集搜索结果（支持 skill 包目录）
-fn collect_skill_search_entries(
-    dir: &std::path::Path,
-    source: &str,
-    query: &str,
-    check_skill: &dyn Fn(&std::path::Path, &str) -> Option<serde_json::Value>,
-    out: &mut Vec<serde_json::Value>,
-) {
-    if !dir.exists() {
-        return;
-    }
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            // 目录本身是 skill：优先检查自身
-            if is_skill_dir(&path) {
-                if let Some(result) = check_skill(&path, source) {
-                    out.push(result);
-                }
-                // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
-                if path.join("manifest.json").exists() {
-                    collect_skill_search_entries(&path, source, query, check_skill, out);
-                }
-                continue;
-            }
-
-            // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
-            if path.join("manifest.json").exists() {
-                collect_skill_search_entries(&path, source, query, check_skill, out);
-            }
-        }
-    }
-}
-
-/// 递归扫描技能目录，收集搜索结果（跳过已存在的名称）
-fn collect_skill_search_entries_filtered(
-    dir: &std::path::Path,
-    source: &str,
-    query: &str,
-    existing_names: &std::collections::HashSet<&str>,
-    check_skill: &dyn Fn(&std::path::Path, &str) -> Option<serde_json::Value>,
-    out: &mut Vec<serde_json::Value>,
-) {
-    if !dir.exists() {
-        return;
-    }
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            // 目录本身是 skill：优先检查自身
-            if is_skill_dir(&path) {
-                let name = match path.file_name().and_then(|n| n.to_str()) {
-                    Some(n) => n.to_string(),
-                    None => continue,
-                };
-                if !existing_names.contains(name.as_str()) {
-                    if let Some(result) = check_skill(&path, source) {
-                        out.push(result);
-                    }
-                }
-                // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
-                if path.join("manifest.json").exists() {
-                    collect_skill_search_entries_filtered(
-                        &path, source, query, existing_names, check_skill, out,
+                    collect_skill_entries_filtered_recursive(
+                        &path,
+                        source,
+                        category,
+                        disabled_skills,
+                        existing_names,
+                        out,
                     );
                 }
                 continue;
@@ -261,10 +235,223 @@ fn collect_skill_search_entries_filtered(
 
             // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
             if path.join("manifest.json").exists() {
-                collect_skill_search_entries_filtered(
-                    &path, source, query, existing_names, check_skill, out,
+                collect_skill_entries_filtered_recursive(
+                    &path,
+                    source,
+                    category,
+                    disabled_skills,
+                    existing_names,
+                    out,
                 );
+                continue;
             }
+
+            // 否则：视为 category 目录，递归扫描子目录
+            collect_skill_entries_filtered_recursive(
+                &path,
+                source,
+                &dir_name,
+                disabled_skills,
+                existing_names,
+                out,
+            );
+        }
+    }
+}
+
+/// 递归扫描技能目录，收集搜索结果（支持 skill 包目录和 category 目录）
+fn collect_skill_search_entries(
+    dir: &std::path::Path,
+    source: &str,
+    query: &str,
+    check_skill: &dyn Fn(&std::path::Path, &str, &str) -> Option<serde_json::Value>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    collect_skill_search_entries_recursive(dir, source, "", query, check_skill, out);
+}
+
+fn collect_skill_search_entries_recursive(
+    dir: &std::path::Path,
+    source: &str,
+    category: &str,
+    query: &str,
+    check_skill: &dyn Fn(&std::path::Path, &str, &str) -> Option<serde_json::Value>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    if !dir.exists() {
+        return;
+    }
+
+    const EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            if EXCLUDED_DIRS.contains(&dir_name.as_str()) {
+                continue;
+            }
+
+            // 目录本身是 skill：优先检查自身
+            if is_skill_dir(&path) {
+                let composite_name = if category.is_empty() {
+                    dir_name.clone()
+                } else {
+                    format!("{}/{}", category, dir_name)
+                };
+
+                if let Some(result) = check_skill(&path, source, &composite_name) {
+                    out.push(result);
+                }
+                // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
+                if path.join("manifest.json").exists() {
+                    collect_skill_search_entries_recursive(
+                        &path,
+                        source,
+                        category,
+                        query,
+                        check_skill,
+                        out,
+                    );
+                }
+                continue;
+            }
+
+            // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
+            if path.join("manifest.json").exists() {
+                collect_skill_search_entries_recursive(
+                    &path,
+                    source,
+                    category,
+                    query,
+                    check_skill,
+                    out,
+                );
+                continue;
+            }
+
+            // 否则：视为 category 目录，递归扫描子目录
+            collect_skill_search_entries_recursive(
+                &path,
+                source,
+                &dir_name,
+                query,
+                check_skill,
+                out,
+            );
+        }
+    }
+}
+
+/// 递归扫描技能目录，收集搜索结果（跳过已存在的名称，支持 category 目录）
+fn collect_skill_search_entries_filtered(
+    dir: &std::path::Path,
+    source: &str,
+    query: &str,
+    existing_names: &std::collections::HashSet<&str>,
+    check_skill: &dyn Fn(&std::path::Path, &str, &str) -> Option<serde_json::Value>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    collect_skill_search_entries_filtered_recursive(
+        dir,
+        source,
+        "",
+        query,
+        existing_names,
+        check_skill,
+        out,
+    );
+}
+
+fn collect_skill_search_entries_filtered_recursive(
+    dir: &std::path::Path,
+    source: &str,
+    category: &str,
+    query: &str,
+    existing_names: &std::collections::HashSet<&str>,
+    check_skill: &dyn Fn(&std::path::Path, &str, &str) -> Option<serde_json::Value>,
+    out: &mut Vec<serde_json::Value>,
+) {
+    if !dir.exists() {
+        return;
+    }
+
+    const EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            if EXCLUDED_DIRS.contains(&dir_name.as_str()) {
+                continue;
+            }
+
+            // 目录本身是 skill：优先检查自身
+            if is_skill_dir(&path) {
+                let composite_name = if category.is_empty() {
+                    dir_name.clone()
+                } else {
+                    format!("{}/{}", category, dir_name)
+                };
+
+                if !existing_names.contains(composite_name.as_str()) {
+                    if let Some(result) = check_skill(&path, source, &composite_name) {
+                        out.push(result);
+                    }
+                }
+                // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
+                if path.join("manifest.json").exists() {
+                    collect_skill_search_entries_filtered_recursive(
+                        &path,
+                        source,
+                        category,
+                        query,
+                        existing_names,
+                        check_skill,
+                        out,
+                    );
+                }
+                continue;
+            }
+
+            // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
+            if path.join("manifest.json").exists() {
+                collect_skill_search_entries_filtered_recursive(
+                    &path,
+                    source,
+                    category,
+                    query,
+                    existing_names,
+                    check_skill,
+                    out,
+                );
+                continue;
+            }
+
+            // 否则：视为 category 目录，递归扫描子目录
+            collect_skill_search_entries_filtered_recursive(
+                &path,
+                source,
+                &dir_name,
+                query,
+                existing_names,
+                check_skill,
+                out,
+            );
         }
     }
 }
@@ -288,16 +475,32 @@ pub(super) async fn handle_skills(State(state): State<GatewayState>) -> impl Int
     let mut skills = Vec::new();
 
     // Scan user skills directory (支持 skill 包递归)
-    collect_skill_entries(&state.paths.skills_dir(), "user", &disabled_skills, &mut skills);
+    collect_skill_entries(
+        &state.paths.skills_dir(),
+        "user",
+        &disabled_skills,
+        &mut skills,
+    );
 
     // Scan builtin skills directory (支持 skill 包递归)
     let builtin_dir = state.paths.builtin_skills_dir();
     let user_names: std::collections::HashSet<String> = skills
         .iter()
-        .filter_map(|s| s.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .filter_map(|s| {
+            s.get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
         .collect();
-    let user_name_refs: std::collections::HashSet<&str> = user_names.iter().map(|s| s.as_str()).collect();
-    collect_skill_entries_filtered(&builtin_dir, "builtin", &disabled_skills, &user_name_refs, &mut skills);
+    let user_name_refs: std::collections::HashSet<&str> =
+        user_names.iter().map(|s| s.as_str()).collect();
+    collect_skill_entries_filtered(
+        &builtin_dir,
+        "builtin",
+        &disabled_skills,
+        &user_name_refs,
+        &mut skills,
+    );
 
     let count = skills.len();
     Json(serde_json::json!({
@@ -320,72 +523,72 @@ pub(super) async fn handle_skills_search(
     let mut results = Vec::new();
 
     // Helper: check if a skill directory matches the query
-    let check_skill = |dir: &std::path::Path, source: &str| -> Option<serde_json::Value> {
-        let name = dir.file_name()?.to_string_lossy().to_string();
-        let meta_path = dir.join("meta.yaml");
-        let has_rhai = dir.join("SKILL.rhai").exists();
-        let has_py = dir.join("SKILL.py").exists();
-        let has_md = dir.join("SKILL.md").exists();
+    let check_skill =
+        |dir: &std::path::Path, source: &str, composite_name: &str| -> Option<serde_json::Value> {
+            let meta_path = dir.join("meta.yaml");
+            let has_rhai = dir.join("SKILL.rhai").exists();
+            let has_py = dir.join("SKILL.py").exists();
+            let has_md = dir.join("SKILL.md").exists();
 
-        let mut score = 0u32;
-        let mut matched_fields = Vec::new();
+            let mut score = 0u32;
+            let mut matched_fields = Vec::new();
 
-        // Match against name
-        if name.to_lowercase().contains(&query) {
-            score += 10;
-            matched_fields.push("name".to_string());
-        }
+            // Match against name (composite: category/name)
+            if composite_name.to_lowercase().contains(&query) {
+                score += 10;
+                matched_fields.push("name".to_string());
+            }
 
-        // 统一描述读取：SKILL.md frontmatter / meta.yaml / meta.json
-        let description = read_skill_description(dir);
-        if description.to_lowercase().contains(&query) {
-            score += 8;
-            matched_fields.push("description".to_string());
-        }
+            // 统一描述读取：SKILL.md frontmatter / meta.yaml / meta.json
+            let description = read_skill_description(dir);
+            if description.to_lowercase().contains(&query) {
+                score += 8;
+                matched_fields.push("description".to_string());
+            }
 
-        // Match against meta.yaml text
-        let mut meta_val = serde_json::Value::Null;
-        if meta_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                if content.to_lowercase().contains(&query) {
-                    score += 2;
-                    matched_fields.push("meta".to_string());
-                }
-                // Try parse as JSON for meta field
-                if let Ok(m) = serde_yaml::from_str::<serde_json::Value>(&content) {
-                    meta_val = m;
+            // Match against meta.yaml text
+            let mut meta_val = serde_json::Value::Null;
+            if meta_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&meta_path) {
+                    if content.to_lowercase().contains(&query) {
+                        score += 2;
+                        matched_fields.push("meta".to_string());
+                    }
+                    // Try parse as JSON for meta field
+                    if let Ok(m) = serde_yaml::from_str::<serde_json::Value>(&content) {
+                        meta_val = m;
+                    }
                 }
             }
-        }
 
-        // Match against SKILL.md content (first 500 chars)
-        if has_md {
-            let md_path = dir.join("SKILL.md");
-            if let Ok(md_content) = std::fs::read_to_string(&md_path) {
-                let preview: String = md_content.chars().take(500).collect();
-                if preview.to_lowercase().contains(&query) {
-                    score += 3;
-                    matched_fields.push("skill_md".to_string());
+            // Match against SKILL.md content (first 500 chars)
+            if has_md {
+                let md_path = dir.join("SKILL.md");
+                if let Ok(md_content) = std::fs::read_to_string(&md_path) {
+                    let preview: String = md_content.chars().take(500).collect();
+                    if preview.to_lowercase().contains(&query) {
+                        score += 3;
+                        matched_fields.push("skill_md".to_string());
+                    }
                 }
             }
-        }
 
-        if score == 0 {
-            return None;
-        }
+            if score == 0 {
+                return None;
+            }
 
-        Some(serde_json::json!({
-            "name": name,
-            "source": source,
-            "has_rhai": has_rhai,
-            "has_py": has_py,
-            "has_md": has_md,
-            "description": description,
-            "score": score,
-            "matched_fields": matched_fields,
-            "meta": meta_val,
-        }))
-    };
+            Some(serde_json::json!({
+                "name": composite_name,
+                "source": source,
+                "has_rhai": has_rhai,
+                "has_py": has_py,
+                "has_md": has_md,
+                "description": description,
+                "score": score,
+                "matched_fields": matched_fields,
+                "meta": meta_val,
+            }))
+        };
 
     // Search user skills (支持 skill 包递归)
     let skills_dir = state.paths.skills_dir();
@@ -395,10 +598,22 @@ pub(super) async fn handle_skills_search(
     let builtin_dir = state.paths.builtin_skills_dir();
     let user_names: std::collections::HashSet<String> = results
         .iter()
-        .filter_map(|r| r.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .filter_map(|r| {
+            r.get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
         .collect();
-    let user_name_refs: std::collections::HashSet<&str> = user_names.iter().map(|s| s.as_str()).collect();
-    collect_skill_search_entries_filtered(&builtin_dir, "builtin", &query, &user_name_refs, &check_skill, &mut results);
+    let user_name_refs: std::collections::HashSet<&str> =
+        user_names.iter().map(|s| s.as_str()).collect();
+    collect_skill_search_entries_filtered(
+        &builtin_dir,
+        "builtin",
+        &query,
+        &user_name_refs,
+        &check_skill,
+        &mut results,
+    );
 
     // Sort by score descending
     results.sort_by(|a, b| {

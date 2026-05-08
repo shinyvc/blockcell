@@ -144,7 +144,6 @@ fn scan_skill_dirs(dir: &std::path::Path) -> Vec<(String, String)> {
     skills
 }
 
-
 /// 判断是否为内置工具
 fn is_builtin_tool(name: &str) -> bool {
     // 简单判断，可以根据需要扩展

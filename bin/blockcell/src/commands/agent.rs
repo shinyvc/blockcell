@@ -2056,8 +2056,7 @@ fn is_skill_dir(path: &std::path::Path) -> bool {
 }
 
 /// 排除的目录名
-const SKILL_EXCLUDED_DIRS: &[&str] =
-    &[".git", ".github", ".hub", "__pycache__", "node_modules"];
+const SKILL_EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
 
 /// Scan a directory for skill subdirectories and collect (name, description) pairs.
 /// Supports skill packs (manifest.json) and category directories with recursive scanning.
