@@ -76,13 +76,16 @@ fn collect_skill_entries_recursive(
                 continue;
             }
 
+            // 统一构造 sub_category，确保深层 category 路径累积完整
+            let sub_category = if category.is_empty() {
+                dir_name.clone()
+            } else {
+                format!("{}/{}", category, dir_name)
+            };
+
             // 目录本身是 skill：优先加载自身
             if is_skill_dir(&path) {
-                let composite_name = if category.is_empty() {
-                    dir_name.clone()
-                } else {
-                    format!("{}/{}", category, dir_name)
-                };
+                let composite_name = sub_category.clone();
                 let meta_path = path.join("meta.yaml");
                 let has_rhai = path.join("SKILL.rhai").exists();
                 let has_py = path.join("SKILL.py").exists();
@@ -117,8 +120,9 @@ fn collect_skill_entries_recursive(
                 out.push(skill_info);
 
                 // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
+                // 使用 sub_category 保持路径完整，确保子 skill 可被 SkillFileStore 解析
                 if path.join("manifest.json").exists() {
-                    collect_skill_entries_recursive(&path, source, category, disabled_skills, out);
+                    collect_skill_entries_recursive(&path, source, &sub_category, disabled_skills, out);
                 }
                 continue;
             }
@@ -126,17 +130,13 @@ fn collect_skill_entries_recursive(
             // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
             // pack 目录本身是路径的一部分，需要计入 category
             if path.join("manifest.json").exists() {
-                let sub_category = if category.is_empty() {
-                    dir_name.clone()
-                } else {
-                    format!("{}/{}", category, dir_name)
-                };
                 collect_skill_entries_recursive(&path, source, &sub_category, disabled_skills, out);
                 continue;
             }
 
             // 否则：视为 category 目录，递归扫描子目录
-            collect_skill_entries_recursive(&path, source, &dir_name, disabled_skills, out);
+            // 使用 sub_category 累积路径，避免深层 category 截断
+            collect_skill_entries_recursive(&path, source, &sub_category, disabled_skills, out);
         }
     }
 }
@@ -181,13 +181,16 @@ fn collect_skill_entries_filtered_recursive(
                 continue;
             }
 
+            // 统一构造 sub_category，确保深层 category 路径累积完整
+            let sub_category = if category.is_empty() {
+                dir_name.clone()
+            } else {
+                format!("{}/{}", category, dir_name)
+            };
+
             // 目录本身是 skill：优先加载自身
             if is_skill_dir(&path) {
-                let composite_name = if category.is_empty() {
-                    dir_name.clone()
-                } else {
-                    format!("{}/{}", category, dir_name)
-                };
+                let composite_name = sub_category.clone();
 
                 if !existing_names.contains(composite_name.as_str()) {
                     let meta_path = path.join("meta.yaml");
@@ -230,7 +233,7 @@ fn collect_skill_entries_filtered_recursive(
                     collect_skill_entries_filtered_recursive(
                         &path,
                         source,
-                        category,
+                        &sub_category,
                         disabled_skills,
                         existing_names,
                         out,
@@ -242,11 +245,6 @@ fn collect_skill_entries_filtered_recursive(
             // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
             // pack 目录本身是路径的一部分，需要计入 category
             if path.join("manifest.json").exists() {
-                let sub_category = if category.is_empty() {
-                    dir_name.clone()
-                } else {
-                    format!("{}/{}", category, dir_name)
-                };
                 collect_skill_entries_filtered_recursive(
                     &path,
                     source,
@@ -262,7 +260,7 @@ fn collect_skill_entries_filtered_recursive(
             collect_skill_entries_filtered_recursive(
                 &path,
                 source,
-                &dir_name,
+                &sub_category,
                 disabled_skills,
                 existing_names,
                 out,
@@ -311,13 +309,16 @@ fn collect_skill_search_entries_recursive(
                 continue;
             }
 
+            // 统一构造 sub_category，确保深层 category 路径累积完整
+            let sub_category = if category.is_empty() {
+                dir_name.clone()
+            } else {
+                format!("{}/{}", category, dir_name)
+            };
+
             // 目录本身是 skill：优先检查自身
             if is_skill_dir(&path) {
-                let composite_name = if category.is_empty() {
-                    dir_name.clone()
-                } else {
-                    format!("{}/{}", category, dir_name)
-                };
+                let composite_name = sub_category.clone();
 
                 if let Some(result) = check_skill(&path, source, &composite_name) {
                     out.push(result);
@@ -327,7 +328,7 @@ fn collect_skill_search_entries_recursive(
                     collect_skill_search_entries_recursive(
                         &path,
                         source,
-                        category,
+                        &sub_category,
                         query,
                         check_skill,
                         out,
@@ -339,11 +340,6 @@ fn collect_skill_search_entries_recursive(
             // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
             // pack 目录本身是路径的一部分，需要计入 category
             if path.join("manifest.json").exists() {
-                let sub_category = if category.is_empty() {
-                    dir_name.clone()
-                } else {
-                    format!("{}/{}", category, dir_name)
-                };
                 collect_skill_search_entries_recursive(
                     &path,
                     source,
@@ -359,7 +355,7 @@ fn collect_skill_search_entries_recursive(
             collect_skill_search_entries_recursive(
                 &path,
                 source,
-                &dir_name,
+                &sub_category,
                 query,
                 check_skill,
                 out,
@@ -418,13 +414,16 @@ fn collect_skill_search_entries_filtered_recursive(
                 continue;
             }
 
+            // 统一构造 sub_category，确保深层 category 路径累积完整
+            let sub_category = if category.is_empty() {
+                dir_name.clone()
+            } else {
+                format!("{}/{}", category, dir_name)
+            };
+
             // 目录本身是 skill：优先检查自身
             if is_skill_dir(&path) {
-                let composite_name = if category.is_empty() {
-                    dir_name.clone()
-                } else {
-                    format!("{}/{}", category, dir_name)
-                };
+                let composite_name = sub_category.clone();
 
                 if !existing_names.contains(composite_name.as_str()) {
                     if let Some(result) = check_skill(&path, source, &composite_name) {
@@ -436,7 +435,7 @@ fn collect_skill_search_entries_filtered_recursive(
                     collect_skill_search_entries_filtered_recursive(
                         &path,
                         source,
-                        category,
+                        &sub_category,
                         query,
                         existing_names,
                         check_skill,
@@ -449,11 +448,6 @@ fn collect_skill_search_entries_filtered_recursive(
             // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
             // pack 目录本身是路径的一部分，需要计入 category
             if path.join("manifest.json").exists() {
-                let sub_category = if category.is_empty() {
-                    dir_name.clone()
-                } else {
-                    format!("{}/{}", category, dir_name)
-                };
                 collect_skill_search_entries_filtered_recursive(
                     &path,
                     source,
@@ -470,7 +464,7 @@ fn collect_skill_search_entries_filtered_recursive(
             collect_skill_search_entries_filtered_recursive(
                 &path,
                 source,
-                &dir_name,
+                &sub_category,
                 query,
                 existing_names,
                 check_skill,

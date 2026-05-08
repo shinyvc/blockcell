@@ -333,6 +333,13 @@ impl ListSkillsTool {
                     continue;
                 }
 
+                // 统一构造 sub_category，确保深层 category 路径累积完整
+                let sub_category = if category.is_empty() {
+                    dir_name.clone()
+                } else {
+                    format!("{}/{}", category, dir_name)
+                };
+
                 let is_skill = path.join("SKILL.md").exists()
                     || path.join("meta.yaml").exists()
                     || path.join("meta.json").exists()
@@ -340,17 +347,13 @@ impl ListSkillsTool {
                     || path.join("SKILL.py").exists();
 
                 if is_skill {
-                    let composite_name = if category.is_empty() {
-                        dir_name.clone()
-                    } else {
-                        format!("{}/{}", category, dir_name)
-                    };
+                    let composite_name = sub_category.clone();
 
                     // Skip if already seen (workspace overrides builtin)
                     if !seen.insert(composite_name.clone()) {
-                        // Still recurse into skill packs even if name is seen
+                        // 仍需递归扫描 skill 包子目录，使用 sub_category 保持路径完整
                         if path.join("manifest.json").exists() {
-                            self.scan_skills_dir_recursive(&path, category, skills, seen);
+                            self.scan_skills_dir_recursive(&path, &sub_category, skills, seen);
                         }
                         continue;
                     }
@@ -372,8 +375,9 @@ impl ListSkillsTool {
                     }));
 
                     // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
+                    // 使用 sub_category 保持路径完整，确保子 skill 可被 SkillFileStore 解析
                     if path.join("manifest.json").exists() {
-                        self.scan_skills_dir_recursive(&path, category, skills, seen);
+                        self.scan_skills_dir_recursive(&path, &sub_category, skills, seen);
                     }
                     continue;
                 }
@@ -381,17 +385,13 @@ impl ListSkillsTool {
                 // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
                 // pack 目录本身是路径的一部分，需要计入 category
                 if path.join("manifest.json").exists() {
-                    let sub_category = if category.is_empty() {
-                        dir_name.clone()
-                    } else {
-                        format!("{}/{}", category, dir_name)
-                    };
                     self.scan_skills_dir_recursive(&path, &sub_category, skills, seen);
                     continue;
                 }
 
                 // 否则：视为 category 目录，递归扫描子目录
-                self.scan_skills_dir_recursive(&path, &dir_name, skills, seen);
+                // 使用 sub_category 累积路径，避免深层 category 截断
+                self.scan_skills_dir_recursive(&path, &sub_category, skills, seen);
             }
         }
     }
