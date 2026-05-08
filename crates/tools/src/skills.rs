@@ -371,20 +371,26 @@ impl ListSkillsTool {
                         "path": path.display().to_string(),
                     }));
 
-                    // If also a skill pack, recurse into sub-dirs
+                    // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
                     if path.join("manifest.json").exists() {
                         self.scan_skills_dir_recursive(&path, category, skills, seen);
                     }
                     continue;
                 }
 
-                // Non-skill dir with manifest.json: skill pack, recurse
+                // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
+                // pack 目录本身是路径的一部分，需要计入 category
                 if path.join("manifest.json").exists() {
-                    self.scan_skills_dir_recursive(&path, category, skills, seen);
+                    let sub_category = if category.is_empty() {
+                        dir_name.clone()
+                    } else {
+                        format!("{}/{}", category, dir_name)
+                    };
+                    self.scan_skills_dir_recursive(&path, &sub_category, skills, seen);
                     continue;
                 }
 
-                // Otherwise: treat as a category directory, recurse with category set
+                // 否则：视为 category 目录，递归扫描子目录
                 self.scan_skills_dir_recursive(&path, &dir_name, skills, seen);
             }
         }

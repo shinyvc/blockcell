@@ -101,19 +101,23 @@ impl SkillIndex {
     }
 
     fn scan_dir(&mut self, skills_dir: &Path) {
-        if !skills_dir.exists() {
+        self.scan_dir_recursive(skills_dir, "");
+    }
+
+    /// 递归扫描技能目录，维护完整 category 路径
+    ///
+    /// 与 SkillFileStore 的路径解析保持一致：
+    /// - skill 目录 → 输出 `category/name` 复合名称
+    /// - manifest.json 包目录 → 递归进入，包目录名计入 category
+    /// - 其他非 skill 目录 → 视为 category，递归扫描子目录
+    fn scan_dir_recursive(&mut self, dir: &Path, category: &str) {
+        if !dir.exists() {
             return;
         }
 
-        // 遍历 skills_dir 下的子目录
-        // 每个子目录可能是:
-        //   1. 一个 skill 目录 (包含 SKILL.md / meta.yaml / meta.json / SKILL.rhai / SKILL.py)
-        //   2. 一个 skill 包目录 (包含 manifest.json，需要递归扫描子目录)
-        //   3. 一个 category 目录 (包含多个 skill 子目录)
-        // 排除 .git/.github/.hub 等非 skill 目录 (参考 Hermes skill_index.py)
         const EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
 
-        if let Ok(entries) = std::fs::read_dir(skills_dir) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if !path.is_dir() {
@@ -125,71 +129,43 @@ impl SkillIndex {
                     .unwrap_or("unknown")
                     .to_string();
 
-                // Skip excluded directories
                 if EXCLUDED_DIRS.contains(&dir_name.as_str()) {
                     continue;
                 }
 
-                // 判断: 如果该目录直接包含 skill 标识文件, 则它是一个无 category 的 skill
+                let sub_category = if category.is_empty() {
+                    dir_name.clone()
+                } else {
+                    format!("{}/{}", category, dir_name)
+                };
+
+                // 判断: 如果该目录直接包含 skill 标识文件, 则它是一个 skill
                 if Self::is_skill_dir(&path) {
-                    let entry = Self::build_entry(&dir_name, "", &path);
-                    self.entries.insert(composite_key("", &dir_name), entry);
+                    let entry = Self::build_entry(&dir_name, category, &path);
+                    self.entries.insert(composite_key(category, &dir_name), entry);
                     // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
                     if path.join("manifest.json").exists() {
-                        self.scan_dir(&path);
+                        self.scan_dir_recursive(&path, &sub_category);
                     }
                     continue;
                 }
 
                 // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
+                // 包目录名计入 category 路径，确保子 skill 可被 SkillFileStore 解析
                 if path.join("manifest.json").exists() {
-                    self.scan_dir(&path);
+                    self.scan_dir_recursive(&path, &sub_category);
                     continue;
                 }
 
-                // 该目录是一个 category, 遍历其下的 skill 子目录
-                if let Ok(skill_entries) = std::fs::read_dir(&path) {
-                    for skill_entry in skill_entries.flatten() {
-                        let skill_path = skill_entry.path();
-                        if !skill_path.is_dir() {
-                            continue;
-                        }
-                        let skill_dir_name = skill_path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-
-                        // Skip excluded directories within categories too
-                        if EXCLUDED_DIRS.contains(&skill_dir_name.as_str()) {
-                            continue;
-                        }
-
-                        // skill 目录：索引自身
-                        if Self::is_skill_dir(&skill_path) {
-                            let entry = Self::build_entry(&skill_dir_name, &dir_name, &skill_path);
-                            self.entries
-                                .insert(composite_key(&dir_name, &skill_dir_name), entry);
-                            // 若同时是 skill 包，也递归扫描子目录
-                            if skill_path.join("manifest.json").exists() {
-                                self.scan_dir(&skill_path);
-                            }
-                            continue;
-                        }
-
-                        // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描
-                        if skill_path.join("manifest.json").exists() {
-                            self.scan_dir(&skill_path);
-                        }
-                    }
-                }
+                // 否则：视为 category 目录，递归扫描子目录
+                self.scan_dir_recursive(&path, &sub_category);
             }
         }
 
-        tracing::info!(
-            skill_count = self.entries.len(),
-            "[SkillIndex] Built index from {}",
-            skills_dir.display()
+        tracing::debug!(
+            category = category,
+            dir = %dir.display(),
+            "[SkillIndex] Scanned directory"
         );
     }
 
