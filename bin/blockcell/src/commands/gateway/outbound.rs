@@ -24,6 +24,7 @@ pub(super) async fn outbound_to_ws_bridge(
                         chat_id: msg.chat_id.clone(),
                         task_id: String::new(),
                         content: msg.content.clone(),
+                    reasoning_content: msg.reasoning_content.clone(),
                         tool_calls: 0,
                         duration_ms: 0,
                         media: msg.media.clone(),

@@ -4464,6 +4464,15 @@ impl AgentRuntime {
         let final_response = strip_fake_tool_calls(final_response.trim());
         info!(target: "chat::output", content = %final_response, "Final response");
 
+        // Extract reasoning_content from the last assistant message in history
+        // (populated by DeepSeek thinking mode etc.) so channels can display it.
+        let reasoning_content = history
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .and_then(|m| m.reasoning_content.clone())
+            .filter(|r| !r.is_empty());
+
         // Only cache if this turn had substantive tool results — prevents caching
         // LLM-hallucinated lists from empty/error tool results.
         // A tool message with empty/null content (e.g. memory_query returning [])
@@ -4511,6 +4520,7 @@ impl AgentRuntime {
                 let mut outbound =
                     OutboundMessage::new(&msg.channel, &msg.chat_id, &final_response);
                 outbound.account_id = msg.account_id.clone();
+                outbound.reasoning_content = reasoning_content.clone();
                 outbound.media = collected_media.clone();
                 outbound.metadata = extract_reply_metadata(msg);
                 let _ = tx.send(outbound).await;
@@ -4519,7 +4529,7 @@ impl AgentRuntime {
             if let Some((channel, to)) = cron_deliver_target {
                 if channel == "ws" {
                     if let Some(ref event_tx) = self.event_tx {
-                        let event = serde_json::json!({
+                        let mut event = serde_json::json!({
                             "type": "message_done",
                             "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                             "chat_id": to,
@@ -4532,17 +4542,22 @@ impl AgentRuntime {
                             "delivery_kind": "cron",
                             "cron_kind": "agent",
                         });
+                        if let Some(ref rc) = reasoning_content {
+                            event["reasoning_content"] = serde_json::Value::String(rc.clone());
+                        }
                         let _ = event_tx.send(event.to_string());
                     }
                     if let Some(tx) = &self.outbound_tx {
                         let mut outbound = OutboundMessage::new(&channel, &to, &final_response);
                         outbound.account_id = msg.account_id.clone();
+                        outbound.reasoning_content = reasoning_content.clone();
                         outbound.media = collected_media.clone();
                         let _ = tx.send(outbound).await;
                     }
                 } else if let Some(tx) = &self.outbound_tx {
                     let mut outbound = OutboundMessage::new(&channel, &to, &final_response);
                     outbound.account_id = msg.account_id.clone();
+                    outbound.reasoning_content = reasoning_content.clone();
                     outbound.media = collected_media.clone();
                     let _ = tx.send(outbound).await;
                 }
@@ -4553,7 +4568,7 @@ impl AgentRuntime {
 
         if msg.channel == "ws" || msg.channel == "cli" {
             if let Some(ref event_tx) = self.event_tx {
-                let event = serde_json::json!({
+                let mut event = serde_json::json!({
                     "type": "message_done",
                     "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                     "chat_id": msg.chat_id,
@@ -4563,6 +4578,9 @@ impl AgentRuntime {
                     "duration_ms": 0,
                     "media": collected_media,
                 });
+                if let Some(ref rc) = reasoning_content {
+                    event["reasoning_content"] = serde_json::Value::String(rc.clone());
+                }
                 let _ = event_tx.send(event.to_string());
             }
         }
@@ -4572,6 +4590,7 @@ impl AgentRuntime {
                 let mut outbound =
                     OutboundMessage::new(&msg.channel, &msg.chat_id, &final_response);
                 outbound.account_id = msg.account_id.clone();
+                outbound.reasoning_content = reasoning_content.clone();
                 outbound.media = collected_media.clone();
                 outbound.metadata = extract_reply_metadata(msg);
                 // The runtime already sent message_done via event_tx for ws channel;
@@ -4589,7 +4608,8 @@ impl AgentRuntime {
                         msg.metadata.get("deliver_to").and_then(|v| v.as_str()),
                     ) {
                         if let Some(tx) = &self.outbound_tx {
-                            let outbound = OutboundMessage::new(channel, to, &final_response);
+                            let mut outbound = OutboundMessage::new(channel, to, &final_response);
+                            outbound.reasoning_content = reasoning_content.clone();
                             let _ = tx.send(outbound).await;
                         }
                     }

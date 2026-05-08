@@ -526,6 +526,7 @@ pub async fn run(
             use std::io::Write;
             let mut stdout = std::io::stdout();
             let mut emitted_text_delta = false;
+            let mut emitted_thinking = false;
             loop {
                 match event_rx.recv().await {
                     Ok(event_str) => {
@@ -536,6 +537,11 @@ pub async fn run(
                                 "token" => {
                                     if let Some(delta) = event.get("delta").and_then(|v| v.as_str())
                                     {
+                                        // 在 thinking 之后、第一个 token 之前插入换行
+                                        if emitted_thinking {
+                                            println!();
+                                            emitted_thinking = false;
+                                        }
                                         emitted_text_delta = true;
                                         print!("{}", delta);
                                         let _ = stdout.flush();
@@ -545,6 +551,7 @@ pub async fn run(
                                     if let Some(content) =
                                         event.get("content").and_then(|v| v.as_str())
                                     {
+                                        emitted_thinking = true;
                                         print!("{}", content);
                                         let _ = stdout.flush();
                                     }
@@ -566,6 +573,7 @@ pub async fn run(
                                     }
                                     println!();
                                     emitted_text_delta = false;
+                                    emitted_thinking = false;
                                 }
                                 _ => {}
                             }
@@ -869,6 +877,7 @@ pub async fn run(
                 // If true, message_done should NOT reprint the content (avoid duplicate).
                 // If false (non-streaming path like skill loops), message_done prints content.
                 let mut emitted_text_delta = false;
+                let mut emitted_thinking = false;
                 loop {
                     match event_rx.recv().await {
                         Ok(event_str) => {
@@ -882,6 +891,11 @@ pub async fn run(
                                         if let Some(delta) =
                                             event.get("delta").and_then(|v| v.as_str())
                                         {
+                                            // 在 thinking 之后、第一个 token 之前插入换行
+                                            if emitted_thinking {
+                                                println!();
+                                                emitted_thinking = false;
+                                            }
                                             emitted_text_delta = true;
                                             print!("{}", delta);
                                             let _ = stdout.flush();
@@ -892,6 +906,7 @@ pub async fn run(
                                         if let Some(content) =
                                             event.get("content").and_then(|v| v.as_str())
                                         {
+                                            emitted_thinking = true;
                                             print!("{}", content);
                                             let _ = stdout.flush();
                                         }
@@ -1096,6 +1111,7 @@ pub async fn run(
                                                 }
                                                 println!();
                                                 emitted_text_delta = false;
+                                                emitted_thinking = false;
                                             }
                                         }
                                     }

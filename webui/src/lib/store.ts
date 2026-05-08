@@ -354,6 +354,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             ...m,
             content: finalContent ?? m.content,
             streaming: false,
+            // message_done 携带 reasoning_content 时更新 reasoning 字段
+            reasoning: event.reasoning_content ?? m.reasoning,
             media: event.media && event.media.length > 0
               ? [...new Set([...(m.media || []), ...event.media])]
               : m.media,
@@ -365,17 +367,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
         ) {
           state.updateLastAssistantMessage((m) => ({
             ...m,
+            // message_done 携带 reasoning_content 时补入 reasoning 字段
+            reasoning: event.reasoning_content ?? m.reasoning,
             media: event.media && event.media.length > 0
               ? [...new Set([...(m.media || []), ...event.media])]
               : m.media,
             highlight: m.highlight || highlight,
           }));
         } else {
-          // New complete message
+          // Non-streaming path (outbound bridge, background delivery, etc.)
           state.addMessage({
             id: nextMsgId(),
             role: 'assistant',
             content: event.content || '',
+            reasoning: event.reasoning_content || undefined,
             timestamp: Date.now(),
             streaming: false,
             media: event.media && event.media.length > 0 ? event.media : undefined,
