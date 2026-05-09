@@ -17,6 +17,7 @@ use crate::cron::CronTool;
 use crate::data_process::DataProcessTool;
 use crate::email::EmailTool;
 use crate::encrypt::EncryptTool;
+use crate::evolution_workflow::EvolutionWorkflowTool;
 use crate::exec::ExecTool;
 use crate::exec_local::ExecLocalTool;
 use crate::exec_skill_script::ExecSkillScriptTool;
@@ -132,6 +133,7 @@ impl ToolRegistry {
         registry.register(Arc::new(SystemInfoTool));
         registry.register(Arc::new(AgentStatusTool));
         registry.register(Arc::new(CapabilityEvolveTool));
+        registry.register(Arc::new(EvolutionWorkflowTool::new()));
 
         // Camera tools
         registry.register(Arc::new(CameraCaptureTool));

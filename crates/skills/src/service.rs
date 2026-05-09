@@ -314,16 +314,58 @@ pub struct EvolutionService {
 
 impl EvolutionService {
     fn is_in_progress_status(status: &EvolutionStatus) -> bool {
+        Self::is_pipeline_runnable_status(status)
+            || matches!(*status.normalize(), EvolutionStatus::Observing)
+    }
+
+    fn is_pipeline_runnable_status(status: &EvolutionStatus) -> bool {
         matches!(
             *status.normalize(),
             EvolutionStatus::Triggered
                 | EvolutionStatus::Generating
                 | EvolutionStatus::Generated
                 | EvolutionStatus::Auditing
+                | EvolutionStatus::AuditFailed
                 | EvolutionStatus::AuditPassed
+                | EvolutionStatus::CompileFailed
                 | EvolutionStatus::CompilePassed
-                | EvolutionStatus::Observing
         )
+    }
+
+    fn normalize_resumable_pipeline_record(&self, record: &mut EvolutionRecord) -> Result<()> {
+        let next_status = match record.status.clone() {
+            EvolutionStatus::Generating => {
+                if record.patch.is_some() {
+                    Some(EvolutionStatus::Generated)
+                } else {
+                    Some(EvolutionStatus::Triggered)
+                }
+            }
+            EvolutionStatus::Auditing | EvolutionStatus::AuditFailed => {
+                if record.patch.is_some() {
+                    Some(EvolutionStatus::Generated)
+                } else {
+                    Some(EvolutionStatus::Triggered)
+                }
+            }
+            EvolutionStatus::CompileFailed => {
+                if record.patch.is_some() {
+                    record.audit = None;
+                    Some(EvolutionStatus::Generated)
+                } else {
+                    Some(EvolutionStatus::Triggered)
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(status) = next_status {
+            record.status = status;
+            record.updated_at = chrono::Utc::now().timestamp();
+            self.evolution.save_record_public(record)?;
+        }
+
+        Ok(())
     }
 
     fn find_in_progress_record_on_disk(&self, skill_name: &str) -> Option<String> {
@@ -1113,7 +1155,15 @@ impl EvolutionService {
             }
         }
 
-        // Phase 2: Check observation windows
+        self.tick_observations().await?;
+
+        Ok(())
+    }
+
+    /// Check observation windows without running the generation pipeline.
+    pub async fn tick_observations(&self) -> Result<()> {
+        self.adopt_orphaned_records().await;
+
         let active = self.active_evolutions.lock().await;
         let observing: Vec<(String, String)> =
             active.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -1139,12 +1189,19 @@ impl EvolutionService {
     ///
     /// If an LLM provider is configured, runs the full pipeline (generate→audit→compile→deploy+observe).
     /// Otherwise, just marks the record as "Generating" so list_skills can show it.
-    async fn process_pending_evolution(&self, skill_name: &str, evolution_id: &str) -> Result<()> {
+    pub async fn process_pending_evolution(
+        &self,
+        skill_name: &str,
+        evolution_id: &str,
+    ) -> Result<()> {
         let record = self.evolution.load_record(evolution_id)?;
 
-        if record.status != EvolutionStatus::Triggered {
+        if !Self::is_pipeline_runnable_status(&record.status) {
             return Ok(());
         }
+
+        let mut record = record;
+        self.normalize_resumable_pipeline_record(&mut record)?;
 
         info!(
             skill = %skill_name,
@@ -1244,8 +1301,13 @@ impl EvolutionService {
         }
 
         let stats = self.observation_stats.lock().await;
-        let error_rate = stats.error_rate(evolution_id);
+        let memory_error_rate = stats.error_rate(evolution_id);
         drop(stats);
+        let error_rate = if record.observation_total_calls > 0 {
+            record.observation_error_calls as f64 / record.observation_total_calls as f64
+        } else {
+            memory_error_rate
+        };
 
         // 使用 check_observation 检查观察窗口状态
         match self.evolution.check_observation(evolution_id, error_rate)? {
@@ -1334,12 +1396,40 @@ impl EvolutionService {
 
     /// 报告观察期间的技能调用结果（供外部在执行技能后调用）
     pub async fn report_skill_call(&self, skill_name: &str, is_error: bool) {
-        let active = self.active_evolutions.lock().await;
-        if let Some(evolution_id) = active.get(skill_name) {
-            let evolution_id = evolution_id.clone();
-            drop(active);
-            let mut stats = self.observation_stats.lock().await;
-            stats.record_call(&evolution_id, is_error);
+        let evolution_id = {
+            let active = self.active_evolutions.lock().await;
+            active.get(skill_name).cloned()
+        }
+        .or_else(|| self.find_in_progress_record_on_disk(skill_name));
+
+        if let Some(evolution_id) = evolution_id {
+            {
+                let mut active = self.active_evolutions.lock().await;
+                active.insert(skill_name.to_string(), evolution_id.clone());
+            }
+
+            {
+                let mut stats = self.observation_stats.lock().await;
+                stats.record_call(&evolution_id, is_error);
+            }
+
+            if let Ok(mut record) = self.evolution.load_record(&evolution_id) {
+                if *record.status.normalize() == EvolutionStatus::Observing {
+                    record.observation_total_calls += 1;
+                    if is_error {
+                        record.observation_error_calls += 1;
+                    }
+                    record.updated_at = chrono::Utc::now().timestamp();
+                    if let Err(e) = self.evolution.save_record_public(&record) {
+                        warn!(
+                            skill = %skill_name,
+                            evolution_id = %evolution_id,
+                            error = %e,
+                            "🧠 [观察] 持久化观察期调用统计失败"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1600,8 +1690,8 @@ impl EvolutionService {
         let mut pending = Vec::new();
         for (skill_name, evolution_id) in active.iter() {
             if let Ok(record) = self.evolution.load_record(evolution_id) {
-                // 只有 Triggered 状态才需要 pipeline 驱动
-                if record.status == EvolutionStatus::Triggered {
+                // Durable worker can resume any pipeline-runnable checkpoint.
+                if Self::is_pipeline_runnable_status(&record.status) {
                     pending.push((skill_name.clone(), evolution_id.clone()));
                 }
             }
@@ -1650,18 +1740,8 @@ impl EvolutionService {
                 Err(_) => continue,
             };
 
-            // Only adopt records that are in an active pipeline state
-            let dominated = matches!(
-                record.status,
-                EvolutionStatus::Triggered
-                    | EvolutionStatus::Generating
-                    | EvolutionStatus::Generated
-                    | EvolutionStatus::Auditing
-                    | EvolutionStatus::AuditPassed
-                    | EvolutionStatus::CompilePassed
-                    | EvolutionStatus::Observing
-                    | EvolutionStatus::RollingOut
-            );
+            // Adopt every state the durable worker can resume, plus observation.
+            let dominated = Self::is_in_progress_status(&record.status);
             if !dominated {
                 continue;
             }

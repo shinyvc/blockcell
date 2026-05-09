@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
+use crate::capability_adapter::EvolutionWorkflowStoreAdapter;
 use crate::context::{ActiveSkillContext, ContextBuilder, InteractionMode};
 use crate::error::{
     classify_tool_failure, dangerous_exec_denied, dangerous_file_ops_denied, disabled_skill_result,
@@ -1960,6 +1961,12 @@ pub struct AgentRuntime {
     capability_registry: Option<CapabilityRegistryHandle>,
     /// Core evolution engine handle for tools.
     core_evolution: Option<CoreEvolutionHandle>,
+    /// 核心进化工作流 worker — 后台独立运行，tick 只做轻量 notify
+    evolution_worker: Option<Arc<dyn crate::capability_adapter::EvolutionNotifier>>,
+    /// Skill evolution worker — runtime only triggers and notifies it.
+    skill_evolution_worker: Option<Arc<dyn crate::capability_adapter::EvolutionNotifier>>,
+    /// 核心进化工作流存储 — 快速入队，不拿 engine mutex
+    evolution_workflow_store: Option<Arc<blockcell_storage::EvolutionWorkflowStore>>,
     /// Broadcast sender for streaming events to WebSocket clients (gateway mode).
     event_tx: Option<broadcast::Sender<String>>,
     /// In-memory store for structured system events emitted by runtime producers.
@@ -2096,6 +2103,9 @@ impl AgentRuntime {
             skill_file_store: None,
             capability_registry: None,
             core_evolution: None,
+            evolution_worker: None,
+            skill_evolution_worker: None,
+            evolution_workflow_store: None,
             event_tx: None,
             system_event_store,
             system_event_orchestrator,
@@ -2770,28 +2780,27 @@ impl AgentRuntime {
             let skill_summary = match mode_clone {
                 ReviewMode::Memory => String::new(),
                 ReviewMode::Skill | ReviewMode::Combined => {
-                    if !skills_dir.exists() {
-                        tracing::info!("[Nudge] Skills 目录不存在, 跳过 Skill 部分");
+                    let index = match tokio::task::spawn_blocking(move || {
+                        if skills_dir.exists() {
+                            crate::skill_index::SkillIndex::build_from_dir(&skills_dir)
+                        } else {
+                            crate::skill_index::SkillIndex::new()
+                        }
+                    })
+                    .await
+                    {
+                        Ok(idx) => idx,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "[Nudge] 构建索引任务失败");
+                            return;
+                        }
+                    };
+
+                    if index.entries().is_empty() {
+                        tracing::info!("[Nudge] 无可用 Skill, 跳过 Skill 部分");
                         String::new()
                     } else {
-                        let index = match tokio::task::spawn_blocking(move || {
-                            crate::skill_index::SkillIndex::build_from_dir(&skills_dir)
-                        })
-                        .await
-                        {
-                            Ok(idx) => idx,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "[Nudge] 构建索引任务失败");
-                                return;
-                            }
-                        };
-
-                        if index.entries().is_empty() {
-                            tracing::info!("[Nudge] 无可用 Skill, 跳过 Skill 部分");
-                            String::new()
-                        } else {
-                            index.to_prompt_summary()
-                        }
+                        index.to_prompt_summary()
                     }
                 }
             };
@@ -2891,11 +2900,13 @@ impl AgentRuntime {
 
                     // 刷新父 Agent 的 Skill 索引缓存 (后台 Review 可能创建/修改了 Skill)
                     // 与 Hermes 一致: 系统提示词在下次 LLM 调用时反映最新的 Skill 列表
-                    if matches!(mode_clone, ReviewMode::Skill | ReviewMode::Combined)
-                        && skills_dir_clone.exists()
-                    {
+                    if matches!(mode_clone, ReviewMode::Skill | ReviewMode::Combined) {
                         if let Ok(index) = tokio::task::spawn_blocking(move || {
-                            crate::skill_index::SkillIndex::build_from_dir(&skills_dir_clone)
+                            if skills_dir_clone.exists() {
+                                crate::skill_index::SkillIndex::build_from_dir(&skills_dir_clone)
+                            } else {
+                                crate::skill_index::SkillIndex::new()
+                            }
                         })
                         .await
                         {
@@ -3174,6 +3185,27 @@ impl AgentRuntime {
     /// Set the core evolution engine handle for tools.
     pub fn set_core_evolution(&mut self, core_evo: CoreEvolutionHandle) {
         self.core_evolution = Some(core_evo);
+    }
+
+    pub fn set_evolution_worker(
+        &mut self,
+        worker: Arc<dyn crate::capability_adapter::EvolutionNotifier>,
+    ) {
+        self.evolution_worker = Some(worker);
+    }
+
+    pub fn set_skill_evolution_worker(
+        &mut self,
+        worker: Arc<dyn crate::capability_adapter::EvolutionNotifier>,
+    ) {
+        self.skill_evolution_worker = Some(worker);
+    }
+
+    pub fn set_evolution_workflow_store(
+        &mut self,
+        store: Arc<blockcell_storage::EvolutionWorkflowStore>,
+    ) {
+        self.evolution_workflow_store = Some(store);
     }
 
     /// Deprecated: MCP tools are now injected before runtime construction via the shared MCP manager.
@@ -3676,6 +3708,7 @@ impl AgentRuntime {
             response_cache: None,
             skill_mutex: None,
             agent_type_registry: None,
+            evolution_workflow_store: None,
             runtime_handle: self.runtime_handle.clone(),
             agent_identity: blockcell_core::current_agent_context(),
         })
@@ -5613,9 +5646,16 @@ impl AgentRuntime {
                     warn!(error = %e, iteration = ?tool_call_counts, retries = max_retries, "LLM call failed after all retries");
                     final_response = llm_exhausted_error(max_retries, &e);
                     if let Some(evo_service) = self.context_builder.evolution_service() {
-                        let _ = evo_service
+                        if let Ok(report) = evo_service
                             .report_error("__llm_provider__", &format!("{}", e), None, vec![])
-                            .await;
+                            .await
+                        {
+                            if report.evolution_triggered.is_some() {
+                                if let Some(ref worker) = self.skill_evolution_worker {
+                                    worker.notify();
+                                }
+                            }
+                        }
                     }
                     // Preserve reasoning_content: None here since this is a synthetic error
                     // message, not an LLM response. DeepSeek requires consistent reasoning_content
@@ -7135,6 +7175,10 @@ impl AgentRuntime {
             ),
             agent_type_registry: Some(Arc::new(self.agent_type_registry.clone())
                 as blockcell_tools::AgentTypeRegistryHandle),
+            evolution_workflow_store: self.evolution_workflow_store.clone().map(|store| {
+                Arc::new(EvolutionWorkflowStoreAdapter::new((*store).clone()))
+                    as blockcell_tools::EvolutionWorkflowStoreHandle
+            }),
         };
 
         // Emit tool_call_start event to WebSocket clients
@@ -7256,6 +7300,9 @@ impl AgentRuntime {
                     {
                         Ok(report) => {
                             if report.evolution_triggered.is_some() {
+                                if let Some(ref worker) = self.skill_evolution_worker {
+                                    worker.notify();
+                                }
                                 learning_hint = Some(format!(
                                     "[系统] 技能 `{}` 执行失败，已自动触发进化学习。\
                                 请向用户坦诚说明：你暂时还不具备这个技能，但已经开始学习，\
@@ -7609,6 +7656,7 @@ impl AgentRuntime {
         let capability_registry = self.capability_registry.clone();
         let core_evolution = self.core_evolution.clone();
         let event_emitter = self.system_event_emitter.clone();
+        let evolution_workflow_store = self.evolution_workflow_store.clone();
 
         let tool_executor =
             move |tool_name: &str, params: serde_json::Value| -> Result<serde_json::Value> {
@@ -7695,6 +7743,10 @@ impl AgentRuntime {
                     agent_identity: None,
                     skill_mutex: None,
                     agent_type_registry: None,
+                    evolution_workflow_store: evolution_workflow_store.clone().map(|store| {
+                        Arc::new(EvolutionWorkflowStoreAdapter::new((*store).clone()))
+                            as blockcell_tools::EvolutionWorkflowStoreHandle
+                    }),
                 };
 
                 // Execute tool synchronously via a new tokio runtime handle
@@ -7783,10 +7835,8 @@ impl AgentRuntime {
     ) {
         info!("AgentRuntime started");
 
-        // 启动灰度发布调度器（每 60 秒 tick 一次）
-        let has_evolution = self.context_builder.evolution_service().is_some();
-        if has_evolution {
-            info!("Evolution rollout scheduler enabled");
+        if self.skill_evolution_worker.is_some() {
+            info!("Skill evolution durable workflow scheduler enabled");
         }
 
         let tick_secs = self.config.tools.tick_interval_secs.clamp(10, 300) as u64;
@@ -8118,27 +8168,15 @@ impl AgentRuntime {
                         .process_system_event_tick(chrono::Utc::now().timestamp_millis())
                         .await;
 
-                    // Evolution rollout tick
-                    if has_evolution {
-                        if let Some(evo_service) = self.context_builder.evolution_service() {
-                            if let Err(e) = evo_service.tick().await {
-                                warn!(error = %e, "Evolution rollout tick error");
-                            }
-                        }
+                    // Wake skill evolution worker. The worker owns the long LLM/audit/compile
+                    // pipeline, so this select branch stays responsive.
+                    if let Some(ref worker) = self.skill_evolution_worker {
+                        worker.notify();
                     }
 
-                    // Process pending core evolutions
-                    if let Some(ref core_evo_handle) = self.core_evolution {
-                        let core_evo = core_evo_handle.lock().await;
-                        match core_evo.run_pending_evolutions().await {
-                            Ok(n) if n > 0 => {
-                                info!(count = n, "🧬 [核心进化] 处理了 {} 个待处理进化", n);
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "🧬 [核心进化] 处理待处理进化出错");
-                            }
-                            _ => {}
-                        }
+                    // 唤醒核心进化 worker — 轻量操作，不执行长任务，不拿 mutex
+                    if let Some(ref worker) = self.evolution_worker {
+                        worker.notify();
                     }
 
                     // Periodic skill hot-reload (picks up skills created by chat)
@@ -8164,43 +8202,62 @@ impl AgentRuntime {
                         self.context_builder.sync_capabilities(cap_ids);
                     }
 
-                    // Auto-trigger Capability evolution for missing skill dependencies
-                    // With 24h cooldown per capability to prevent repeated requests
-                    if let Some(ref core_evo_handle) = self.core_evolution {
+                    // 自动触发缺失能力的进化 — 通过 workflow store 快速入队，不拿 engine mutex
+                    // 24 小时冷却，防止重复请求
+                    if let Some(ref workflow_store) = self.evolution_workflow_store {
                         let missing = self.context_builder.get_missing_capabilities();
                         let now = chrono::Utc::now().timestamp();
-                        const COOLDOWN_SECS: i64 = 86400; // 24 hours
+                        const COOLDOWN_SECS: i64 = 86400; // 24 小时
 
                         for (skill_name, cap_id) in missing {
-                            // Cooldown check: skip if requested within 24h
+                            // 冷却检查：24 小时内不重复请求
                             if let Some(&last_request) = self.cap_request_cooldown.get(&cap_id) {
                                 if now - last_request < COOLDOWN_SECS {
                                     continue;
                                 }
                             }
 
+                            // 检查是否已有活跃或阻塞的工作流
+                            match workflow_store.is_active_or_blocked(&cap_id) {
+                                Ok(true) => {
+                                    debug!(
+                                        capability_id = %cap_id,
+                                        "🧬 能力 '{}' 已有活跃/阻塞工作流，跳过",
+                                        cap_id
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "检查工作流状态失败");
+                                    continue;
+                                }
+                                _ => {}
+                            }
+
                             let description = format!(
                                 "Auto-requested: required by skill '{}'",
                                 skill_name
                             );
-                            let core_evo = core_evo_handle.lock().await;
-                            match core_evo.request_capability(&cap_id, &description, "script").await {
+                            match workflow_store.enqueue(&cap_id, &description, "script") {
                                 Ok(_) => {
                                     self.cap_request_cooldown.insert(cap_id.clone(), now);
                                     info!(
                                         capability_id = %cap_id,
                                         skill = %skill_name,
-                                        "🧬 Auto-requested missing capability '{}' for skill '{}'",
+                                        "🧬 自动入队缺失能力 '{}' (skill '{}')",
                                         cap_id, skill_name
                                     );
+                                    // 唤醒 worker 处理新入队的工作流
+                                    if let Some(ref worker) = self.evolution_worker {
+                                        worker.notify();
+                                    }
                                 }
                                 Err(e) => {
-                                    // Also record cooldown on error (blocked/failed) to avoid retrying immediately
                                     self.cap_request_cooldown.insert(cap_id.clone(), now);
                                     debug!(
                                         capability_id = %cap_id,
                                         error = %e,
-                                        "Failed to auto-request capability (cooldown set)"
+                                        "入队能力进化失败（已设冷却）"
                                     );
                                 }
                             }
@@ -11060,6 +11117,7 @@ mod tests {
             skill_mutex: Some(Arc::new(crate::skill_mutex::SkillMutex::new())
                 as blockcell_tools::SkillMutexHandle),
             agent_type_registry: None,
+            evolution_workflow_store: None,
         };
 
         assert!(ctx.event_emitter.is_some());

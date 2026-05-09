@@ -224,13 +224,16 @@ impl Tool for ListSkillsTool {
             .unwrap_or("all");
 
         let skills_dir = ctx.workspace.join("skills");
-        let builtin_dir = ctx.builtin_skills_dir.as_deref();
+        let mut external_dirs = Vec::new();
+        if let Some(builtin) = ctx.builtin_skills_dir.clone() {
+            external_dirs.push(builtin);
+        }
 
         match query {
             "learned" | "available" | "all" => {
-                self.get_available_skills(&skills_dir, builtin_dir).await
+                self.get_available_skills(&skills_dir, &external_dirs).await
             }
-            _ => self.get_available_skills(&skills_dir, builtin_dir).await,
+            _ => self.get_available_skills(&skills_dir, &external_dirs).await,
         }
     }
 }
@@ -261,7 +264,7 @@ impl ListSkillsTool {
     async fn get_available_skills(
         &self,
         skills_dir: &std::path::Path,
-        builtin_dir: Option<&std::path::Path>,
+        external_dirs: &[PathBuf],
     ) -> Result<Value> {
         let mut skills = Vec::new();
         let mut seen_names = std::collections::HashSet::new();
@@ -269,8 +272,8 @@ impl ListSkillsTool {
         // Scan workspace skills first (higher priority)
         self.scan_skills_dir(skills_dir, &mut skills, &mut seen_names);
 
-        // Scan builtin skills (lower priority, skip duplicates)
-        if let Some(builtin) = builtin_dir {
+        // Scan external and builtin skills (lower priority, skip duplicates)
+        for builtin in external_dirs {
             self.scan_skills_dir(builtin, &mut skills, &mut seen_names);
         }
 
@@ -474,6 +477,7 @@ mod tests {
             response_cache: None,
             skill_mutex: None,
             agent_type_registry: None,
+            evolution_workflow_store: None,
             runtime_handle: None,
             agent_identity: None,
         }
@@ -509,6 +513,7 @@ mod tests {
             response_cache: None,
             skill_mutex: None,
             agent_type_registry: None,
+            evolution_workflow_store: None,
             runtime_handle: None,
             agent_identity: None,
         }

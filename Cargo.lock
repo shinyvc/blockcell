@@ -589,6 +589,8 @@ dependencies = [
  "blockcell-agent",
  "blockcell-core",
  "blockcell-providers",
+ "blockcell-skills",
+ "blockcell-storage",
  "blockcell-tools",
  "chrono",
  "chrono-tz",

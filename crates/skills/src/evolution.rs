@@ -268,6 +268,10 @@ pub struct EvolutionRecord {
     pub shadow_test: Option<ShadowTestResult>,
     /// 观察窗口（部署后的错误率监控）
     pub observation: Option<ObservationWindow>,
+    #[serde(default)]
+    pub observation_total_calls: u64,
+    #[serde(default)]
+    pub observation_error_calls: u64,
     /// Legacy rollout field (for backward-compatible deserialization of old records)
     #[serde(default, skip_serializing)]
     pub rollout: Option<RolloutConfig>,
@@ -436,6 +440,8 @@ impl SkillEvolution {
             audit: None,
             shadow_test: None,
             observation: None,
+            observation_total_calls: 0,
+            observation_error_calls: 0,
             rollout: None,
             status: EvolutionStatus::Triggered,
             attempt: 1,
@@ -912,6 +918,8 @@ impl SkillEvolution {
 
         // 设置观察窗口
         record.observation = Some(ObservationWindow::default());
+        record.observation_total_calls = 0;
+        record.observation_error_calls = 0;
         record.status = EvolutionStatus::Observing;
         record.updated_at = chrono::Utc::now().timestamp();
         self.save_record(&record)?;

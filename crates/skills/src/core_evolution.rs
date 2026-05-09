@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+fn default_max_attempts() -> u32 {
+    3
+}
+
 /// Core-level evolution record — tracks the lifecycle of a capability evolution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreEvolutionRecord {
@@ -30,6 +34,9 @@ pub struct CoreEvolutionRecord {
     pub validation: Option<ValidationResult>,
     /// Attempt count
     pub attempt: u32,
+    /// Maximum retry attempts
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
     /// Feedback history for retries
     pub feedback_history: Vec<CoreFeedbackEntry>,
     /// Input schema (JSON Schema) extracted from LLM response
@@ -100,6 +107,60 @@ const MAX_AUTO_FAILURES: u32 = 3;
 /// Blocked records auto-expire after this many seconds (7 days).
 const BLOCK_EXPIRY_SECS: i64 = 7 * 24 * 3600;
 
+/// Evolution step names — used by the workflow worker to advance one step at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvolutionStep {
+    BuildPrompt,
+    GenerateCode,
+    CompileArtifact,
+    ValidateArtifact,
+    LoadCapability,
+    Promote,
+}
+
+impl EvolutionStep {
+    /// All steps in execution order.
+    pub fn all_steps() -> &'static [EvolutionStep] {
+        &[
+            EvolutionStep::BuildPrompt,
+            EvolutionStep::GenerateCode,
+            EvolutionStep::CompileArtifact,
+            EvolutionStep::ValidateArtifact,
+            EvolutionStep::LoadCapability,
+            EvolutionStep::Promote,
+        ]
+    }
+
+    /// Step name as stored in the workflow steps table.
+    pub fn name(&self) -> &'static str {
+        match self {
+            EvolutionStep::BuildPrompt => "build_prompt",
+            EvolutionStep::GenerateCode => "generate_code",
+            EvolutionStep::CompileArtifact => "compile_artifact",
+            EvolutionStep::ValidateArtifact => "validate_artifact",
+            EvolutionStep::LoadCapability => "load_capability",
+            EvolutionStep::Promote => "promote",
+        }
+    }
+
+    /// Find the next step after the given completed step name.
+    /// Returns None if this was the last step.
+    pub fn next_after(completed: &str) -> Option<EvolutionStep> {
+        let steps = Self::all_steps();
+        for (i, s) in steps.iter().enumerate() {
+            if s.name() == completed && i + 1 < steps.len() {
+                return Some(steps[i + 1]);
+            }
+        }
+        None
+    }
+
+    /// Find the first step.
+    pub fn first() -> EvolutionStep {
+        EvolutionStep::BuildPrompt
+    }
+}
+
 /// Core-level evolution engine
 ///
 /// Unlike the Rhai skill evolution which generates scripts, this generates
@@ -154,6 +215,53 @@ impl CoreEvolution {
         self.llm_provider = Some(provider);
     }
 
+    /// 处理单个待处理（Requested）进化请求，返回处理数量（0 或 1）。
+    ///
+    /// 与 `run_pending_evolutions`（处理所有待处理请求，可能阻塞事件循环数分钟）不同，
+    /// 此方法每次调用只处理 1 个请求，保持每个 tick 轻量且响应迅速。
+    pub async fn run_one_pending_evolution(&self) -> Result<usize> {
+        let provider = match &self.llm_provider {
+            Some(p) => p.clone(),
+            None => {
+                debug!("🧬 [核心进化] 无 LLM provider，跳过待处理进化");
+                return Ok(0);
+            }
+        };
+
+        let records = self.list_records()?;
+        let pending: Vec<_> = records
+            .iter()
+            .filter(|r| r.status == CoreEvolutionStatus::Requested)
+            .collect();
+
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        // 只处理第一个待处理进化
+        let record = &pending[0];
+        info!(
+            remaining = pending.len(),
+            "🧬 [核心进化] 发现 {} 个待处理请求，本次处理 1 个",
+            pending.len()
+        );
+
+        match self.run_evolution(&record.id, provider.as_ref()).await {
+            Ok(success) => {
+                if success {
+                    info!(id = %record.id, "🧬 [核心进化] ✅ 进化成功: {}", record.capability_id);
+                } else {
+                    warn!(id = %record.id, "🧬 [核心进化] ❌ 进化失败: {}", record.capability_id);
+                }
+                Ok(1)
+            }
+            Err(e) => {
+                warn!(id = %record.id, error = %e, "🧬 [核心进化] 进化出错: {}", record.capability_id);
+                Ok(0)
+            }
+        }
+    }
+
     /// Process all pending (Requested) evolutions using the configured LLM provider.
     /// Returns the number of evolutions processed.
     pub async fn run_pending_evolutions(&self) -> Result<usize> {
@@ -199,6 +307,220 @@ impl CoreEvolution {
         }
 
         Ok(processed)
+    }
+
+    /// Run a single evolution step for a workflow.
+    ///
+    /// This is the Phase 2 step-by-step interface used by the EvolutionWorker.
+    /// Each call advances the workflow by one step, writing progress to the
+    /// CoreEvolutionRecord (JSON file). The workflow store step table is
+    /// updated by the caller (EvolutionWorker).
+    ///
+    /// The `evolution_id` is the workflow store's UUID, which is also used
+    /// as the CoreEvolutionRecord ID for traceability.
+    ///
+    /// Returns `Ok(step_output_json)` on success, `Err` on failure.
+    pub async fn run_step(&self, evolution_id: &str, step: EvolutionStep) -> Result<String> {
+        // For BuildPrompt, ensure the CoreEvolutionRecord exists.
+        // If the record doesn't exist yet, create it.
+        if step == EvolutionStep::BuildPrompt && self.load_record(evolution_id).is_err() {
+            // Record doesn't exist — we need to create it.
+            // The workflow store's enqueue() already has capability_id and description,
+            // but CoreEvolutionRecord needs them. We'll create a minimal record.
+            // The worker will pass these via a separate method.
+            warn!(
+                evolution_id = %evolution_id,
+                "CoreEvolutionRecord does not exist for BuildPrompt step. \
+                 Use run_step_with_context() instead."
+            );
+            return Err(Error::Evolution(
+                "CoreEvolutionRecord not found. Use run_step_with_context().".to_string(),
+            ));
+        }
+
+        let mut record = self.load_record(evolution_id)?;
+
+        match step {
+            EvolutionStep::BuildPrompt => {
+                // Build the generation prompt and store it as step output.
+                // This step is pure computation — no LLM call.
+                info!(
+                    evolution_id = %evolution_id,
+                    "🧬 [核心进化] Step: build_prompt"
+                );
+                record.status = CoreEvolutionStatus::Generating;
+                record.updated_at = chrono::Utc::now().timestamp();
+                self.save_record(&record)?;
+
+                let prompt = self.build_generation_prompt(&record)?;
+                Ok(serde_json::json!({ "prompt_len": prompt.len() }).to_string())
+            }
+
+            EvolutionStep::GenerateCode => {
+                // Call LLM to generate code.
+                let provider = self
+                    .llm_provider
+                    .as_ref()
+                    .ok_or_else(|| Error::Evolution("No LLM provider configured".to_string()))?;
+
+                info!(
+                    evolution_id = %evolution_id,
+                    "🧬 [核心进化] Step: generate_code"
+                );
+                record.status = CoreEvolutionStatus::Generating;
+                record.updated_at = chrono::Utc::now().timestamp();
+                self.save_record(&record)?;
+
+                let (code, raw_response) = self.generate_code(&record, provider.as_ref()).await?;
+                record.source_code = Some(code.clone());
+
+                // Extract input/output schema from the raw LLM response
+                if let Some((input_schema, output_schema)) =
+                    self.extract_schema_from_response(&raw_response)
+                {
+                    record.input_schema = Some(input_schema);
+                    record.output_schema = Some(output_schema);
+                }
+
+                record.status = CoreEvolutionStatus::Generated;
+                record.updated_at = chrono::Utc::now().timestamp();
+                self.save_record(&record)?;
+
+                Ok(serde_json::json!({ "code_len": code.len() }).to_string())
+            }
+
+            EvolutionStep::CompileArtifact => {
+                info!(
+                    evolution_id = %evolution_id,
+                    "🧬 [核心进化] Step: compile_artifact"
+                );
+                record.status = CoreEvolutionStatus::Compiling;
+                record.updated_at = chrono::Utc::now().timestamp();
+                self.save_record(&record)?;
+
+                let artifact_path = self.compile_artifact(&record).await?;
+                record.artifact_path = Some(artifact_path);
+                record.compile_output = Some("Success".to_string());
+                record.status = CoreEvolutionStatus::Compiled;
+                record.updated_at = chrono::Utc::now().timestamp();
+                self.save_record(&record)?;
+
+                Ok(serde_json::json!({ "artifact_path": record.artifact_path }).to_string())
+            }
+
+            EvolutionStep::ValidateArtifact => {
+                info!(
+                    evolution_id = %evolution_id,
+                    "🧬 [核心进化] Step: validate_artifact"
+                );
+                record.status = CoreEvolutionStatus::Validating;
+                record.updated_at = chrono::Utc::now().timestamp();
+                self.save_record(&record)?;
+
+                let validation = self.validate_artifact(&record).await?;
+                let passed = validation.passed;
+                record.validation = Some(validation.clone());
+
+                if !passed {
+                    let issues: Vec<String> = validation
+                        .checks
+                        .iter()
+                        .filter(|c| !c.passed)
+                        .map(|c| format!("[{}] {}", c.name, c.message))
+                        .collect();
+                    let feedback_msg = format!("Validation failed:\n{}", issues.join("\n"));
+
+                    record.status = CoreEvolutionStatus::ValidationFailed;
+                    record.feedback_history.push(CoreFeedbackEntry {
+                        attempt: record.attempt.max(1),
+                        stage: "validation".to_string(),
+                        feedback: feedback_msg,
+                        previous_code: record.source_code.clone().unwrap_or_default(),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    });
+                    record.updated_at = chrono::Utc::now().timestamp();
+                    self.save_record(&record)?;
+
+                    return Err(Error::Evolution("Validation failed".to_string()));
+                }
+
+                record.status = CoreEvolutionStatus::Validated;
+                record.updated_at = chrono::Utc::now().timestamp();
+                self.save_record(&record)?;
+
+                Ok(serde_json::json!({ "passed": true }).to_string())
+            }
+
+            EvolutionStep::LoadCapability => {
+                info!(
+                    evolution_id = %evolution_id,
+                    "🧬 [核心进化] Step: load_capability"
+                );
+                record.status = CoreEvolutionStatus::Loading;
+                record.updated_at = chrono::Utc::now().timestamp();
+                self.save_record(&record)?;
+
+                self.load_capability(&record).await?;
+
+                record.status = CoreEvolutionStatus::Active;
+                record.updated_at = chrono::Utc::now().timestamp();
+                self.save_record(&record)?;
+
+                Ok(serde_json::json!({ "capability_id": record.capability_id }).to_string())
+            }
+
+            EvolutionStep::Promote => {
+                // Promote is already done in load_capability (sets Active status).
+                // This step exists for audit/logging and future canary logic.
+                info!(
+                    evolution_id = %evolution_id,
+                    capability_id = %record.capability_id,
+                    "🧬 [核心进化] Step: promote — capability activated"
+                );
+                Ok(serde_json::json!({ "status": "Active" }).to_string())
+            }
+        }
+    }
+
+    /// Run a single evolution step with workflow context.
+    ///
+    /// This variant is used by the EvolutionWorker for the BuildPrompt step,
+    /// where the CoreEvolutionRecord doesn't exist yet and needs to be created
+    /// from the workflow store's metadata.
+    pub async fn run_step_with_context(
+        &self,
+        evolution_id: &str,
+        step: EvolutionStep,
+        capability_id: &str,
+        description: &str,
+        provider_kind: ProviderKind,
+    ) -> Result<String> {
+        // For BuildPrompt, create the CoreEvolutionRecord if it doesn't exist
+        if step == EvolutionStep::BuildPrompt && self.load_record(evolution_id).is_err() {
+            let now = chrono::Utc::now().timestamp();
+            let record = CoreEvolutionRecord {
+                id: evolution_id.to_string(),
+                capability_id: capability_id.to_string(),
+                description: description.to_string(),
+                provider_kind,
+                status: CoreEvolutionStatus::Requested,
+                attempt: 0,
+                max_attempts: 3,
+                source_code: None,
+                artifact_path: None,
+                compile_output: None,
+                validation: None,
+                feedback_history: Vec::new(),
+                input_schema: None,
+                output_schema: None,
+                created_at: now,
+                updated_at: now,
+            };
+            self.save_record(&record)?;
+        }
+
+        // Delegate to run_step
+        self.run_step(evolution_id, step).await
     }
 
     /// Check if there is already an active (non-terminal) evolution record for a capability.
@@ -345,6 +667,7 @@ impl CoreEvolution {
                 compile_output: None,
                 validation: None,
                 attempt: 0,
+                max_attempts: 3,
                 feedback_history: Vec::new(),
                 input_schema: None,
                 output_schema: None,
@@ -381,6 +704,7 @@ impl CoreEvolution {
             compile_output: None,
             validation: None,
             attempt: 0,
+            max_attempts: 3,
             feedback_history: Vec::new(),
             input_schema: None,
             output_schema: None,
@@ -739,11 +1063,11 @@ impl CoreEvolution {
 
         match record.provider_kind {
             ProviderKind::Process | ProviderKind::BuiltIn => {
-                // Shell script — just write to file and make executable
+                // Shell script — 写入文件并设置可执行权限
                 let script_path = self.artifacts_dir.join(format!("{}.sh", safe_id));
                 std::fs::write(&script_path, code)?;
 
-                // Make executable
+                // 设置可执行权限（仅 Unix）
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -752,27 +1076,43 @@ impl CoreEvolution {
                     std::fs::set_permissions(&script_path, perms)?;
                 }
 
-                // Validate syntax with bash -n
-                let output = tokio::process::Command::new("bash")
-                    .arg("-n")
-                    .arg(&script_path)
-                    .output()
-                    .await
-                    .map_err(|e| Error::Evolution(format!("Failed to check bash syntax: {}", e)))?;
+                // 语法验证：Unix 用 bash -n，Windows 跳过（bash 不可用）
+                #[cfg(unix)]
+                {
+                    let output = tokio::process::Command::new("bash")
+                        .arg("-n")
+                        .arg(&script_path)
+                        .output()
+                        .await
+                        .map_err(|e| {
+                            Error::Evolution(format!("Failed to check bash syntax: {}", e))
+                        })?;
 
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(Error::Evolution(format!("Bash syntax error: {}", stderr)));
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Err(Error::Evolution(format!("Bash syntax error: {}", stderr)));
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    // Windows 上 bash 不可用，跳过语法检查
+                    // 脚本将在实际执行时由 Git Bash 或 WSL 解释
+                    debug!(
+                        path = %script_path.display(),
+                        "🧬 [核心进化] Windows 环境，跳过 bash 语法检查"
+                    );
                 }
 
-                Ok(script_path.to_string_lossy().to_string())
+                // 返回路径时统一使用正斜杠，避免 Windows 反斜杠在其他上下文中被吞掉
+                let path_str = script_path.to_string_lossy().replace('\\', "/");
+                Ok(path_str)
             }
             ProviderKind::ExternalApi => {
-                // Python script
+                // Python 脚本
                 let script_path = self.artifacts_dir.join(format!("{}.py", safe_id));
                 std::fs::write(&script_path, code)?;
 
-                // Validate syntax with python3 -m py_compile
+                // 使用 python3 -m py_compile 验证语法
                 let output = tokio::process::Command::new("python3")
                     .arg("-m")
                     .arg("py_compile")
@@ -786,8 +1126,8 @@ impl CoreEvolution {
                         return Err(Error::Evolution(format!("Python syntax error: {}", stderr)));
                     }
                     Err(e) => {
-                        // python3 not available, skip syntax check
-                        warn!("python3 not available for syntax check: {}", e);
+                        // python3 不可用，跳过语法检查
+                        warn!("python3 不可用，跳过语法检查: {}", e);
                     }
                     _ => {}
                 }
@@ -1040,7 +1380,7 @@ impl CoreEvolution {
         }
 
         // Create version snapshot for rollback support
-        if let Err(e) = self.version_manager.create_version(
+        if let Err(e) = self.version_manager.create_version_if_new_artifact(
             &record.capability_id,
             artifact_path,
             CapabilityVersionSource::Evolution,
@@ -1281,6 +1621,7 @@ mod tests {
                 compile_output: None,
                 validation: None,
                 attempt: 1,
+                max_attempts: 3,
                 feedback_history: Vec::new(),
                 input_schema: None,
                 output_schema: None,

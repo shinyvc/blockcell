@@ -154,7 +154,7 @@ impl ProgressTracker {
 
         // 检查报告间隔
         if let Some(last_time) = self.last_reported_time {
-            let elapsed = (now - last_time).num_milliseconds() as u64;
+            let elapsed = (now - last_time).num_milliseconds().max(0) as u64; // clamp negative (clock skew) to 0
             if elapsed < self.report_interval_ms {
                 return ProgressDelta::empty();
             }

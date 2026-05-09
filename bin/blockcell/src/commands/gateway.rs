@@ -2,7 +2,7 @@ use anyhow::Context;
 use blockcell_agent::{
     AgentRuntime, CapabilityRegistryAdapter, CheckpointManager, ConfirmRequest,
     CoreEvolutionAdapter, MemoryStoreAdapter, MessageBus, ProviderLLMBridge, ResponseCacheConfig,
-    TaskManager,
+    SkillEvolutionLLMBridge, TaskManager,
 };
 #[cfg(feature = "dingtalk")]
 use blockcell_channels::dingtalk::DingTalkChannel;
@@ -23,12 +23,13 @@ use blockcell_channels::whatsapp::WhatsAppChannel;
 use blockcell_channels::ChannelManager;
 use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths};
 use blockcell_scheduler::{
-    CronJob, CronService, DreamService, DreamServiceConfig, GhostMaintenanceService,
-    GhostMaintenanceServiceConfig, HeartbeatService, JobPayload, JobSchedule, JobState,
-    ScheduleKind,
+    CronJob, CronService, DreamService, DreamServiceConfig, EvolutionWorker,
+    GhostMaintenanceService, GhostMaintenanceServiceConfig, HeartbeatService, JobPayload,
+    JobSchedule, JobState, ScheduleKind, SkillEvolutionWorker,
 };
 use blockcell_skills::{new_registry_handle, CoreEvolution};
 use blockcell_skills::{EvolutionService, EvolutionServiceConfig};
+use blockcell_storage::EvolutionWorkflowStore;
 use blockcell_tools::mcp::manager::McpManager;
 use blockcell_tools::{
     build_tool_registry_for_agent_config, build_tool_registry_with_all_mcp,
@@ -58,6 +59,37 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
 use super::memory_store::open_memory_store;
+
+fn create_skill_evolution_llm_provider(
+    config: &Config,
+    provider_pool: &blockcell_providers::ProviderPool,
+    agent_id: &str,
+) -> Option<Arc<dyn blockcell_skills::LLMProvider>> {
+    let provider: Option<Arc<dyn blockcell_providers::Provider>> = if config
+        .agents
+        .defaults
+        .evolution_model
+        .is_some()
+        || config.agents.defaults.evolution_provider.is_some()
+    {
+        match super::provider::create_evolution_provider(config) {
+            Ok(evo_provider) => {
+                info!(agent_id = %agent_id, "Skill evolution provider configured with independent model");
+                Some(Arc::from(evo_provider))
+            }
+            Err(e) => {
+                warn!(agent_id = %agent_id, error = %e, "Failed to create skill evolution provider; using main provider");
+                provider_pool.acquire().map(|(_, p)| p)
+            }
+        }
+    } else {
+        provider_pool.acquire().map(|(_, p)| p)
+    };
+
+    provider.map(|p| {
+        Arc::new(SkillEvolutionLLMBridge::new_arc(p)) as Arc<dyn blockcell_skills::LLMProvider>
+    })
+}
 
 mod alerts;
 mod banner;
@@ -846,6 +878,41 @@ async fn spawn_agent_runtime(
 
     runtime.set_capability_registry(cap_registry_handle);
     runtime.set_core_evolution(core_evo_handle);
+
+    // 创建核心进化工作流存储和 worker
+    let evo_workflow_db = agent_paths.workspace().join("evo_workflow.db");
+    let evo_workflow_store = EvolutionWorkflowStore::open(&evo_workflow_db)?;
+    let evo_workflow_store_arc = Arc::new(evo_workflow_store);
+    let evo_worker = EvolutionWorker::new((*evo_workflow_store_arc).clone(), core_evo_raw.clone());
+    let evo_worker_arc = Arc::new(evo_worker);
+    runtime.set_evolution_workflow_store(evo_workflow_store_arc);
+    runtime.set_evolution_worker(evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>);
+
+    let skill_evo_llm_provider =
+        create_skill_evolution_llm_provider(&agent_config, &provider_pool, agent_id);
+    let skill_evo_workflow_db = agent_paths.workspace().join("skill_evolution_workflow.db");
+    let skill_evo_workflow_store = EvolutionWorkflowStore::open(&skill_evo_workflow_db)?;
+    let skill_evo_worker = SkillEvolutionWorker::new(
+        skill_evo_workflow_store,
+        agent_paths.skills_dir(),
+        EvolutionServiceConfig::default(),
+        skill_evo_llm_provider,
+    );
+    let skill_evo_worker_arc = Arc::new(skill_evo_worker);
+    runtime.set_skill_evolution_worker(
+        skill_evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>
+    );
+
+    // 启动核心进化 worker 后台任务
+    let evo_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        evo_worker_arc.run_loop(evo_shutdown_rx).await;
+    });
+    let skill_evo_shutdown_rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        skill_evo_worker_arc.run_loop(skill_evo_shutdown_rx).await;
+    });
+
     runtime.set_event_tx(ws_broadcast_tx);
 
     // Create shared ResponseCache and register it

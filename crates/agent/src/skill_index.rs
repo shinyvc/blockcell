@@ -68,10 +68,32 @@ impl SkillIndex {
 
     /// 从 skills 目录构建索引
     pub fn build_from_dir(skills_dir: &Path) -> Self {
+        Self::build_from_dirs([skills_dir.to_path_buf()])
+    }
+
+    /// Build an index from multiple skill roots. Later roots override earlier
+    /// roots when they expose the same category/name key.
+    pub fn build_from_dirs<I>(skills_dirs: I) -> Self
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
         let mut index = Self::new();
 
+        for skills_dir in skills_dirs {
+            index.scan_dir(&skills_dir);
+        }
+
+        tracing::info!(
+            skill_count = index.entries.len(),
+            "[SkillIndex] Built index from configured skill roots"
+        );
+
+        index
+    }
+
+    fn scan_dir(&mut self, skills_dir: &Path) {
         if !skills_dir.exists() {
-            return index;
+            return;
         }
 
         // 遍历 skills_dir 下的子目录
@@ -101,7 +123,7 @@ impl SkillIndex {
                 // 判断: 如果该目录直接包含 SKILL.md, 则它是一个无 category 的 skill
                 if path.join("SKILL.md").exists() {
                     let entry = Self::build_entry(&dir_name, "", &path);
-                    index.entries.insert(composite_key("", &dir_name), entry);
+                    self.entries.insert(composite_key("", &dir_name), entry);
                 } else {
                     // 该目录是一个 category, 遍历其下的 skill 子目录
                     if let Ok(skill_entries) = std::fs::read_dir(&path) {
@@ -126,8 +148,7 @@ impl SkillIndex {
                                 continue;
                             }
                             let entry = Self::build_entry(&skill_dir_name, &dir_name, &skill_path);
-                            index
-                                .entries
+                            self.entries
                                 .insert(composite_key(&dir_name, &skill_dir_name), entry);
                         }
                     }
@@ -136,12 +157,10 @@ impl SkillIndex {
         }
 
         tracing::info!(
-            skill_count = index.entries.len(),
+            skill_count = self.entries.len(),
             "[SkillIndex] Built index from {}",
             skills_dir.display()
         );
-
-        index
     }
 
     /// 从单个 Skill 目录构建索引条目
@@ -228,17 +247,9 @@ impl SkillIndex {
 
     /// 从 SKILL.md 内容提取描述
     fn extract_description(content: &str) -> String {
-        let trimmed = content.trim();
-
-        // 尝试从 frontmatter 提取
-        if let Some(rest) = trimmed.strip_prefix("---") {
-            if let Some(end_idx) = rest.find("---") {
-                let frontmatter = &rest[..end_idx];
-                for line in frontmatter.lines() {
-                    if let Some(val) = line.strip_prefix("description:") {
-                        return val.trim().trim_matches('"').trim_matches('\'').to_string();
-                    }
-                }
+        if let Some(frontmatter) = Self::extract_frontmatter_value(content) {
+            if let Some(description) = frontmatter.get("description").and_then(|v| v.as_str()) {
+                return description.trim().to_string();
             }
         }
 
@@ -255,23 +266,13 @@ impl SkillIndex {
 
     /// 从 SKILL.md 内容提取工具列表
     fn extract_tools(content: &str) -> Vec<String> {
-        let trimmed = content.trim();
-
-        if let Some(rest) = trimmed.strip_prefix("---") {
-            if let Some(end_idx) = rest.find("---") {
-                let frontmatter = &rest[..end_idx];
-                for line in frontmatter.lines() {
-                    if let Some(val) = line.strip_prefix("tools:") {
-                        let val = val.trim();
-                        if val.starts_with('[') && val.ends_with(']') {
-                            return val[1..val.len() - 1]
-                                .split(',')
-                                .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
-                                .filter(|s| !s.is_empty())
-                                .collect();
-                        }
-                    }
-                }
+        if let Some(frontmatter) = Self::extract_frontmatter_value(content) {
+            if let Some(tools) = frontmatter.get("tools").and_then(|v| v.as_sequence()) {
+                return tools
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect();
             }
         }
 
@@ -280,17 +281,11 @@ impl SkillIndex {
 
     /// 从 SKILL.md 内容提取 always 标志
     fn extract_always(content: &str) -> bool {
-        let trimmed = content.trim();
-
-        if let Some(rest) = trimmed.strip_prefix("---") {
-            if let Some(end_idx) = rest.find("---") {
-                let frontmatter = &rest[..end_idx];
-                for line in frontmatter.lines() {
-                    if let Some(val) = line.strip_prefix("always:") {
-                        return val.trim() == "true";
-                    }
-                }
-            }
+        if let Some(frontmatter) = Self::extract_frontmatter_value(content) {
+            return frontmatter
+                .get("always")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
         }
 
         false
@@ -298,23 +293,31 @@ impl SkillIndex {
 
     /// 从 SKILL.md frontmatter 提取版本号
     fn extract_version(content: &str) -> String {
-        let trimmed = content.trim();
-
-        if let Some(rest) = trimmed.strip_prefix("---") {
-            if let Some(end_idx) = rest.find("---") {
-                let frontmatter = &rest[..end_idx];
-                for line in frontmatter.lines() {
-                    if let Some(val) = line.strip_prefix("version:") {
-                        let v = val.trim().trim_matches('"').trim_matches('\'');
-                        if !v.is_empty() {
-                            return v.to_string();
-                        }
+        if let Some(frontmatter) = Self::extract_frontmatter_value(content) {
+            if let Some(version) = frontmatter.get("version") {
+                if let Some(v) = version.as_str() {
+                    if !v.trim().is_empty() {
+                        return v.trim().to_string();
                     }
+                } else if let Some(v) = version.as_f64() {
+                    return v.to_string();
+                } else if let Some(v) = version.as_i64() {
+                    return v.to_string();
                 }
             }
         }
 
         default_version()
+    }
+
+    fn extract_frontmatter_value(content: &str) -> Option<serde_yaml::Value> {
+        let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+        let content = content.replace("\r\n", "\n");
+        let trimmed = content.trim_start();
+        let rest = trimmed.strip_prefix("---")?;
+        let end_idx = rest.find("\n---")?;
+        let frontmatter = rest[..end_idx].trim();
+        serde_yaml::from_str::<serde_yaml::Value>(frontmatter).ok()
     }
 
     /// 获取所有 Skill 的索引条目
@@ -728,6 +731,28 @@ mod tests {
         let content = "---\ndescription: A test skill\n---\n\n# Title";
         let desc = SkillIndex::extract_description(content);
         assert_eq!(desc, "A test skill");
+    }
+
+    #[test]
+    fn test_extract_gbrain_frontmatter_blocks() {
+        let content = r#"---
+name: query
+version: 1.0.0
+description: |
+  Answer questions using the brain's knowledge with search and citations.
+tools:
+  - search
+  - query
+  - get_page
+---
+
+# Query Skill
+"#;
+        let desc = SkillIndex::extract_description(content);
+        let tools = SkillIndex::extract_tools(content);
+        assert!(desc.contains("brain's knowledge"));
+        assert_eq!(tools, vec!["search", "query", "get_page"]);
+        assert_eq!(SkillIndex::extract_version(content), "1.0.0");
     }
 
     #[test]

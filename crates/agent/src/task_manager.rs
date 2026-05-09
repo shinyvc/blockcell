@@ -540,16 +540,20 @@ impl TaskManager {
     }
 
     /// Mark a task as completed with a result summary.
-    /// 如果任务已处于终态（Cancelled），则跳过更新，防止覆盖取消状态。
+    /// 如果任务已处于终态（Cancelled/Completed/Failed），则跳过更新，防止状态回退或重复完成。
     pub async fn set_completed(&self, task_id: &str, result: &str) {
         let updated = {
             let mut tasks = self.tasks.lock().await;
             if let Some(task) = tasks.get_mut(task_id) {
-                // 防止覆盖已取消的任务状态（cancel 与 complete 的竞态保护）
-                if matches!(task.status, TaskStatus::Cancelled) {
+                // 防止覆盖已处于终态的任务（cancel/complete/fail 的竞态保护）
+                if matches!(
+                    task.status,
+                    TaskStatus::Cancelled | TaskStatus::Completed | TaskStatus::Failed
+                ) {
                     tracing::warn!(
                         task_id = %task_id,
-                        "Skipping set_completed: task already Cancelled"
+                        status = ?task.status,
+                        "Skipping set_completed: task already in terminal state"
                     );
                     None
                 } else {
@@ -595,13 +599,16 @@ impl TaskManager {
     }
 
     /// Mark a task as failed with an error message.
-    /// 如果任务已处于终态（Cancelled/Completed），则跳过更新，防止状态回退。
+    /// 如果任务已处于终态（Cancelled/Completed/Failed），则跳过更新，防止状态回退。
     pub async fn set_failed(&self, task_id: &str, error: &str) {
         let updated = {
             let mut tasks = self.tasks.lock().await;
             if let Some(task) = tasks.get_mut(task_id) {
-                // 防止覆盖已取消/已完成的任务状态
-                if matches!(task.status, TaskStatus::Cancelled | TaskStatus::Completed) {
+                // 防止覆盖已处于终态的任务（cancel/complete/fail 的竞态保护）
+                if matches!(
+                    task.status,
+                    TaskStatus::Cancelled | TaskStatus::Completed | TaskStatus::Failed
+                ) {
                     tracing::warn!(
                         task_id = %task_id,
                         status = ?task.status,
@@ -780,7 +787,10 @@ impl TaskManager {
         // Clean up corresponding message_queues entries
         if !removed_ids.is_empty() {
             {
-                let mut queues = self.message_queues.lock().unwrap();
+                let mut queues = match self.message_queues.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 for id in &removed_ids {
                     queues.remove(id);
                 }
@@ -921,17 +931,21 @@ impl TaskManager {
 
     /// Mark a task as completed with structured result and broadcast completion event.
     /// This is used by child agents to report their completion status to Lead Agent.
-    /// 如果任务已处于终态（Cancelled），则跳过更新，防止覆盖取消状态。
+    /// 如果任务已处于终态（Cancelled/Completed/Failed），则跳过更新，防止状态回退或重复广播。
     pub async fn complete_task(&self, task_id: &str, agent_type: String, result: AgentResult) {
         let task_info = {
             // 更新 TaskInfo 状态
             let mut tasks = self.tasks.lock().await;
             if let Some(task) = tasks.get_mut(task_id) {
-                // 防止覆盖已取消的任务状态
-                if matches!(task.status, TaskStatus::Cancelled) {
+                // 防止覆盖已取消/已完成/已失败的任务状态
+                if matches!(
+                    task.status,
+                    TaskStatus::Cancelled | TaskStatus::Completed | TaskStatus::Failed
+                ) {
                     tracing::warn!(
                         task_id = %task_id,
-                        "Skipping complete_task: task already Cancelled"
+                        status = ?task.status,
+                        "Skipping complete_task: task already in terminal state"
                     );
                     None
                 } else {
@@ -1204,7 +1218,10 @@ impl TaskManager {
 
         // 清理对应的 message_queues 条目，防止内存泄漏
         if !evicted_ids.is_empty() {
-            let mut queues = self.message_queues.lock().unwrap();
+            let mut queues = match self.message_queues.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             for id in &evicted_ids {
                 queues.remove(id);
             }

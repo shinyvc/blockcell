@@ -15,7 +15,14 @@ use std::path::Path;
 #[derive(Deserialize)]
 struct OpenClawFrontmatter {
     name: Option<String>,
+    #[allow(dead_code)]
+    version: Option<String>,
     description: Option<String>,
+    tools: Option<Vec<String>>,
+    capabilities: Option<Vec<String>>,
+    triggers: Option<Vec<String>>,
+    always: Option<bool>,
+    mutating: Option<bool>,
     #[allow(dead_code)]
     homepage: Option<String>,
     #[serde(rename = "user-invocable")]
@@ -95,7 +102,17 @@ pub fn parse_openclaw_skill(skill_dir: &Path, content: &str) -> Result<(SkillMet
     let body = body.replace("{baseDir}", &base_dir);
 
     // 5. 推断工具列表
-    let tools = infer_tools_for_openclaw(skill_dir, &body);
+    let tools = fm
+        .tools
+        .clone()
+        .or_else(|| fm.capabilities.clone())
+        .filter(|tools| !tools.is_empty())
+        .unwrap_or_else(|| infer_tools_for_openclaw(skill_dir, &body));
+
+    let output_format = build_gbrain_output_hint(
+        fm.mutating.unwrap_or(false),
+        fm.triggers.as_deref().unwrap_or(&[]),
+    );
 
     let meta = SkillMeta {
         name: fm.name.unwrap_or(dir_name),
@@ -109,12 +126,16 @@ pub fn parse_openclaw_skill(skill_dir: &Path, content: &str) -> Result<(SkillMet
                 .unwrap_or_default(),
             config: requires.and_then(|r| r.config.clone()).unwrap_or_default(),
         },
-        always: oc.as_ref().and_then(|o| o.always).unwrap_or(false),
+        always: fm
+            .always
+            .or_else(|| oc.as_ref().and_then(|o| o.always))
+            .unwrap_or(false),
         emoji: oc.as_ref().and_then(|o| o.emoji.clone()),
         os: oc.as_ref().and_then(|o| o.os.clone()),
         user_invocable: fm.user_invocable.unwrap_or(true),
         disable_model_invocation: fm.disable_model_invocation.unwrap_or(false),
         tools,
+        output_format,
         install: oc
             .as_ref()
             .and_then(|o| o.install.as_ref())
@@ -187,6 +208,22 @@ fn infer_tools_for_openclaw(skill_dir: &Path, skill_body: &str) -> Vec<String> {
     }
 
     tools
+}
+
+fn build_gbrain_output_hint(mutating: bool, triggers: &[String]) -> Option<String> {
+    if !mutating && triggers.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if mutating {
+        parts.push("This skill may mutate the brain; report the user-visible outcome clearly.");
+    }
+    if !triggers.is_empty() {
+        parts.push("Use the declared triggers as routing hints for when this skill applies.");
+    }
+
+    Some(parts.join(" "))
 }
 
 /// 将内部反序列化结构体映射到输出侧的 SkillInstallSpec。
@@ -365,6 +402,36 @@ Use `gh` CLI to manage repos.
         let dir = PathBuf::from("/skills/my_skill");
         let (meta, _) = parse_openclaw_skill(&dir, content).unwrap();
         assert_eq!(meta.name, "my_skill");
+    }
+
+    #[test]
+    fn test_parse_gbrain_frontmatter_tools() {
+        let content = r#"---
+name: query
+description: |
+  Answer questions using the brain's knowledge with search and citations.
+triggers:
+  - "what do we know about"
+tools:
+  - search
+  - query
+  - get_page
+  - get_backlinks
+mutating: false
+---
+
+# Query Skill
+"#;
+        let (meta, body) = parse_openclaw_skill(&test_dir(), content).unwrap();
+        assert_eq!(meta.name, "query");
+        assert!(meta.description.contains("brain's knowledge"));
+        assert_eq!(
+            meta.tools,
+            vec!["search", "query", "get_page", "get_backlinks"]
+        );
+        assert!(!meta.tools.contains(&"exec_local".to_string()));
+        assert!(meta.output_format.is_some());
+        assert!(body.contains("# Query Skill"));
     }
 
     #[test]

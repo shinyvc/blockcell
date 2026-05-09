@@ -323,7 +323,9 @@ impl ExtractionCursorManager {
                     "[cursor] Failed to parse cursor file, backing up and using defaults"
                 );
                 // 备份损坏的文件，避免数据永久丢失
-                let backup_path = self.cursor_file_path.with_extension("cursors.json.bak");
+                // Note: with_extension replaces only the last extension part.
+                // For ".cursors.json", we want ".cursors.json.bak", so use "json.bak".
+                let backup_path = self.cursor_file_path.with_extension("json.bak");
                 if let Err(e) = fs::rename(&self.cursor_file_path, &backup_path).await {
                     tracing::warn!(
                         error = %e,

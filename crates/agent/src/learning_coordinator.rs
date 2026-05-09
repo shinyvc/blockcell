@@ -291,6 +291,10 @@ impl LearningCoordinator {
     ///
     /// Returns the skill action if a skill nudge is due,
     /// potentially upgrading an existing memory action to combined.
+    ///
+    /// If `existing_memory` is true, the caller already reserved a throttle
+    /// slot via `check_memory_nudge`, so we skip `try_start_review()` to
+    /// avoid double-counting (which would leak the throttle counter).
     pub fn check_skill_nudge(
         &self,
         has_skill_tool: bool,
@@ -299,9 +303,13 @@ impl LearningCoordinator {
         if !self.self_improve_review_enabled {
             return None;
         }
-        // Atomically check throttle + increment counter
-        if !self.throttle.try_start_review() {
-            return None;
+        // Only reserve a new throttle slot if no memory review is already pending.
+        // If existing_memory is true, the caller's memory slot covers this review too.
+        if !existing_memory {
+            // Atomically check throttle + increment counter
+            if !self.throttle.try_start_review() {
+                return None;
+            }
         }
 
         let mut engine = self.nudge_engine.lock().unwrap_or_else(recover_mutex);
@@ -311,7 +319,9 @@ impl LearningCoordinator {
         let skill_due = skill_nudge != NudgeResult::NoNudge && has_skill_tool;
 
         if !skill_due {
-            self.throttle.review_completed(); // rollback
+            if !existing_memory {
+                self.throttle.review_completed(); // rollback only if we reserved a slot
+            }
             return None;
         }
 
@@ -322,7 +332,9 @@ impl LearningCoordinator {
         };
 
         if self.dedup.is_duplicate(dedup_key) {
-            self.throttle.review_completed(); // rollback
+            if !existing_memory {
+                self.throttle.review_completed(); // rollback only if we reserved a slot
+            }
             return None;
         }
 

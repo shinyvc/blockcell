@@ -608,6 +608,7 @@ mod tests {
             agent_identity: None,
             skill_mutex: None,
             agent_type_registry: None,
+            evolution_workflow_store: None,
         }
     }
 

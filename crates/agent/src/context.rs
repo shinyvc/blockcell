@@ -206,15 +206,15 @@ impl ContextBuilder {
             .skill_index_summary
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        if skills_dir.exists() {
+        if !skills_dir.exists() {
+            *summary = None;
+        } else {
             let index = crate::skill_index::SkillIndex::build_from_dir(&skills_dir);
             *summary = if index.entries().is_empty() {
                 None
             } else {
                 Some(index.to_prompt_summary())
             };
-        } else {
-            *summary = None;
         }
     }
 

@@ -8,6 +8,8 @@ blockcell-core = { path = "../core" }
 blockcell-agent = { path = "../agent" }
 blockcell-tools = { path = "../tools" }
 blockcell-providers = { path = "../providers" }
+blockcell-skills = { path = "../skills" }
+blockcell-storage = { path = "../storage" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

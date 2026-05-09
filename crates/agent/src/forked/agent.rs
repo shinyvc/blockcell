@@ -2850,6 +2850,20 @@ impl ForkAgentEvent {
     }
 }
 
+/// Safely truncate a string at a UTF-8 character boundary, appending "..." if truncated.
+/// Avoids panics from slicing at non-character boundaries (e.g., CJK text).
+fn truncate_str_safe(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let mut boundary = max_len;
+        while boundary > 0 && !s.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        format!("{}...", &s[..boundary])
+    }
+}
+
 /// 从工具参数中提取摘要信息，用于控制台实时显示。
 ///
 /// 例如 read_file → "src/main.rs", grep → "pattern='TODO'", write_file → "config.json"
@@ -2895,11 +2909,7 @@ fn extract_tool_summary(tool_name: &str, input: &serde_json::Value) -> String {
                 .map(|c| {
                     // 只显示命令的第一行/前60字符
                     let first_line = c.lines().next().unwrap_or(c);
-                    if first_line.len() > 60 {
-                        format!("{}...", &first_line[..60])
-                    } else {
-                        first_line.to_string()
-                    }
+                    truncate_str_safe(first_line, 60)
                 })
                 .unwrap_or_default()
         }
@@ -2907,13 +2917,7 @@ fn extract_tool_summary(tool_name: &str, input: &serde_json::Value) -> String {
             .get("query")
             .or_else(|| obj.get("url"))
             .and_then(|v| v.as_str())
-            .map(|q| {
-                if q.len() > 80 {
-                    format!("{}...", &q[..80])
-                } else {
-                    q.to_string()
-                }
-            })
+            .map(|q| truncate_str_safe(q, 80))
             .unwrap_or_default(),
         "list_dir" => obj
             .get("path")
@@ -2933,12 +2937,7 @@ fn extract_tool_summary(tool_name: &str, input: &serde_json::Value) -> String {
                 "message",
             ] {
                 if let Some(v) = obj.get(*key).and_then(|v| v.as_str()) {
-                    let truncated = if v.len() > 80 {
-                        format!("{}...", &v[..80])
-                    } else {
-                        v.to_string()
-                    };
-                    return truncated;
+                    return truncate_str_safe(v, 80);
                 }
             }
             String::new()

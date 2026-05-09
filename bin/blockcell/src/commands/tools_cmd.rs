@@ -192,6 +192,7 @@ pub async fn test(tool_name: &str, params_json: &str) -> anyhow::Result<()> {
         agent_identity: None,
         skill_mutex: None,
         agent_type_registry: None,
+        evolution_workflow_store: None,
     };
 
     println!("⏳ Executing {} ...", tool_name);
