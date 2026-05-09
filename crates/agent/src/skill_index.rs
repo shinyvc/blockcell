@@ -91,19 +91,33 @@ impl SkillIndex {
         index
     }
 
+    /// 判断目录是否包含 skill 标识文件
+    fn is_skill_dir(path: &Path) -> bool {
+        path.join("SKILL.md").exists()
+            || path.join("meta.yaml").exists()
+            || path.join("meta.json").exists()
+            || path.join("SKILL.rhai").exists()
+            || path.join("SKILL.py").exists()
+    }
+
     fn scan_dir(&mut self, skills_dir: &Path) {
-        if !skills_dir.exists() {
+        self.scan_dir_recursive(skills_dir, "");
+    }
+
+    /// 递归扫描技能目录，维护完整 category 路径
+    ///
+    /// 与 SkillFileStore 的路径解析保持一致：
+    /// - skill 目录 → 输出 `category/name` 复合名称
+    /// - manifest.json 包目录 → 递归进入，包目录名计入 category
+    /// - 其他非 skill 目录 → 视为 category，递归扫描子目录
+    fn scan_dir_recursive(&mut self, dir: &Path, category: &str) {
+        if !dir.exists() {
             return;
         }
 
-        // 遍历 skills_dir 下的子目录
-        // 每个子目录可能是:
-        //   1. 一个 category 目录 (包含多个 skill 子目录)
-        //   2. 一个无 category 的 skill 目录 (直接包含 SKILL.md)
-        // 排除 .git/.github/.hub 等非 skill 目录 (参考 Hermes skill_index.py)
         const EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
 
-        if let Ok(entries) = std::fs::read_dir(skills_dir) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if !path.is_dir() {
@@ -115,55 +129,48 @@ impl SkillIndex {
                     .unwrap_or("unknown")
                     .to_string();
 
-                // Skip excluded directories
                 if EXCLUDED_DIRS.contains(&dir_name.as_str()) {
                     continue;
                 }
 
-                // 判断: 如果该目录直接包含 SKILL.md, 则它是一个无 category 的 skill
-                if path.join("SKILL.md").exists() {
-                    let entry = Self::build_entry(&dir_name, "", &path);
-                    self.entries.insert(composite_key("", &dir_name), entry);
+                let sub_category = if category.is_empty() {
+                    dir_name.clone()
                 } else {
-                    // 该目录是一个 category, 遍历其下的 skill 子目录
-                    if let Ok(skill_entries) = std::fs::read_dir(&path) {
-                        for skill_entry in skill_entries.flatten() {
-                            let skill_path = skill_entry.path();
-                            if !skill_path.is_dir() {
-                                continue;
-                            }
-                            let skill_dir_name = skill_path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("unknown")
-                                .to_string();
+                    format!("{}/{}", category, dir_name)
+                };
 
-                            // Skip excluded directories within categories too
-                            if EXCLUDED_DIRS.contains(&skill_dir_name.as_str()) {
-                                continue;
-                            }
-
-                            // 只索引包含 SKILL.md 的目录 (跳过非 skill 目录)
-                            if !skill_path.join("SKILL.md").exists() {
-                                continue;
-                            }
-                            let entry = Self::build_entry(&skill_dir_name, &dir_name, &skill_path);
-                            self.entries
-                                .insert(composite_key(&dir_name, &skill_dir_name), entry);
-                        }
+                // 判断: 如果该目录直接包含 skill 标识文件, 则它是一个 skill
+                if Self::is_skill_dir(&path) {
+                    let entry = Self::build_entry(&dir_name, category, &path);
+                    self.entries.insert(composite_key(category, &dir_name), entry);
+                    // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
+                    if path.join("manifest.json").exists() {
+                        self.scan_dir_recursive(&path, &sub_category);
                     }
+                    continue;
                 }
+
+                // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
+                // 包目录名计入 category 路径，确保子 skill 可被 SkillFileStore 解析
+                if path.join("manifest.json").exists() {
+                    self.scan_dir_recursive(&path, &sub_category);
+                    continue;
+                }
+
+                // 否则：视为 category 目录，递归扫描子目录
+                self.scan_dir_recursive(&path, &sub_category);
             }
         }
 
-        tracing::info!(
-            skill_count = self.entries.len(),
-            "[SkillIndex] Built index from {}",
-            skills_dir.display()
+        tracing::debug!(
+            category = category,
+            dir = %dir.display(),
+            "[SkillIndex] Scanned directory"
         );
     }
 
     /// 从单个 Skill 目录构建索引条目
+    /// 优先级: meta.yaml → meta.json → SKILL.md frontmatter
     fn build_entry(name: &str, category: &str, path: &Path) -> SkillIndexEntry {
         let mut description = String::new();
         let mut tools = Vec::new();
@@ -171,34 +178,98 @@ impl SkillIndex {
         let mut version = default_version();
         let mut updated_at: Option<String> = None;
 
-        // 1. 尝试从 meta.json 读取
-        let meta_path = path.join("meta.json");
-        if meta_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(desc) = meta.get("description").and_then(|v| v.as_str()) {
-                        description = desc.to_string();
+        // 1. 尝试从 meta.yaml 读取
+        let meta_yaml_path = path.join("meta.yaml");
+        if meta_yaml_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&meta_yaml_path) {
+                if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                    if let Some(desc) = yaml.get("description").and_then(|v| v.as_str()) {
+                        let trimmed = desc.trim();
+                        if !trimmed.is_empty() {
+                            description = trimmed.to_string();
+                        }
                     }
-                    if let Some(t) = meta.get("tools").and_then(|v| v.as_array()) {
-                        tools = t
-                            .iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect();
+                    if tools.is_empty() {
+                        if let Some(arr) = yaml.get("tools").and_then(|v| v.as_sequence()) {
+                            tools = arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect();
+                        }
+                        // Legacy fallback: capabilities → tools (same as SkillMeta::effective_tools)
+                        if tools.is_empty() {
+                            if let Some(arr) =
+                                yaml.get("capabilities").and_then(|v| v.as_sequence())
+                            {
+                                tools = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect();
+                            }
+                        }
                     }
-                    if let Some(a) = meta.get("always").and_then(|v| v.as_bool()) {
-                        always = a;
+                    if !always {
+                        always = yaml
+                            .get("always")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                     }
-                    if let Some(v) = meta.get("version").and_then(|v| v.as_str()) {
-                        version = v.to_string();
-                    }
-                    if let Some(u) = meta.get("updated_at").and_then(|v| v.as_str()) {
-                        updated_at = Some(u.to_string());
+                    if version == default_version() {
+                        if let Some(v) = yaml.get("version").and_then(|v| v.as_str()) {
+                            version = v.to_string();
+                        }
                     }
                 }
             }
         }
 
-        // 2. 回退到 SKILL.md frontmatter
+        // 2. 尝试从 meta.json 读取
+        let meta_path = path.join("meta.json");
+        if meta_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if description.is_empty() {
+                        if let Some(desc) = meta.get("description").and_then(|v| v.as_str()) {
+                            description = desc.to_string();
+                        }
+                    }
+                    if tools.is_empty() {
+                        if let Some(t) = meta.get("tools").and_then(|v| v.as_array()) {
+                            tools = t
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect();
+                        }
+                        // Legacy fallback: capabilities → tools (same as SkillMeta::effective_tools)
+                        if tools.is_empty() {
+                            if let Some(c) = meta.get("capabilities").and_then(|v| v.as_array()) {
+                                tools = c
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect();
+                            }
+                        }
+                    }
+                    if !always {
+                        if let Some(a) = meta.get("always").and_then(|v| v.as_bool()) {
+                            always = a;
+                        }
+                    }
+                    if version == default_version() {
+                        if let Some(v) = meta.get("version").and_then(|v| v.as_str()) {
+                            version = v.to_string();
+                        }
+                    }
+                    if updated_at.is_none() {
+                        if let Some(u) = meta.get("updated_at").and_then(|v| v.as_str()) {
+                            updated_at = Some(u.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. 回退到 SKILL.md frontmatter
         if description.is_empty() {
             let skill_md = path.join("SKILL.md");
             if let Ok(content) = std::fs::read_to_string(&skill_md) {
@@ -215,20 +286,24 @@ impl SkillIndex {
             }
         }
 
-        // 3. 从文件修改时间获取 updated_at (如果 meta.json 和 frontmatter 都没有)
+        // 4. 从文件修改时间获取 updated_at
         if updated_at.is_none() {
-            let skill_md = path.join("SKILL.md");
-            if skill_md.exists() {
-                if let Ok(metadata) = std::fs::metadata(&skill_md) {
-                    if let Ok(modified) = metadata.modified() {
-                        let dt: DateTime<Utc> = modified.into();
-                        updated_at = Some(dt.to_rfc3339());
+            // 尝试 SKILL.md, meta.yaml, meta.json 的修改时间
+            for file_name in &["SKILL.md", "meta.yaml", "meta.json"] {
+                let fpath = path.join(file_name);
+                if fpath.exists() {
+                    if let Ok(metadata) = std::fs::metadata(&fpath) {
+                        if let Ok(modified) = metadata.modified() {
+                            let dt: DateTime<Utc> = modified.into();
+                            updated_at = Some(dt.to_rfc3339());
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        // 4. 最终回退
+        // 5. 最终回退
         if description.is_empty() {
             description = format!("Skill: {}", name);
         }
@@ -331,6 +406,7 @@ impl SkillIndex {
     }
 
     /// 按需加载 Skill 完整内容
+    /// 支持多种 skill 文件: SKILL.md → SKILL.rhai → SKILL.py
     pub fn load_skill(&mut self, name: &str) -> Option<String> {
         // 检查是否已加载
         if let Some(content) = self.loaded.get(name) {
@@ -342,33 +418,48 @@ impl SkillIndex {
             .entries
             .get(name)
             .or_else(|| self.entries.values().find(|e| e.name == name))?;
-        let skill_md = entry.path.join("SKILL.md");
 
-        if !skill_md.exists() {
-            return None;
+        // 按优先级尝试读取 skill 文件；meta-only skill 至少应能加载元信息。
+        for file_name in &[
+            "SKILL.md",
+            "SKILL.rhai",
+            "SKILL.py",
+            "meta.yaml",
+            "meta.json",
+        ] {
+            let file_path = entry.path.join(file_name);
+            if file_path.exists() {
+                let content = match std::fs::read_to_string(&file_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            skill_name = name,
+                            path = %file_path.display(),
+                            error = %e,
+                            "[SkillIndex] Failed to read skill file"
+                        );
+                        continue;
+                    }
+                };
+                self.loaded.insert(name.to_string(), content.clone());
+
+                tracing::debug!(
+                    skill_name = name,
+                    file = file_name,
+                    content_len = content.len(),
+                    "[SkillIndex] Loaded skill content"
+                );
+
+                return Some(content);
+            }
         }
 
-        let content = match std::fs::read_to_string(&skill_md) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    skill_name = name,
-                    path = %skill_md.display(),
-                    error = %e,
-                    "[SkillIndex] Failed to read SKILL.md"
-                );
-                return None;
-            }
-        };
-        self.loaded.insert(name.to_string(), content.clone());
-
-        tracing::debug!(
+        tracing::warn!(
             skill_name = name,
-            content_len = content.len(),
-            "[SkillIndex] Loaded skill content"
+            path = %entry.path.display(),
+            "[SkillIndex] No readable skill file found"
         );
-
-        Some(content)
+        None
     }
 
     /// 卸载 Skill 内容 (释放内存)
@@ -867,5 +958,81 @@ tools:
         let content = "---\nversion: 3.0.1\n---\n\n# Title";
         let version = SkillIndex::extract_version(content);
         assert_eq!(version, "3.0.1");
+    }
+
+    #[test]
+    fn test_capabilities_fallback_in_meta_yaml() {
+        let dir = temp_skills_dir();
+        let skill_dir = dir.join("general").join("legacy-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // meta.yaml with capabilities but no tools
+        std::fs::write(
+            skill_dir.join("meta.yaml"),
+            "name: legacy-skill\ndescription: Legacy skill with capabilities\ncapabilities:\n  - web_fetch\n  - web_search\n",
+        ).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Legacy Skill").unwrap();
+
+        let index = SkillIndex::build_from_dir(&dir);
+        let entry = index.entries().get("general/legacy-skill").unwrap();
+        assert_eq!(entry.tools, vec!["web_fetch", "web_search"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_meta_only_skill() {
+        let dir = temp_skills_dir();
+        let skill_dir = dir.join("general").join("metadata-only");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("meta.yaml"),
+            "name: metadata-only\ndescription: Metadata only skill\n",
+        )
+        .unwrap();
+
+        let mut index = SkillIndex::build_from_dir(&dir);
+        let content = index.load_skill("general/metadata-only").unwrap();
+        assert!(content.contains("Metadata only skill"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_capabilities_fallback_in_meta_json() {
+        let dir = temp_skills_dir();
+        let skill_dir = dir.join("general").join("json-legacy-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // meta.json with capabilities but no tools
+        std::fs::write(
+            skill_dir.join("meta.json"),
+            r#"{"description":"JSON legacy skill","capabilities":["exec","read_file"]}"#,
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# JSON Legacy Skill").unwrap();
+
+        let index = SkillIndex::build_from_dir(&dir);
+        let entry = index.entries().get("general/json-legacy-skill").unwrap();
+        assert_eq!(entry.tools, vec!["exec", "read_file"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tools_preferred_over_capabilities() {
+        let dir = temp_skills_dir();
+        let skill_dir = dir.join("general").join("both-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // meta.yaml with both tools and capabilities — tools should win
+        std::fs::write(
+            skill_dir.join("meta.yaml"),
+            "name: both-skill\ndescription: Skill with both\ntools:\n  - finance_api\n  - chart_generate\ncapabilities:\n  - web_fetch\n",
+        ).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Both Skill").unwrap();
+
+        let index = SkillIndex::build_from_dir(&dir);
+        let entry = index.entries().get("general/both-skill").unwrap();
+        assert_eq!(entry.tools, vec!["finance_api", "chart_generate"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

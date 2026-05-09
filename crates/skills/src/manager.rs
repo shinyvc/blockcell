@@ -1177,25 +1177,44 @@ impl SkillManager {
             let entry = entry?;
             let path = entry.path();
 
-            if path.is_dir() {
-                if let Some(skill) = self.load_skill(&path)? {
-                    let skill_name = skill.name.clone();
+            if !path.is_dir() {
+                continue;
+            }
 
-                    // Workspace skills override built-in skills
-                    if is_workspace || !self.skills.contains_key(&skill_name) {
-                        let source = if is_workspace {
-                            "workspace"
-                        } else {
-                            "built-in"
-                        };
-                        debug!(
-                            name = %skill_name,
-                            available = skill.available,
-                            source = source,
-                            "Loaded skill"
-                        );
-                        self.skills.insert(skill_name, skill);
-                    }
+            // Skill 包目录：包含 manifest.json 的目录，其子目录是独立 skill。
+            // 递归扫描子目录，逐个加载每个子 skill。
+            if path.join("manifest.json").exists() {
+                debug!(path = %path.display(), "Scanning skill pack");
+                self.scan_directory_with_priority(&path, is_workspace)?;
+                continue;
+            }
+
+            // 跳过没有 skill 标识文件的目录，避免将资料目录（如 conventions/）
+            // 误注册为空 skill。
+            if !path.join("SKILL.md").exists()
+                && !path.join("meta.yaml").exists()
+                && !path.join("meta.json").exists()
+            {
+                continue;
+            }
+
+            if let Some(skill) = self.load_skill(&path)? {
+                let skill_name = skill.name.clone();
+
+                // Workspace skills override built-in skills
+                if is_workspace || !self.skills.contains_key(&skill_name) {
+                    let source = if is_workspace {
+                        "workspace"
+                    } else {
+                        "built-in"
+                    };
+                    debug!(
+                        name = %skill_name,
+                        available = skill.available,
+                        source = source,
+                        "Loaded skill"
+                    );
+                    self.skills.insert(skill_name, skill);
                 }
             }
         }

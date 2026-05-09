@@ -72,11 +72,11 @@ impl Tool for SkillViewTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: "skill_view",
-            description: "View a workspace skill's SKILL.md, meta.yaml, and supporting file list before patching it.",
+            description: "View a workspace skill's content (SKILL.md, SKILL.rhai, SKILL.py, or metadata-only fallback), meta.yaml, and supporting file list.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Workspace skill name."}
+                    "name": {"type": "string", "description": "Workspace skill name, or category/name for categorized skills."}
                 },
                 "required": ["name"]
             }),
@@ -108,11 +108,11 @@ impl Tool for SkillManageTool {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["create", "edit", "patch", "delete", "write_file", "remove_file", "undo_latest"]},
-                    "name": {"type": "string", "description": "Workspace skill name using lowercase letters, digits, '-' or '_'."},
+                    "name": {"type": "string", "description": "Workspace skill name, or category/name for categorized skills."},
                     "description": {"type": "string", "description": "Required for create."},
                     "content": {"type": "string", "description": "Skill body, full SKILL.md rewrite, replacement text, or file content."},
                     "old_text": {"type": "string", "description": "Unique text to replace for patch."},
-                    "path": {"type": "string", "description": "Supporting path under references/, templates/, scripts/, or assets/."}
+                    "path": {"type": "string", "description": "Supporting path under references/, templates/, scripts/, or assets/, or top-level SKILL.md/SKILL.rhai/SKILL.py/meta.yaml/meta.json."}
                 },
                 "required": ["action", "name"]
             }),
@@ -288,52 +288,110 @@ impl ListSkillsTool {
         }))
     }
 
-    /// Scan a single directory for skill subdirectories.
+    /// Scan a directory for skill subdirectories (recursive, supports category dirs).
+    ///
+    /// Mirrors the discovery logic in `SkillIndex::scan_dir`:
+    /// - A dir with skill markers (SKILL.md / meta.yaml / meta.json / SKILL.rhai / SKILL.py)
+    ///   is a skill, keyed by `category/name` (or just `name` when category is empty).
+    /// - A dir with `manifest.json` is a skill pack; recurse into it.
+    /// - Any other dir is treated as a category; recurse into it looking for skills.
     fn scan_skills_dir(
         &self,
         dir: &std::path::Path,
         skills: &mut Vec<Value>,
         seen: &mut std::collections::HashSet<String>,
     ) {
+        self.scan_skills_dir_recursive(dir, "", skills, seen);
+    }
+
+    fn scan_skills_dir_recursive(
+        &self,
+        dir: &std::path::Path,
+        category: &str,
+        skills: &mut Vec<Value>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
         if !dir.exists() || !dir.is_dir() {
             return;
         }
+
+        const EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
+
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir() {
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+                if !path.is_dir() {
+                    continue;
+                }
+                let dir_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                if EXCLUDED_DIRS.contains(&dir_name.as_str()) {
+                    continue;
+                }
+
+                // 统一构造 sub_category，确保深层 category 路径累积完整
+                let sub_category = if category.is_empty() {
+                    dir_name.clone()
+                } else {
+                    format!("{}/{}", category, dir_name)
+                };
+
+                let is_skill = path.join("SKILL.md").exists()
+                    || path.join("meta.yaml").exists()
+                    || path.join("meta.json").exists()
+                    || path.join("SKILL.rhai").exists()
+                    || path.join("SKILL.py").exists();
+
+                if is_skill {
+                    let composite_name = sub_category.clone();
 
                     // Skip if already seen (workspace overrides builtin)
-                    if !seen.insert(name.clone()) {
+                    if !seen.insert(composite_name.clone()) {
+                        // 仍需递归扫描 skill 包子目录，使用 sub_category 保持路径完整
+                        if path.join("manifest.json").exists() {
+                            self.scan_skills_dir_recursive(&path, &sub_category, skills, seen);
+                        }
                         continue;
                     }
 
                     let meta = self.read_skill_meta(&path);
                     let assets = self.detect_skill_assets(&path);
-                    let has_skill_file = assets.has_rhai
-                        || assets.has_py
-                        || assets.has_md
-                        || !assets.script_assets.is_empty();
 
-                    if has_skill_file {
-                        skills.push(json!({
-                            "name": name,
-                            "description": meta.get("description").unwrap_or(&Value::Null),
-                            "always": meta.get("always").unwrap_or(&json!(false)),
-                            "has_rhai": assets.has_rhai,
-                            "has_py": assets.has_py,
-                            "has_md": assets.has_md,
-                            "has_script_assets": !assets.script_assets.is_empty(),
-                            "script_assets": assets.script_assets,
-                            "path": path.display().to_string(),
-                        }));
+                    skills.push(json!({
+                        "name": composite_name,
+                        "category": category,
+                        "description": meta.get("description").unwrap_or(&Value::Null),
+                        "always": meta.get("always").unwrap_or(&json!(false)),
+                        "has_rhai": assets.has_rhai,
+                        "has_py": assets.has_py,
+                        "has_md": assets.has_md,
+                        "has_script_assets": !assets.script_assets.is_empty(),
+                        "script_assets": assets.script_assets,
+                        "path": path.display().to_string(),
+                    }));
+
+                    // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
+                    // 使用 sub_category 保持路径完整，确保子 skill 可被 SkillFileStore 解析
+                    if path.join("manifest.json").exists() {
+                        self.scan_skills_dir_recursive(&path, &sub_category, skills, seen);
                     }
+                    continue;
                 }
+
+                // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
+                // pack 目录本身是路径的一部分，需要计入 category
+                if path.join("manifest.json").exists() {
+                    self.scan_skills_dir_recursive(&path, &sub_category, skills, seen);
+                    continue;
+                }
+
+                // 否则：视为 category 目录，递归扫描子目录
+                // 使用 sub_category 累积路径，避免深层 category 截断
+                self.scan_skills_dir_recursive(&path, &sub_category, skills, seen);
             }
         }
     }
@@ -754,7 +812,7 @@ mod tests {
         .expect("write meta.yaml");
 
         let result = tool
-            .get_available_skills(&root, None)
+            .get_available_skills(&root, &[])
             .await
             .expect("get available skills");
 
@@ -819,7 +877,7 @@ mod tests {
         }
 
         let result = tool
-            .get_available_skills(&root, None)
+            .get_available_skills(&root, &[])
             .await
             .expect("get available skills");
 

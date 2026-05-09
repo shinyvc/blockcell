@@ -63,13 +63,13 @@ impl SkillFileStore {
     /// Acquire the unified write guard for the given skill, if configured.
     /// Returns Ok(RAII guard) on success, Err if the target is already being written.
     /// If no write_guard is configured, returns Ok(None) (backward compat).
-    fn acquire_write_guard(&self, skill_name: &str) -> Result<Option<WriteGuardRAII>> {
+    fn acquire_write_guard(&self, target: &SkillTarget) -> Result<Option<WriteGuardRAII>> {
         let Some(ref guard) = self.write_guard else {
             return Ok(None);
         };
         let write_target = WriteTarget::Skill {
-            category: String::new(),
-            name: skill_name.to_string(),
+            category: target.category.clone(),
+            name: target.name.clone(),
         };
         guard
             .acquire(write_target)
@@ -80,22 +80,75 @@ impl SkillFileStore {
     }
 
     pub fn view(&self, name: &str) -> Result<Value> {
-        let skill_name = validate_skill_name(name)?;
-        let skill_dir = self.skill_dir(&skill_name);
-        let skill_md = skill_dir.join("SKILL.md");
-        if !skill_md.exists() {
-            return Err(Error::NotFound(format!("skill not found: {}", skill_name)));
-        }
-        let meta_yaml = skill_dir.join("meta.yaml");
+        let target = self.resolve_existing_skill_target(name)?;
+
+        // 按优先级查找 skill 内容文件: SKILL.md → SKILL.rhai → SKILL.py → meta.*
+        let skill_file = skill_content_file(&target.dir);
+
+        let Some(ref skill_file_path) = skill_file else {
+            return Err(Error::NotFound(format!(
+                "skill not found: {}",
+                target.display_name
+            )));
+        };
+
+        let meta_yaml = target.dir.join("meta.yaml");
         Ok(json!({
             "success": true,
-            "name": skill_name,
-            "dir": skill_dir.to_string_lossy(),
-            "skillMd": skill_md.to_string_lossy(),
-            "content": fs::read_to_string(&skill_md)?,
+            "name": target.display_name,
+            "dir": target.dir.to_string_lossy(),
+            "skillMd": skill_file_path.to_string_lossy(),
+            "skillFile": skill_file_path.to_string_lossy(),
+            "content": fs::read_to_string(skill_file_path)?,
             "metaYaml": if meta_yaml.exists() { Some(fs::read_to_string(meta_yaml)?) } else { None },
-            "files": list_skill_files(&skill_dir)?,
+            "files": list_skill_files(&target.dir)?,
         }))
+    }
+
+    fn resolve_existing_skill_target(&self, name: &str) -> Result<SkillTarget> {
+        let target = validate_skill_target(name)?;
+        let direct = self.skills_dir.join(&target.relative_path);
+        if is_skill_dir(&direct) {
+            return Ok(SkillTarget::from_validated(target, direct));
+        }
+
+        if target.segments.len() > 1 {
+            return Err(Error::NotFound(format!(
+                "skill not found: {}",
+                target.display_name
+            )));
+        }
+
+        let mut matches = Vec::new();
+        find_skill_dirs_named(&self.skills_dir, &target.display_name, &mut matches)?;
+        matches.sort();
+        matches.dedup();
+
+        match matches.len() {
+            0 => Err(Error::NotFound(format!(
+                "skill not found: {}",
+                target.display_name
+            ))),
+            1 => SkillTarget::from_resolved_dir(&self.skills_dir, matches.remove(0)),
+            _ => {
+                let choices = matches
+                    .iter()
+                    .filter_map(|path| path.strip_prefix(&self.skills_dir).ok())
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(Error::Validation(format!(
+                    "ambiguous skill name: {}; use one of: {}",
+                    target.display_name, choices
+                )))
+            }
+        }
+    }
+
+    fn resolve_requested_skill_target(&self, name: &str) -> Result<SkillTarget> {
+        let target = validate_skill_target(name)?;
+        let dir = self.skills_dir.join(&target.relative_path);
+        Ok(SkillTarget::from_validated(target, dir))
     }
 
     pub fn create(
@@ -104,18 +157,19 @@ impl SkillFileStore {
         description: &str,
         content: &str,
     ) -> Result<SkillFileMutation> {
-        let skill_name = validate_skill_name(name)?;
+        let target = self.resolve_requested_skill_target(name)?;
+        let skill_name = target.display_name.clone();
         let description = normalize_description(description)?;
         let body = normalize_skill_body(content)?;
         scan_learned_skill_content(&description)?;
         scan_learned_skill_content(&body)?;
-        let _wg = self.acquire_write_guard(&skill_name)?;
+        let _wg = self.acquire_write_guard(&target)?;
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| Error::Other("skill file write lock poisoned".to_string()))?;
         let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
-        let skill_dir = self.skill_dir(&skill_name);
+        let skill_dir = target.dir.clone();
         if skill_dir.exists() {
             return Err(Error::Validation(format!(
                 "skill already exists: {}",
@@ -127,9 +181,9 @@ impl SkillFileStore {
         let meta_yaml = skill_dir.join("meta.yaml");
         atomic_write(
             &skill_md,
-            &render_skill_md(&skill_name, &description, &body),
+            &render_skill_md(&target.name, &description, &body),
         )?;
-        atomic_write(&meta_yaml, &render_meta_yaml(&skill_name, &description))?;
+        atomic_write(&meta_yaml, &render_meta_yaml(&target.name, &description))?;
         self.reenable_skill_if_disabled(&skill_name)?;
         self.invalidate_prompt_snapshot()?;
         Ok(SkillFileMutation {
@@ -142,25 +196,26 @@ impl SkillFileStore {
     }
 
     pub fn patch(&self, name: &str, old_text: &str, content: &str) -> Result<SkillFileMutation> {
-        let skill_name = validate_skill_name(name)?;
+        let target = self.resolve_existing_skill_target(name)?;
+        let skill_name = target.display_name.clone();
         let old_text = old_text.trim();
         if old_text.is_empty() {
             return Err(Error::Validation("old_text cannot be empty".to_string()));
         }
         let content = normalize_skill_body(content)?;
         scan_learned_skill_content(&content)?;
-        let _wg = self.acquire_write_guard(&skill_name)?;
+        let _wg = self.acquire_write_guard(&target)?;
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| Error::Other("skill file write lock poisoned".to_string()))?;
         let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
-        let skill_md = self.skill_dir(&skill_name).join("SKILL.md");
+        let skill_md = target.dir.join("SKILL.md");
         let current = fs::read_to_string(&skill_md)
             .map_err(|err| Error::NotFound(format!("skill not found: {} ({})", skill_name, err)))?;
         let next = patch_skill_content(&current, old_text, &content)?;
         ensure_len("SKILL.md", &next, SKILL_MD_CHAR_LIMIT)?;
-        let snapshot_ref = self.snapshot_before_write(&skill_name, &skill_md)?;
+        let snapshot_ref = self.snapshot_before_write(&target, &skill_md)?;
         atomic_write(&skill_md, &next)?;
         self.reenable_skill_if_disabled(&skill_name)?;
         self.invalidate_prompt_snapshot()?;
@@ -174,20 +229,21 @@ impl SkillFileStore {
     }
 
     pub fn edit(&self, name: &str, content: &str) -> Result<SkillFileMutation> {
-        let skill_name = validate_skill_name(name)?;
+        let target = self.resolve_existing_skill_target(name)?;
+        let skill_name = target.display_name.clone();
         let content = normalize_skill_body(content)?;
         scan_learned_skill_content(&content)?;
-        let _wg = self.acquire_write_guard(&skill_name)?;
+        let _wg = self.acquire_write_guard(&target)?;
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| Error::Other("skill file write lock poisoned".to_string()))?;
         let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
-        let skill_md = self.skill_dir(&skill_name).join("SKILL.md");
+        let skill_md = target.dir.join("SKILL.md");
         if !skill_md.exists() {
             return Err(Error::NotFound(format!("skill not found: {}", skill_name)));
         }
-        let snapshot_ref = self.snapshot_before_write(&skill_name, &skill_md)?;
+        let snapshot_ref = self.snapshot_before_write(&target, &skill_md)?;
         atomic_write(&skill_md, &content)?;
         self.reenable_skill_if_disabled(&skill_name)?;
         self.invalidate_prompt_snapshot()?;
@@ -201,18 +257,19 @@ impl SkillFileStore {
     }
 
     pub fn delete(&self, name: &str) -> Result<SkillFileMutation> {
-        let skill_name = validate_skill_name(name)?;
-        let _wg = self.acquire_write_guard(&skill_name)?;
+        let target = self.resolve_existing_skill_target(name)?;
+        let skill_name = target.display_name.clone();
+        let _wg = self.acquire_write_guard(&target)?;
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| Error::Other("skill file write lock poisoned".to_string()))?;
         let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
-        let skill_dir = self.skill_dir(&skill_name);
+        let skill_dir = target.dir.clone();
         if !skill_dir.exists() {
             return Err(Error::NotFound(format!("skill not found: {}", skill_name)));
         }
-        let snapshot_ref = self.snapshot_skill_dir(&skill_name)?;
+        let snapshot_ref = self.snapshot_skill_dir(&target)?;
         fs::remove_dir_all(&skill_dir)?;
         self.invalidate_prompt_snapshot()?;
         Ok(SkillFileMutation {
@@ -230,7 +287,8 @@ impl SkillFileStore {
         relative_path: &str,
         content: &str,
     ) -> Result<SkillFileMutation> {
-        let skill_name = validate_skill_name(name)?;
+        let target = self.resolve_existing_skill_target(name)?;
+        let skill_name = target.display_name.clone();
         let relative_path = validate_skill_relative_path(relative_path)?;
         ensure_len(
             &relative_path.to_string_lossy(),
@@ -238,18 +296,18 @@ impl SkillFileStore {
             AUX_FILE_CHAR_LIMIT,
         )?;
         scan_learned_skill_content(content)?;
-        let _wg = self.acquire_write_guard(&skill_name)?;
+        let _wg = self.acquire_write_guard(&target)?;
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| Error::Other("skill file write lock poisoned".to_string()))?;
         let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
-        let skill_dir = self.skill_dir(&skill_name);
+        let skill_dir = target.dir.clone();
         if !skill_dir.exists() {
             return Err(Error::NotFound(format!("skill not found: {}", skill_name)));
         }
         let path = skill_dir.join(relative_path);
-        let snapshot_ref = self.snapshot_before_write(&skill_name, &path)?;
+        let snapshot_ref = self.snapshot_before_write(&target, &path)?;
         atomic_write(&path, content)?;
         self.reenable_skill_if_disabled(&skill_name)?;
         self.invalidate_prompt_snapshot()?;
@@ -263,8 +321,13 @@ impl SkillFileStore {
     }
 
     pub fn restore_latest(&self, name: &str) -> Result<SkillFileMutation> {
-        let skill_name = validate_skill_name(name)?;
-        let _wg = self.acquire_write_guard(&skill_name)?;
+        let target = match self.resolve_existing_skill_target(name) {
+            Ok(target) => target,
+            Err(Error::NotFound(_)) => self.resolve_requested_skill_target(name)?,
+            Err(err) => return Err(err),
+        };
+        let skill_name = target.display_name.clone();
+        let _wg = self.acquire_write_guard(&target)?;
         let _guard = self
             .write_lock
             .lock()
@@ -276,9 +339,9 @@ impl SkillFileStore {
                 skill_name
             )));
         };
-        let skill_dir = self.skill_dir(&skill_name);
+        let skill_dir = target.dir.clone();
         let current_snapshot = if skill_dir.exists() {
-            self.snapshot_skill_dir(&skill_name)?
+            self.snapshot_skill_dir(&target)?
         } else {
             None
         };
@@ -304,27 +367,28 @@ impl SkillFileStore {
     }
 
     pub fn remove_file(&self, name: &str, relative_path: &str) -> Result<SkillFileMutation> {
-        let skill_name = validate_skill_name(name)?;
+        let target = self.resolve_existing_skill_target(name)?;
+        let skill_name = target.display_name.clone();
         let relative_path = validate_skill_relative_path(relative_path)?;
-        if relative_path == Path::new("SKILL.md") || relative_path == Path::new("meta.yaml") {
+        if is_protected_top_level_skill_file(&relative_path) {
             return Err(Error::Validation(
                 "use delete to remove the whole skill".to_string(),
             ));
         }
-        let _wg = self.acquire_write_guard(&skill_name)?;
+        let _wg = self.acquire_write_guard(&target)?;
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| Error::Other("skill file write lock poisoned".to_string()))?;
         let _file_guard = FileWriteGuard::lock(&self.lock_path)?;
-        let path = self.skill_dir(&skill_name).join(relative_path);
+        let path = target.dir.join(relative_path);
         if !path.exists() || !path.is_file() {
             return Err(Error::NotFound(format!(
                 "skill file not found: {}",
                 path.display()
             )));
         }
-        let snapshot_ref = self.snapshot_before_write(&skill_name, &path)?;
+        let snapshot_ref = self.snapshot_before_write(&target, &path)?;
         fs::remove_file(&path)?;
         self.invalidate_prompt_snapshot()?;
         Ok(SkillFileMutation {
@@ -336,21 +400,17 @@ impl SkillFileStore {
         })
     }
 
-    fn skill_dir(&self, skill_name: &str) -> PathBuf {
-        self.skills_dir.join(skill_name)
-    }
-
     fn snapshot_before_write(
         &self,
-        skill_name: &str,
+        target: &SkillTarget,
         source_path: &Path,
     ) -> Result<Option<String>> {
         if !source_path.exists() {
             return Ok(None);
         }
-        let snapshot_dir = self.new_snapshot_dir(skill_name)?;
+        let snapshot_dir = self.new_snapshot_dir(&target.display_name)?;
         let snapshot_path = source_path
-            .strip_prefix(self.skill_dir(skill_name))
+            .strip_prefix(&target.dir)
             .map(|relative| snapshot_dir.join(relative))
             .unwrap_or_else(|_| {
                 snapshot_dir.join(
@@ -367,27 +427,30 @@ impl SkillFileStore {
         Ok(Some(snapshot_path.to_string_lossy().to_string()))
     }
 
-    fn snapshot_skill_dir(&self, skill_name: &str) -> Result<Option<String>> {
-        let source_dir = self.skill_dir(skill_name);
+    fn snapshot_skill_dir(&self, target: &SkillTarget) -> Result<Option<String>> {
+        let source_dir = &target.dir;
         if !source_dir.exists() {
             return Ok(None);
         }
-        let snapshot_dir = self.new_snapshot_dir(skill_name)?;
-        copy_dir_recursive(&source_dir, &snapshot_dir)?;
+        let snapshot_dir = self.new_snapshot_dir(&target.display_name)?;
+        copy_dir_recursive(source_dir, &snapshot_dir)?;
         Ok(Some(snapshot_dir.to_string_lossy().to_string()))
     }
 
     fn new_snapshot_dir(&self, skill_name: &str) -> Result<PathBuf> {
         let stamp = Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
-        let dir = self
-            .snapshots_dir
-            .join(format!("{}_{}_{}", skill_name, stamp, Uuid::new_v4()));
+        let dir = self.snapshots_dir.join(format!(
+            "{}_{}_{}",
+            snapshot_skill_key(skill_name),
+            stamp,
+            Uuid::new_v4()
+        ));
         fs::create_dir_all(&dir)?;
         Ok(dir)
     }
 
     fn latest_snapshot_for(&self, skill_name: &str) -> Result<Option<PathBuf>> {
-        let prefix = format!("{skill_name}_");
+        let prefix = format!("{}_", snapshot_skill_key(skill_name));
         let mut latest: Option<PathBuf> = None;
         for entry in fs::read_dir(&self.snapshots_dir)? {
             let entry = entry?;
@@ -501,6 +564,162 @@ fn validate_skill_name(name: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+#[derive(Debug)]
+struct ValidatedSkillTarget {
+    display_name: String,
+    relative_path: PathBuf,
+    segments: Vec<String>,
+}
+
+#[derive(Debug)]
+struct SkillTarget {
+    display_name: String,
+    category: String,
+    name: String,
+    dir: PathBuf,
+}
+
+impl SkillTarget {
+    fn from_validated(target: ValidatedSkillTarget, dir: PathBuf) -> Self {
+        let name = target
+            .segments
+            .last()
+            .cloned()
+            .unwrap_or_else(|| target.display_name.clone());
+        let category = if target.segments.len() > 1 {
+            target.segments[..target.segments.len() - 1].join("/")
+        } else {
+            String::new()
+        };
+        Self {
+            display_name: target.display_name,
+            category,
+            name,
+            dir,
+        }
+    }
+
+    fn from_resolved_dir(skills_dir: &Path, dir: PathBuf) -> Result<Self> {
+        let relative = dir
+            .strip_prefix(skills_dir)
+            .map_err(|_| Error::Validation("skill path is outside skills directory".to_string()))?;
+        let segments = relative
+            .components()
+            .map(|component| match component {
+                Component::Normal(value) => value
+                    .to_str()
+                    .ok_or_else(|| Error::Validation("skill path must be utf-8".to_string()))
+                    .and_then(validate_skill_name),
+                _ => Err(Error::Validation(
+                    "skill path cannot contain traversal".to_string(),
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let relative_path = segments.iter().collect::<PathBuf>();
+        Ok(Self::from_validated(
+            ValidatedSkillTarget {
+                display_name: segments.join("/"),
+                relative_path,
+                segments,
+            },
+            dir,
+        ))
+    }
+}
+
+fn validate_skill_target(name: &str) -> Result<ValidatedSkillTarget> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 240 {
+        return Err(Error::Validation(
+            "skill name must be a skill name or skill path".to_string(),
+        ));
+    }
+
+    let segments = trimmed
+        .split('/')
+        .map(validate_skill_name)
+        .collect::<Result<Vec<_>>>()?;
+    if segments.is_empty() || segments.len() > 8 {
+        return Err(Error::Validation(
+            "skill name must be a skill name or skill path".to_string(),
+        ));
+    }
+
+    let relative_path = segments.iter().collect::<PathBuf>();
+    Ok(ValidatedSkillTarget {
+        display_name: segments.join("/"),
+        relative_path,
+        segments,
+    })
+}
+
+fn is_skill_dir(skill_dir: &Path) -> bool {
+    skill_dir.join("SKILL.md").exists()
+        || skill_dir.join("meta.yaml").exists()
+        || skill_dir.join("meta.json").exists()
+        || skill_dir.join("SKILL.rhai").exists()
+        || skill_dir.join("SKILL.py").exists()
+}
+
+fn skill_content_file(skill_dir: &Path) -> Option<PathBuf> {
+    [
+        "SKILL.md",
+        "SKILL.rhai",
+        "SKILL.py",
+        "meta.yaml",
+        "meta.json",
+    ]
+    .iter()
+    .map(|file_name| skill_dir.join(file_name))
+    .find(|path| path.exists())
+}
+
+fn find_skill_dirs_named(root: &Path, name: &str, matches: &mut Vec<PathBuf>) -> Result<()> {
+    const EXCLUDED_DIRS: &[&str] = &[
+        ".git",
+        ".github",
+        ".hub",
+        ".snapshots",
+        ".skill_file_store.lockdir",
+        "__pycache__",
+        "node_modules",
+    ];
+
+    let Ok(entries) = fs::read_dir(root) else {
+        return Ok(());
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if EXCLUDED_DIRS.contains(&dir_name) || dir_name.starts_with('.') {
+            continue;
+        }
+
+        let path_is_skill = is_skill_dir(&path);
+        if dir_name == name && path_is_skill {
+            matches.push(path.clone());
+        }
+
+        if path_is_skill && !path.join("manifest.json").exists() {
+            continue;
+        }
+
+        find_skill_dirs_named(&path, name, matches)?;
+    }
+
+    Ok(())
+}
+
+fn snapshot_skill_key(skill_name: &str) -> String {
+    skill_name.replace('/', "~").replace('\\', "~")
+}
+
 fn validate_skill_relative_path(path: &str) -> Result<PathBuf> {
     let trimmed = path.trim();
     if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('~') {
@@ -518,6 +737,7 @@ fn validate_skill_relative_path(path: &str) -> Result<PathBuf> {
             ));
         }
     }
+    let components = candidate.components().count();
     let first = candidate
         .components()
         .next()
@@ -526,16 +746,26 @@ fn validate_skill_relative_path(path: &str) -> Result<PathBuf> {
             _ => None,
         })
         .unwrap_or_default();
-    if !matches!(
-        first,
-        "references" | "templates" | "scripts" | "assets" | "SKILL.md"
-    ) {
+    let top_level_skill_file = components == 1 && is_top_level_skill_file(Path::new(first));
+    if !top_level_skill_file && !matches!(first, "references" | "templates" | "scripts" | "assets")
+    {
         return Err(Error::Validation(
-            "skill files must live under references/, templates/, scripts/, assets/, or SKILL.md"
+            "skill files must live under references/, templates/, scripts/, assets/, or a top-level skill file"
                 .to_string(),
         ));
     }
     Ok(candidate)
+}
+
+fn is_top_level_skill_file(path: &Path) -> bool {
+    matches!(
+        path.to_str(),
+        Some("SKILL.md" | "SKILL.rhai" | "SKILL.py" | "meta.yaml" | "meta.json")
+    )
+}
+
+fn is_protected_top_level_skill_file(path: &Path) -> bool {
+    path.components().count() == 1 && is_top_level_skill_file(path)
 }
 
 fn normalize_description(description: &str) -> Result<String> {
@@ -940,6 +1170,234 @@ mod tests {
             .skills_dir()
             .join("release_checklist")
             .join("meta.yaml")
+            .exists());
+    }
+
+    #[test]
+    fn skill_file_store_views_category_skill_by_path() {
+        let paths = test_paths("category-view");
+        let store = SkillFileStore::open(&paths).unwrap();
+        let skill_dir = paths.skills_dir().join("devops").join("deploy_docs");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Deploy Docs\n\nUse rollout checks.",
+        )
+        .unwrap();
+
+        let view = store.view("devops/deploy_docs").unwrap();
+        assert_eq!(view["name"], json!("devops/deploy_docs"));
+        assert!(view["content"].as_str().unwrap().contains("rollout checks"));
+        assert!(view["dir"]
+            .as_str()
+            .unwrap()
+            .replace('\\', "/")
+            .ends_with("skills/devops/deploy_docs"));
+    }
+
+    #[test]
+    fn skill_file_store_views_unique_nested_skill_by_name() {
+        let paths = test_paths("nested-view");
+        let store = SkillFileStore::open(&paths).unwrap();
+        let skill_dir = paths
+            .skills_dir()
+            .join("packs")
+            .join("gbrain")
+            .join("code_review");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.py"), "print('review')\n").unwrap();
+
+        let view = store.view("code_review").unwrap();
+        assert_eq!(view["name"], json!("packs/gbrain/code_review"));
+        assert!(view["content"].as_str().unwrap().contains("review"));
+        assert!(view["skillMd"]
+            .as_str()
+            .unwrap()
+            .replace('\\', "/")
+            .ends_with("packs/gbrain/code_review/SKILL.py"));
+    }
+
+    #[test]
+    fn skill_file_store_views_meta_only_skill() {
+        let paths = test_paths("meta-only-view");
+        let store = SkillFileStore::open(&paths).unwrap();
+        let skill_dir = paths.skills_dir().join("general").join("metadata_only");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("meta.yaml"),
+            "name: metadata_only\ndescription: Metadata only skill\n",
+        )
+        .unwrap();
+
+        let view = store.view("general/metadata_only").unwrap();
+
+        assert_eq!(view["name"], json!("general/metadata_only"));
+        assert!(view["content"]
+            .as_str()
+            .unwrap()
+            .contains("Metadata only skill"));
+        assert!(view["skillFile"]
+            .as_str()
+            .unwrap()
+            .replace('\\', "/")
+            .ends_with("general/metadata_only/meta.yaml"));
+    }
+
+    #[test]
+    fn skill_file_store_view_rejects_ambiguous_nested_name() {
+        let paths = test_paths("ambiguous-view");
+        let store = SkillFileStore::open(&paths).unwrap();
+        for category in ["devops", "qa"] {
+            let skill_dir = paths.skills_dir().join(category).join("deploy_docs");
+            fs::create_dir_all(&skill_dir).unwrap();
+            fs::write(skill_dir.join("SKILL.md"), "# Deploy Docs").unwrap();
+        }
+
+        let err = store.view("deploy_docs").unwrap_err();
+        assert!(format!("{}", err).contains("ambiguous skill name"));
+    }
+
+    #[test]
+    fn skill_file_store_view_rejects_path_traversal_name() {
+        let paths = test_paths("view-traversal");
+        let store = SkillFileStore::open(&paths).unwrap();
+
+        let err = store.view("../deploy_docs").unwrap_err();
+        assert!(format!("{}", err).contains("skill name"));
+    }
+
+    #[test]
+    fn skill_file_store_creates_category_skill() {
+        let paths = test_paths("category-create");
+        let store = SkillFileStore::open(&paths).unwrap();
+
+        let result = store
+            .create(
+                "devops/deploy_docs",
+                "Deploy docs",
+                "Write concise deploy docs.",
+            )
+            .unwrap();
+
+        assert_eq!(result.skill_name, "devops/deploy_docs");
+        assert!(paths
+            .skills_dir()
+            .join("devops/deploy_docs/SKILL.md")
+            .exists());
+        let meta =
+            fs::read_to_string(paths.skills_dir().join("devops/deploy_docs/meta.yaml")).unwrap();
+        assert!(meta.contains("name: deploy_docs"));
+        assert!(!meta.contains("name: devops/deploy_docs"));
+        let view = store.view("devops/deploy_docs").unwrap();
+        assert!(view["content"].as_str().unwrap().contains("deploy docs"));
+    }
+
+    #[test]
+    fn skill_file_store_patches_category_skill_by_path() {
+        let paths = test_paths("category-patch");
+        let store = SkillFileStore::open(&paths).unwrap();
+        let skill_dir = paths.skills_dir().join("devops").join("deploy_docs");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "# Deploy Docs\n\nCheck logs.").unwrap();
+
+        let result = store
+            .patch("devops/deploy_docs", "Check logs.", "Check rollout logs.")
+            .unwrap();
+
+        assert_eq!(result.skill_name, "devops/deploy_docs");
+        assert!(result.snapshot_ref.unwrap().contains("devops~deploy_docs_"));
+        assert!(fs::read_to_string(skill_dir.join("SKILL.md"))
+            .unwrap()
+            .contains("rollout logs"));
+    }
+
+    #[test]
+    fn skill_file_store_writes_category_skill_top_level_script() {
+        let paths = test_paths("category-script-write");
+        let store = SkillFileStore::open(&paths).unwrap();
+        let skill_dir = paths.skills_dir().join("devops").join("code_review");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.py"), "print('v1')\n").unwrap();
+
+        let result = store
+            .write_file("devops/code_review", "SKILL.py", "print('v2')\n")
+            .unwrap();
+
+        assert_eq!(result.skill_name, "devops/code_review");
+        assert_eq!(
+            fs::read_to_string(skill_dir.join("SKILL.py")).unwrap(),
+            "print('v2')\n"
+        );
+        let err = store
+            .remove_file("devops/code_review", "SKILL.py")
+            .unwrap_err();
+        assert!(format!("{}", err).contains("delete"));
+    }
+
+    #[test]
+    fn skill_file_store_restore_latest_reverts_category_skill() {
+        let paths = test_paths("category-restore");
+        let store = SkillFileStore::open(&paths).unwrap();
+        let skill_dir = paths.skills_dir().join("devops").join("deploy_docs");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "# Deploy Docs\n\nCheck logs.").unwrap();
+        store
+            .patch("devops/deploy_docs", "Check logs.", "Check rollout logs.")
+            .unwrap();
+
+        let result = store.restore_latest("devops/deploy_docs").unwrap();
+
+        assert_eq!(result.skill_name, "devops/deploy_docs");
+        assert!(fs::read_to_string(skill_dir.join("SKILL.md"))
+            .unwrap()
+            .contains("Check logs."));
+    }
+
+    #[test]
+    fn skill_file_store_short_nested_name_uses_resolved_snapshot_key() {
+        let paths = test_paths("nested-short-snapshot");
+        let store = SkillFileStore::open(&paths).unwrap();
+        let skill_dir = paths
+            .skills_dir()
+            .join("packs")
+            .join("gbrain")
+            .join("review");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "# Review\n\nCheck facts.").unwrap();
+
+        let patch = store
+            .patch("review", "Check facts.", "Check facts and dates.")
+            .unwrap();
+        assert_eq!(patch.skill_name, "packs/gbrain/review");
+        assert!(patch
+            .snapshot_ref
+            .as_deref()
+            .unwrap_or_default()
+            .contains("packs~gbrain~review_"));
+
+        store.restore_latest("packs/gbrain/review").unwrap();
+        assert!(fs::read_to_string(skill_dir.join("SKILL.md"))
+            .unwrap()
+            .contains("Check facts."));
+    }
+
+    #[test]
+    fn skill_file_store_deletes_category_skill_only() {
+        let paths = test_paths("category-delete");
+        let store = SkillFileStore::open(&paths).unwrap();
+        for name in ["deploy_docs", "release_docs"] {
+            let skill_dir = paths.skills_dir().join("devops").join(name);
+            fs::create_dir_all(&skill_dir).unwrap();
+            fs::write(skill_dir.join("SKILL.md"), "# Skill").unwrap();
+        }
+
+        let result = store.delete("devops/deploy_docs").unwrap();
+
+        assert_eq!(result.skill_name, "devops/deploy_docs");
+        assert!(!paths.skills_dir().join("devops/deploy_docs").exists());
+        assert!(paths
+            .skills_dir()
+            .join("devops/release_docs/SKILL.md")
             .exists());
     }
 

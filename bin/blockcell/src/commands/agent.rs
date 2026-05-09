@@ -2046,7 +2046,20 @@ fn clear_suggestions(visible_limit: usize, input: &str, stdout: &mut std::io::St
     let _ = stdout.flush();
 }
 
+/// 判断目录是否包含 skill 标识文件
+fn is_skill_dir(path: &std::path::Path) -> bool {
+    path.join("SKILL.md").exists()
+        || path.join("meta.yaml").exists()
+        || path.join("meta.json").exists()
+        || path.join("SKILL.rhai").exists()
+        || path.join("SKILL.py").exists()
+}
+
+/// 排除的目录名
+const SKILL_EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
+
 /// Scan a directory for skill subdirectories and collect (name, description) pairs.
+/// Supports skill packs (manifest.json) and category directories with recursive scanning.
 fn scan_skill_dirs(dir: &std::path::Path) -> Vec<(String, String)> {
     let mut skills = Vec::new();
     if !dir.is_dir() {
@@ -2058,42 +2071,104 @@ fn scan_skill_dirs(dir: &std::path::Path) -> Vec<(String, String)> {
             if !p.is_dir() {
                 continue;
             }
-            // Must have SKILL.rhai or SKILL.md
-            if !p.join("SKILL.rhai").exists() && !p.join("SKILL.md").exists() {
-                continue;
-            }
-            let name = p
+
+            let dir_name = p
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
+                .unwrap_or("")
                 .to_string();
-            // Try to read description from meta.yaml
-            let desc = p
-                .join("meta.yaml")
-                .exists()
-                .then(|| std::fs::read_to_string(p.join("meta.yaml")).ok())
-                .flatten()
-                .and_then(|content| {
-                    // Simple extraction: look for "description:" line
-                    for line in content.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.starts_with("description:") {
-                            let val = trimmed.trim_start_matches("description:").trim();
-                            // Strip surrounding quotes
-                            let val = val.trim_matches('"').trim_matches('\'');
-                            if !val.is_empty() {
-                                return Some(val.to_string());
-                            }
-                        }
-                    }
-                    None
-                })
-                .unwrap_or_default();
-            skills.push((name, desc));
+            if SKILL_EXCLUDED_DIRS.contains(&dir_name.as_str()) {
+                continue;
+            }
+
+            // 目录本身是 skill：优先加载自身
+            if is_skill_dir(&p) {
+                let name = dir_name;
+                let desc = read_skill_description_from_dir(&p);
+                skills.push((name, desc));
+                // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
+                if p.join("manifest.json").exists() {
+                    skills.extend(scan_skill_dirs(&p));
+                }
+                continue;
+            }
+
+            // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
+            if p.join("manifest.json").exists() {
+                skills.extend(scan_skill_dirs(&p));
+                continue;
+            }
+
+            // 普通 category 目录：递归扫描其子目录寻找 skill
+            skills.extend(scan_skill_dirs(&p));
         }
     }
     skills.sort_by(|a, b| a.0.cmp(&b.0));
     skills
+}
+
+/// 从技能目录读取描述（SKILL.md frontmatter / meta.yaml / meta.json）
+fn read_skill_description_from_dir(path: &std::path::Path) -> String {
+    // 1. 尝试 meta.yaml
+    let meta_yaml = path.join("meta.yaml");
+    if meta_yaml.exists() {
+        if let Ok(content) = std::fs::read_to_string(&meta_yaml) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("description:") {
+                    let val = trimmed.trim_start_matches("description:").trim();
+                    let val = val.trim_matches('"').trim_matches('\'');
+                    if !val.is_empty() {
+                        return val.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. 尝试 meta.json
+    let meta_json = path.join("meta.json");
+    if meta_json.exists() {
+        if let Ok(content) = std::fs::read_to_string(&meta_json) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(desc) = meta.get("description").and_then(|v| v.as_str()) {
+                    if !desc.is_empty() {
+                        return desc.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 尝试 SKILL.md frontmatter
+    let skill_md = path.join("SKILL.md");
+    if let Ok(content) = std::fs::read_to_string(&skill_md) {
+        // Extract frontmatter description
+        let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+        let content_normalized = content.replace("\r\n", "\n");
+        let trimmed = content_normalized.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("---") {
+            if let Some(end_idx) = rest.find("\n---") {
+                let frontmatter = rest[..end_idx].trim();
+                if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(frontmatter) {
+                    if let Some(desc) = yaml.get("description").and_then(|v| v.as_str()) {
+                        if !desc.is_empty() {
+                            return desc.trim().to_string();
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: first heading
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some(heading) = line.strip_prefix("# ") {
+                return heading.to_string();
+            }
+        }
+    }
+
+    String::new()
 }
 
 /// A command item for the interactive picker

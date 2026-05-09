@@ -27,6 +27,7 @@ pub use manager::{
     Skill, SkillCard, SkillCommandSpec, SkillInstallSpec, SkillManager, SkillMeta, SkillSource,
     SkillTestFixture,
 };
+pub use openclaw_parser::read_skill_description;
 pub use service::{
     is_builtin_tool, CapabilityErrorReport, ErrorReport, EvolutionService, EvolutionServiceConfig,
     SkillRecordSummary,

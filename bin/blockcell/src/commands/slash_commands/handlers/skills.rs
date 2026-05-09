@@ -4,6 +4,7 @@
 
 use crate::commands::slash_commands::*;
 use blockcell_skills::evolution::EvolutionRecord;
+use blockcell_skills::read_skill_description;
 use std::collections::{BTreeMap, HashSet};
 
 /// 技能分类
@@ -98,7 +99,16 @@ impl SlashCommand for SkillsCommand {
     }
 }
 
-/// 扫描技能目录
+/// 判断目录是否包含 skill 标识文件
+fn is_skill_dir(path: &std::path::Path) -> bool {
+    path.join("SKILL.md").exists()
+        || path.join("meta.yaml").exists()
+        || path.join("meta.json").exists()
+        || path.join("SKILL.rhai").exists()
+        || path.join("SKILL.py").exists()
+}
+
+/// 扫描技能目录（支持 skill 包递归）
 fn scan_skill_dirs(dir: &std::path::Path) -> Vec<(String, String)> {
     let mut skills = Vec::new();
     if !dir.exists() {
@@ -107,26 +117,27 @@ fn scan_skill_dirs(dir: &std::path::Path) -> Vec<(String, String)> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            if !path.is_dir() {
+                continue;
+            }
+
+            // 目录本身是 skill：优先加载自身
+            if is_skill_dir(&path) {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    // 尝试读取描述
-                    let desc_path = path.join("README.md");
-                    let desc = if desc_path.exists() {
-                        if let Ok(content) = std::fs::read_to_string(&desc_path) {
-                            // 提取第一行作为描述
-                            content
-                                .lines()
-                                .next()
-                                .map(|s| s.trim_start_matches('#').trim().to_string())
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        }
-                    } else {
-                        String::new()
-                    };
+                    let desc = read_skill_description(&path);
                     skills.push((name.to_string(), desc));
                 }
+                // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
+                if path.join("manifest.json").exists() {
+                    skills.extend(scan_skill_dirs(&path));
+                }
+                continue;
+            }
+
+            // 非 skill 目录但含 manifest.json：作为 skill 包递归扫描子目录
+            if path.join("manifest.json").exists() {
+                skills.extend(scan_skill_dirs(&path));
+                continue;
             }
         }
     }
