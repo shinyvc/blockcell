@@ -73,7 +73,10 @@ WebUI 的完整配置编辑器也会直接读取/保存原始 `config.json5` 文
   },
   "agents": {
     "defaults": {
-      "model": "deepseek-chat"
+      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "maxContextTokens": 1048576,
+      "reasoningEffort": "high"
     }
   }
 }
@@ -171,14 +174,15 @@ WebUI 的完整配置编辑器也会直接读取/保存原始 `config.json5` 文
 {
   "agents": {
     "defaults": {
-      "model": "",
+      "model": "deepseek-v4-pro",
       "provider": null,
       "maxTokens": 8192,
       "temperature": 0.7,
-      "maxToolIterations": 20,
+      "maxToolIterations": 30,
       "llmMaxRetries": 3,
       "llmRetryDelayMs": 2000,
-      "maxContextTokens": 32000,
+      "maxContextTokens": 1048576,
+      "reasoningEffort": null,
       "evolutionModel": null,
       "evolutionProvider": null
     }
@@ -188,14 +192,15 @@ WebUI 的完整配置编辑器也会直接读取/保存原始 `config.json5` 文
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `model` | `""` | 主模型名称（默认空字符串，通常会在 `setup` 时写入实际模型） |
+| `model` | `deepseek-v4-pro` | 主模型名称；`setup` 会按所选 provider 写入推荐默认模型 |
 | `provider` | null | 显式指定 provider（不指定则从 model 前缀推断） |
 | `maxTokens` | 8192 | 每次 LLM 调用的最大输出 token 数 |
 | `temperature` | 0.7 | 采样温度（0.0 ~ 1.0） |
-| `maxToolIterations` | 20 | 单次消息处理的最大工具调用轮数 |
+| `maxToolIterations` | 30 | 单次消息处理的最大工具调用轮数 |
 | `llmMaxRetries` | 3 | LLM 调用失败时的最大重试次数 |
 | `llmRetryDelayMs` | 2000 | 重试间隔（毫秒） |
-| `maxContextTokens` | 32000 | 上下文窗口大小（影响历史压缩） |
+| `maxContextTokens` | 1048576 | 上下文窗口大小（影响历史压缩）；DeepSeek/Gemini 等长上下文模型可使用更高值 |
+| `reasoningEffort` | null | 推理强度控制；DeepSeek thinking mode 支持 `off`、`low`、`medium`、`high`、`max` |
 | `evolutionModel` | null | 技能自进化专用模型（为 null 则使用主模型） |
 | `evolutionProvider` | null | 技能自进化专用 provider |
 
@@ -347,7 +352,7 @@ Telegram 渠道有独立的代理配置，与 LLM provider 代理分开设置：
 blockcell config set network.proxy "http://127.0.0.1:7890"
 
 # 设置模型
-blockcell config set agents.defaults.model "deepseek-chat"
+blockcell config set agents.defaults.model "deepseek-v4-pro"
 
 # 设置 DeepSeek API Key
 blockcell config set providers.deepseek.apiKey "sk-xxxxxxxx"
@@ -399,7 +404,7 @@ blockcell config providers
       "maxTokens": 8192,
       "temperature": 0.7,
       "maxToolIterations": 20,
-      "evolutionModel": "deepseek-chat",
+      "evolutionModel": "deepseek-v4-pro",
       "evolutionProvider": "deepseek"
     }
   },

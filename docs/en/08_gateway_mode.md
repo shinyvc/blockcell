@@ -68,6 +68,33 @@ In that case, Gateway dispatches messages from `bot1` to the `default` runtime a
 
 ---
 
+## Slash Commands in Gateway and Channels
+
+Since v0.1.6, Gateway/WebSocket and external channels share the same slash-command handler as the CLI. When a user sends `/help`, `/tasks`, `/skills`, `/tools`, `/clear`, and similar commands from Telegram, Slack, Discord, Feishu, DingTalk, or another channel, Gateway handles the command locally first and replies back to the original channel.
+
+This has two practical effects:
+
+- Common status/query commands do not enter the LLM, so they are faster and token-free.
+- CLI, WebUI/WebSocket, and external channels keep the same command behavior.
+
+Built-in commands include:
+
+| Command | Description |
+|------|------|
+| `/help` | Show command list |
+| `/tasks [status]` | List background tasks |
+| `/skills` | List loaded skills |
+| `/tools` | List loaded tools |
+| `/learn <description>` | Ask the Agent to learn a skill; uses the LLM |
+| `/clear` | Clear current session history |
+| `/compact` | Manually trigger history compression |
+| `/session-metrics` | Show 7-layer memory-system metrics |
+| `/log ...` | Control logging output at runtime |
+
+`/quit` and `/exit` are CLI-only. Command names must match exactly; a no-argument command with extra text is treated as a normal message.
+
+---
+
 ## HTTP API
 
 Gateway provides a concise REST API:

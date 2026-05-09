@@ -14,7 +14,7 @@
 
 [官网](https://blockcell.dev) • [文档](https://blockcell.dev/docs) • [English](README.en.md)
 
-**最新版本**：v0.1.5 • [下载 Release](https://github.com/blockcell-labs/blockcell/releases/tag/v0.1.5) • [更新日志](CHANGELOG.md)
+**最新版本**：v0.1.6 • [下载 Release](https://github.com/blockcell-labs/blockcell/releases/tag/v0.1.6) • [更新日志](CHANGELOG.md)
 
 </div>
 
@@ -82,6 +82,22 @@ BlockCell: ✓ 设置监控 → ✓ 每小时检查价格 → ✓ 发送 Telegra
                                       自动回滚
 ```
 
+### 🧠 Ghost Native 自学习
+
+BlockCell 可以在真实使用中沉淀长期有效的经验：
+
+- 将稳定用户偏好写入 `USER.md`
+- 将项目事实、环境约定和踩坑记录写入 `MEMORY.md`
+- 将可复用流程整理成 workspace skills
+- 后台 review 失败不影响当前对话，所有自动写入都有审计、快照和撤销入口
+
+### 🤖 多智能体与自定义 Agent
+
+- 支持 typed agent、forked subagent、checkpoint 和链式取消
+- 支持用户级与项目级 Markdown agent 定义
+- 每类 agent 可单独配置工具范围、模型、技能、MCP、one-shot 和权限模式
+- CLI、Gateway 和 WebUI 可接收后台任务进度事件
+
 ### 🌐 多渠道支持
 
 将 BlockCell 作为守护进程运行，连接到：
@@ -137,6 +153,7 @@ BlockCell: ✓ 设置监控 → ✓ 每小时检查价格 → ✓ 发送 Telegra
 - **纯 Markdown 技能**：只用 `SKILL.md` 定义行为说明，适合知识型与流程型技能
 - **Markdown + Rhai 技能**：使用 `SKILL.md` + `SKILL.rhai` 实现结构化编排与工具调用
 - **Markdown + Python 技能**：使用 `SKILL.md` + Python 脚本承载更复杂的数据处理、集成与执行逻辑
+- **社区技能兼容**：支持 skill pack/category 递归扫描，兼容 OpenClaw 与 gbrain skill 格式
 
 ---
 
@@ -217,7 +234,10 @@ blockcell gateway
   },
   "agents": {
     "defaults": {
-      "model": "deepseek-chat"
+      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "maxContextTokens": 1048576,
+      "reasoningEffort": "high"
     }
   }
 }
@@ -229,7 +249,10 @@ blockcell gateway
 {
   "agents": {
     "defaults": {
-      "model": "deepseek-chat"
+      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "maxContextTokens": 1048576,
+      "reasoningEffort": "high"
     },
     "list": [
       {
@@ -323,7 +346,7 @@ blockcell gateway
 - **OpenAI**（GPT-4o、GPT-4.1、o1、o3）
 - **Anthropic**（Claude 3.5 Sonnet、Claude 4）
 - **Google Gemini**（Gemini 2.0 Flash、Pro）
-- **DeepSeek**（DeepSeek V3、R1）
+- **DeepSeek**（DeepSeek V4 Pro、V3、R1）
 - **Kimi/Moonshot**（月之暗面）
 - **MiniMax**（[MiniMax 2.5](https://www.minimaxi.com/)）
 - **智谱 AI**（[GLM-5](https://bigmodel.cn/)）
@@ -355,10 +378,12 @@ blockcell gateway
 - [工具系统](docs/03_tools_system.md)
 - [技能系统](docs/04_skill_system.md)
 - [记忆系统](docs/05_memory_system.md)
+- [Ghost Native 学习闭环](docs/27_ghost_learning_design.md)
 - [渠道配置](docs/06_channels.md)
 - [浏览器自动化](docs/07_browser_automation.md)
 - [Gateway 模式](docs/08_gateway_mode.md)
 - [自我进化](docs/09_self_evolution.md)
+- [CLI 参考](docs/17_cli_reference.md)
 
 ---
 
@@ -371,8 +396,8 @@ blockcell/
     ├── core/               # 配置、路径、共享类型
     ├── agent/              # Agent 运行时和安全
     ├── tools/              # 50+ 内置工具
-    ├── skills/             # Rhai 引擎与进化
-    ├── storage/            # SQLite 记忆与会话
+    ├── skills/             # 技能加载、OpenClaw 兼容与进化
+    ├── storage/            # SQLite 记忆、会话、RabitQ 向量索引
     ├── channels/           # 消息适配器
     ├── providers/          # LLM 提供商客户端
     ├── scheduler/          # Cron 与心跳

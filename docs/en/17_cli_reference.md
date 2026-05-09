@@ -41,7 +41,7 @@ Recommended for first-time users. `setup` walks you through provider setup and o
 
 ```bash
 blockcell setup
-blockcell setup --provider deepseek --api-key sk-xxx --model deepseek-chat
+blockcell setup --provider deepseek --api-key sk-xxx --model deepseek-v4-pro
 blockcell setup --provider kimi --api-key sk-xxx --channel telegram
 blockcell setup --force
 blockcell setup --provider ollama --skip-provider-test
@@ -80,7 +80,7 @@ Creates the workspace and initial config files. Compared with `setup`, `onboard`
 
 ```bash
 blockcell onboard
-blockcell onboard --provider deepseek --api-key sk-xxx --model deepseek-chat
+blockcell onboard --provider deepseek --api-key sk-xxx --model deepseek-v4-pro
 blockcell onboard --channels-only
 ```
 
@@ -112,16 +112,26 @@ blockcell agent -a ops -s work:finance
 blockcell agent --agent ops --model gpt-4o --provider openai
 ```
 
-Interactive mode built-ins:
+Unified slash commands:
+
+In interactive CLI mode, inputs starting with `/` go through the unified slash-command handler first. Gateway/WebSocket and external channels reuse the same handler. Most commands execute locally and do not spend LLM tokens; `/learn` and `/compact` are forwarded to the runtime for further processing.
 
 | Command | Description |
 |------|------|
 | `/help` | Show help |
+| `/tasks [status]` | List background tasks, optionally filtered by `running` / `completed` / `failed` / `cancelled` |
 | `/tools` | List loaded tools |
 | `/skills` | List loaded skills |
-| `/status` | Show runtime status |
+| `/learn <description>` | Ask the Agent to learn a new skill; uses the LLM |
 | `/clear` | Clear current conversation history |
+| `/compact` | Manually trigger conversation-history compression |
+| `/clear-skills` | Clear skill learning/evolution records |
+| `/forget-skill <name>` | Delete learning/evolution records for one skill |
+| `/session-metrics [--json|--reset|--layer N]` | Show or reset 7-layer memory-system metrics |
+| `/log status|level <LEVEL>|filter <TEXT>|console on/off|file on/off|clear` | Control the logging system at runtime |
 | `/exit` or `/quit` | Exit |
+
+`/quit` and `/exit` are CLI-only. In external channels they return an unavailable-command message. Command names must match exactly; for example, `/skills now` does not accidentally trigger `/skills`.
 
 ---
 
@@ -290,7 +300,7 @@ blockcell config set <KEY> <VALUE>
 **Examples:**
 
 ```bash
-blockcell config set agents.defaults.model "deepseek-chat"
+blockcell config set agents.defaults.model "deepseek-v4-pro"
 blockcell config set network.proxy "http://127.0.0.1:7890"
 blockcell config set agents.defaults.maxTokens 4096
 blockcell config set network.noProxy "['localhost', '127.0.0.1']"
@@ -749,6 +759,22 @@ blockcell memory maintenance [--recycle-days <DAYS>]
 | Option | Default | Description |
 |------|--------|------|
 | `--recycle-days <DAYS>` | `30` | Retention window for soft-deleted items |
+
+### `memory retry-vector-sync`
+
+Retry pending vector-index sync operations.
+
+```bash
+blockcell memory retry-vector-sync [--limit <N>]
+```
+
+### `memory reindex`
+
+Rebuild the optional vector index from SQLite memory items.
+
+```bash
+blockcell memory reindex
+```
 
 ---
 

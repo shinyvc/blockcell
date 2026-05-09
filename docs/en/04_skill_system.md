@@ -89,12 +89,21 @@ This is the actual flow implemented today in `runtime.rs`, `context.rs`, and `ma
 
 ### 1) Skills are loaded at startup
 
-`ContextBuilder::new()` creates a `SkillManager`, then `load_from_paths()` scans two roots:
+`ContextBuilder::new()` creates a `SkillManager`, then `load_from_paths()` scans two root classes:
 - built-in skills first, lower priority
 - workspace skills second, higher priority and allowed to override built-ins
 
+Inside each root, v0.1.6 uses a more package-oriented scan model:
+
+- Normal skill: a directory is considered a skill when it contains `SKILL.md`, `meta.yaml`, or `meta.json`.
+- Skill pack: a directory containing `manifest.json` is treated as a package directory, and its child directories are scanned recursively as independent skills.
+- Category paths: recursive scans preserve category / sub-category paths so deep skills and composite names are not truncated.
+- Empty/reference directories: directories without any skill marker are skipped to avoid registering empty skills.
+- Compatibility formats: OpenClaw frontmatter can be parsed when `openclawSkillEnabled` is enabled; gbrain skills are loaded through the compatibility path.
+
 Each skill load performs:
 - reading `meta.yaml` / `meta.json`
+- generating compatible runtime metadata for OpenClaw/gbrain formats when needed
 - validating `requires.bins`, `requires.env`, and declared `tools`
 - reading `SKILL.md`
 - compiling `shared` / `prompt` / `planning` / `summary` bundles from `SKILL.md`
@@ -447,13 +456,11 @@ Supported URL formats:
 - **GitHub single file**: `https://github.com/<owner>/<repo>/blob/<branch>/<path>` (auto-converted to raw)
 - **Zip bundle**: any downloadable `.zip` URL
 
-Import behavior (high-level):
-- Downloads into an import **staging** directory first
-- Tries to parse OpenClaw `SKILL.md` YAML frontmatter (`name`/`description`) and generates a minimal `meta.yaml`
-- Triggers the self-evolution pipeline to convert the imported OpenClaw skill into blockcell format:
-  - `.rhai` → `SKILL.rhai`
-  - `.py` → `SKILL.py`
-  - docs-only → improved `SKILL.md` + `meta.yaml`
+Import/load behavior (high-level):
+- WebUI External import downloads into an import **staging** directory first, then normalizes the result into a workspace skill according to the current import policy.
+- The v0.1.6 runtime loader can also parse OpenClaw `SKILL.md` YAML frontmatter directly when `openclawSkillEnabled` is enabled, generating runtime metadata from it.
+- gbrain skills are loaded through the compatibility path without requiring `openclawSkillEnabled`.
+- For docs-only or metadata-only skills, description loading prefers `meta.yaml` / `meta.json`, then `SKILL.md` frontmatter, then a body summary.
 
 Security and limits:
 - Only http/https are allowed; localhost and `.local` are blocked

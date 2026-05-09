@@ -9,6 +9,8 @@
 - 用 `denyTools` 从最终结果里移除不允许暴露的工具
 - 为 `Chat` 显式写 `{ "inheritBase": false, "tools": [] }`
 - 始终配置 `Unknown`
+- 如果只是想临时关闭意图分类但保留全量工具，可用 `enabled: false` + `loadAllTools: true`
+- 如果内置意图规则不能覆盖你的业务词汇，可用 `intentRules` 追加关键词或正则
 
 > `allowedMcpServers` / `allowedMcpTools` 是 agent 级别的 MCP 可见性白名单，字段名是 camelCase。
 
@@ -19,8 +21,71 @@
 3. 如果还是找不到，就回退到 `intentRouter.defaultProfile`。
 4. `agents.list` 为空时，runtime 会回退到一个隐式的 `default` agent。
 5. `intentRouter` 缺失时，blockcell 会自动注入内置默认 router。
-6. 如果 `intentRouter.enabled = false`，runtime 仍然会解析 profile，但最终只使用该 profile 的 `Unknown` 工具集。
-7. 每个 profile 都必须提供 `Unknown`，否则配置校验会失败。
+6. 如果 `intentRouter.enabled = false` 且 `loadAllTools = false`，runtime 仍然会解析 profile，但最终只使用该 profile 的 `Unknown` 工具集。
+7. 如果 `intentRouter.enabled = false` 且 `loadAllTools = true`，runtime 会暴露当前可用的全部工具，再应用当前 profile 的 `denyTools`。
+8. 如果 `intentRouter.enabled = true`，`loadAllTools` 会被忽略，仍按意图分类解析工具。
+9. 每个 profile 都必须提供 `Unknown`，否则配置校验会失败。
+
+## 关闭分类但保留全量工具
+
+有些场景下你可能不想让意图分类器筛工具，而是希望 LLM 看到当前可用的完整工具集。可以这样配置：
+
+```json
+{
+  "intentRouter": {
+    "enabled": false,
+    "loadAllTools": true,
+    "defaultProfile": "default",
+    "profiles": {
+      "default": {
+        "coreTools": [],
+        "intentTools": {
+          "Unknown": []
+        },
+        "denyTools": ["email", "exec"]
+      }
+    }
+  }
+}
+```
+
+这种模式下：
+
+- `enabled: false` 表示不走意图分类
+- `loadAllTools: true` 表示返回所有当前注册且可用的工具
+- `denyTools` 仍然会生效，适合保留全量能力但排除高风险工具
+- 如果不设置 `loadAllTools`，默认是 `false`，会回到只暴露 `Unknown` 工具集的保守行为
+
+## 追加自定义意图规则
+
+`intentRules` 用来补充内置分类规则，适合把业务词汇映射到已有意图类别。它不会覆盖内置规则，只会追加命中条件。
+
+```json
+{
+  "intentRouter": {
+    "enabled": true,
+    "intentRules": [
+      {
+        "category": "Finance",
+        "keywords": ["资金费率", "合约持仓", "链上净流入"],
+        "patterns": ["(?i)funding\\s+rate", "(?i)open\\s+interest"],
+        "negative": ["不是行情"],
+        "priority": 80
+      }
+    ]
+  }
+}
+```
+
+字段说明：
+
+| 字段 | 说明 |
+|------|------|
+| `category` | 必填，必须是已有意图类别，例如 `Finance`、`FileOps`、`WebSearch` |
+| `keywords` | 大小写不敏感的关键词，出现即命中 |
+| `patterns` | 正则表达式，任意一条匹配即命中；无效正则会被跳过并记录 warning |
+| `negative` | 否定关键词，命中后跳过该规则 |
+| `priority` | 规则优先级，默认 `60`；当前主要用于规则排序 |
 
 ## 示例一：默认助手 + 运维助手
 

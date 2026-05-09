@@ -42,6 +42,7 @@ BlockCell 现在有两条不同的 Ghost 相关路径：
 
 - `agents.ghost.enabled` 只控制 **定时后台维护**。
 - 嵌入式自学习由 `agents.ghost.learning.enabled` 控制，并在正常助手使用过程中自动运行。
+- 嵌入式学习的完整技术设计见 [第 27 篇：Ghost Native 学习闭环技术设计](./27_ghost_learning_design.md)。
 
 这个边界是刻意保留的：自学习必须贴近用户对话和任务结果；定时维护只做后台卫生工作，不应该成为学习闭环的入口。
 

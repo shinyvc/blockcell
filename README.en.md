@@ -14,7 +14,7 @@
 
 [Website](https://blockcell.dev) • [Documentation](https://blockcell.dev/docs) • [中文](README.md)
 
-**Latest release**: v0.1.5 • [Download Release](https://github.com/blockcell-labs/blockcell/releases/tag/v0.1.5) • [Changelog](CHANGELOG.en.md)
+**Latest release**: v0.1.6 • [Download Release](https://github.com/blockcell-labs/blockcell/releases/tag/v0.1.6) • [Changelog](CHANGELOG.en.md)
 
 </div>
 
@@ -82,6 +82,22 @@ Error detected → LLM generates fix → Audit → Test → Canary deploy → Fu
                                                  Auto rollback
 ```
 
+### 🧠 Ghost Native Learning
+
+BlockCell can retain durable lessons from real usage:
+
+- Stable user preferences go into `USER.md`
+- Project facts, environment conventions, and recurring lessons go into `MEMORY.md`
+- Reusable workflows can become workspace skills
+- Background review failures do not block the current answer, and automatic writes are audited, snapshotted, and undoable
+
+### 🤖 Multi-Agent and Custom Agents
+
+- Supports typed agents, forked subagents, checkpoints, and chained cancellation
+- Loads user-level and project-level Markdown agent definitions
+- Each agent type can define tool scope, model, skills, MCP servers, one-shot behavior, and permission mode
+- CLI, Gateway, and WebUI can receive background task progress events
+
 ### 🌐 Multi-Channel Support
 
 Run BlockCell as a daemon and connect it to:
@@ -137,6 +153,7 @@ Each guide includes:
 - **Pure Markdown skills**: define behavior with `SKILL.md` only, ideal for knowledge and workflow-oriented skills
 - **Markdown + Rhai skills**: combine `SKILL.md` with `SKILL.rhai` for structured orchestration and tool calling
 - **Markdown + Python skills**: combine `SKILL.md` with Python scripts for heavier data processing, integrations, and execution logic
+- **Community skill compatibility**: recursive skill pack/category scanning, with OpenClaw and gbrain skill support
 
 ---
 
@@ -217,7 +234,10 @@ Minimal configuration example (`~/.blockcell/config.json5`):
   },
   "agents": {
     "defaults": {
-      "model": "deepseek-chat"
+      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "maxContextTokens": 1048576,
+      "reasoningEffort": "high"
     }
   }
 }
@@ -229,7 +249,10 @@ To enable multi-agent routing plus external channels, extend it using the struct
 {
   "agents": {
     "defaults": {
-      "model": "deepseek-chat"
+      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "maxContextTokens": 1048576,
+      "reasoningEffort": "high"
     },
     "list": [
       {
@@ -323,7 +346,7 @@ Notes:
 - **OpenAI** (GPT-4o, GPT-4.1, o1, o3)
 - **Anthropic** (Claude 3.5 Sonnet, Claude 4)
 - **Google Gemini** (Gemini 2.0 Flash, Pro)
-- **DeepSeek** (DeepSeek V3, R1)
+- **DeepSeek** (DeepSeek V4 Pro, V3, R1)
 - **Kimi/Moonshot**
 - **MiniMax** ([MiniMax 2.5](https://www.minimaxi.com/))
 - **Zhipu AI** ([GLM-5](https://bigmodel.cn/))
@@ -355,10 +378,12 @@ For full functionality, install these tools:
 - [Tool System](docs/en/03_tools_system.md)
 - [Skill System](docs/en/04_skill_system.md)
 - [Memory System](docs/en/05_memory_system.md)
+- [Ghost Native Learning Design (Chinese)](docs/27_ghost_learning_design.md)
 - [Channel Configuration](docs/en/06_channels.md)
 - [Browser Automation](docs/en/07_browser_automation.md)
 - [Gateway Mode](docs/en/08_gateway_mode.md)
 - [Self-Evolution](docs/en/09_self_evolution.md)
+- [CLI Reference](docs/en/17_cli_reference.md)
 
 ---
 
@@ -371,8 +396,8 @@ blockcell/
     ├── core/               # Config, paths, shared types
     ├── agent/              # Agent runtime and safety
     ├── tools/              # 50+ built-in tools
-    ├── skills/             # Rhai engine & evolution
-    ├── storage/            # SQLite memory & sessions
+    ├── skills/             # Skill loading, OpenClaw compatibility & evolution
+    ├── storage/            # SQLite memory, sessions & RabitQ vector index
     ├── channels/           # Messaging adapters
     ├── providers/          # LLM provider clients
     ├── scheduler/          # Cron & heartbeat

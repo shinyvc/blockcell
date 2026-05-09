@@ -21,7 +21,7 @@ blockcell's **Provider Pool** solves this by letting you declare a list of **mod
 {
   "agents": {
     "defaults": {
-      "model": "deepseek-chat",
+      "model": "deepseek-v4-pro",
       "provider": "deepseek"
     }
   }
@@ -36,7 +36,7 @@ blockcell's **Provider Pool** solves this by letting you declare a list of **mod
     "defaults": {
       "modelPool": [
         {
-          "model": "deepseek-chat",
+          "model": "deepseek-v4-pro",
           "provider": "deepseek",
           "weight": 2,
           "priority": 1
@@ -102,7 +102,7 @@ Each completed call reports one of these outcomes back to the pool:
 
 ```json
 "modelPool": [
-  { "model": "deepseek-chat", "provider": "deepseek", "weight": 1, "priority": 1 },
+  { "model": "deepseek-v4-pro", "provider": "deepseek", "weight": 1, "priority": 1 },
   { "model": "gpt-4o-mini", "provider": "openai", "weight": 1, "priority": 2 }
 ]
 ```
@@ -113,7 +113,7 @@ Use DeepSeek normally, then fall back to GPT-4o-mini when needed.
 
 ```json
 "modelPool": [
-  { "model": "deepseek-chat", "provider": "deepseek", "weight": 2, "priority": 1 },
+  { "model": "deepseek-v4-pro", "provider": "deepseek", "weight": 2, "priority": 1 },
   { "model": "claude-3-5-sonnet-20241022", "provider": "anthropic", "weight": 1, "priority": 1 },
   { "model": "gemini-2.0-flash", "provider": "gemini", "weight": 1, "priority": 1 }
 ]
@@ -126,7 +126,7 @@ Three primary models share traffic in a 2:1:1 ratio.
 ```json
 "modelPool": [
   { "model": "ollama/qwen2.5:7b", "provider": "ollama", "weight": 1, "priority": 1 },
-  { "model": "deepseek-chat", "provider": "deepseek", "weight": 1, "priority": 2 }
+  { "model": "deepseek-v4-pro", "provider": "deepseek", "weight": 1, "priority": 2 }
 ]
 ```
 
@@ -150,7 +150,7 @@ blockcell agent --model gpt-4o --provider openai -m "Analyze this file"
   "agents": {
     "defaults": {
       "modelPool": [ ... ],
-      "evolutionModel": "deepseek-chat",
+      "evolutionModel": "deepseek-v4-pro",
       "evolutionProvider": "deepseek"
     }
   }

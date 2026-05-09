@@ -68,6 +68,33 @@ blockcell gateway
 
 ---
 
+## Gateway 与外部渠道里的斜杠命令
+
+从 v0.1.6 开始，Gateway/WebSocket 和外部 Channel 与 CLI 共用统一斜杠命令处理器。用户在 Telegram、Slack、Discord、飞书、钉钉等渠道里发送 `/help`、`/tasks`、`/skills`、`/tools`、`/clear` 等命令时，Gateway 会优先本地处理，再把结果回发到原渠道。
+
+这带来两个效果：
+
+- 常见查询命令不需要进入 LLM，因此响应更快，也不会消耗 token。
+- CLI、WebUI/WebSocket 和外部渠道看到的命令行为保持一致。
+
+当前内置命令包括：
+
+| 命令 | 说明 |
+|------|------|
+| `/help` | 显示命令列表 |
+| `/tasks [status]` | 查看后台任务 |
+| `/skills` | 查看已加载技能 |
+| `/tools` | 查看已加载工具 |
+| `/learn <描述>` | 让 Agent 学习新技能，会调用 LLM |
+| `/clear` | 清空当前会话历史 |
+| `/compact` | 手动触发会话历史压缩 |
+| `/session-metrics` | 查看 7 层记忆系统指标 |
+| `/log ...` | 动态控制日志输出 |
+
+`/quit` 和 `/exit` 仅在 CLI 模式可用。命令名必须完整匹配，带多余参数的无参命令会被当作普通消息处理。
+
+---
+
 ## HTTP API
 
 Gateway 提供了一个简洁的 REST API：

@@ -147,14 +147,15 @@ Example:
 {
   agents: {
     defaults: {
-      model: "anthropic/claude-sonnet-4-20250514",
+      model: "deepseek-v4-pro",
       provider: null,
       maxTokens: 8192,
       temperature: 0.7,
-      maxToolIterations: 20,
+      maxToolIterations: 30,
       llmMaxRetries: 3,
       llmRetryDelayMs: 2000,
-      maxContextTokens: 32000,
+      maxContextTokens: 1048576,
+      reasoningEffort: null,
       evolutionModel: null,
       evolutionProvider: null,
     },
@@ -164,14 +165,15 @@ Example:
 
 | Field | Default | Description |
 |------|--------|------|
-| `model` | empty in default config; usually set during setup | Primary model |
+| `model` | `deepseek-v4-pro` | Primary model; `setup` writes a provider-specific recommended default |
 | `provider` | `null` | Explicit provider override |
 | `maxTokens` | `8192` | Max output tokens per LLM call |
 | `temperature` | `0.7` | Sampling temperature |
-| `maxToolIterations` | `20` | Max tool-call loops per message |
+| `maxToolIterations` | `30` | Max tool-call loops per message |
 | `llmMaxRetries` | `3` | Max retry count for failed LLM calls |
 | `llmRetryDelayMs` | `2000` | Retry delay in milliseconds |
-| `maxContextTokens` | `32000` | Context window used for history management |
+| `maxContextTokens` | `1048576` | Context window used for history management; long-context providers such as DeepSeek/Gemini can use higher values |
+| `reasoningEffort` | `null` | Reasoning control; DeepSeek thinking mode supports `off`, `low`, `medium`, `high`, and `max` |
 | `evolutionModel` | `null` | Dedicated model for self-evolution |
 | `evolutionProvider` | `null` | Dedicated provider for self-evolution |
 
@@ -293,7 +295,7 @@ You do not have to hand-edit `config.json5` for every change. Use `blockcell con
 blockcell config set network.proxy "http://127.0.0.1:7890"
 
 # Set the default model
-blockcell config set agents.defaults.model "deepseek-chat"
+blockcell config set agents.defaults.model "deepseek-v4-pro"
 
 # Set the DeepSeek API key
 blockcell config set providers.deepseek.apiKey "sk-xxxxxxxx"
@@ -354,7 +356,7 @@ A practical production-style example:
       maxTokens: 8192,
       temperature: 0.7,
       maxToolIterations: 20,
-      evolutionModel: "deepseek-chat",
+      evolutionModel: "deepseek-v4-pro",
       evolutionProvider: "deepseek",
     },
   },

@@ -13,6 +13,8 @@
 - Remove disallowed tools with `denyTools`
 - Explicitly configure `Chat` as `{ "inheritBase": false, "tools": [] }`
 - Always configure `Unknown`
+- Use `enabled: false` + `loadAllTools: true` if you want to disable classification while exposing the full available tool set
+- Use `intentRules` when built-in intent rules do not cover your domain vocabulary
 
 > `allowedMcpServers` and `allowedMcpTools` are agent-level MCP visibility allowlists. The JSON field names are camelCase.
 
@@ -23,8 +25,71 @@
 3. If that still does not resolve, blockcell falls back to `intentRouter.defaultProfile`.
 4. If `agents.list` is empty, runtime falls back to an implicit `default` agent.
 5. If `intentRouter` is missing, blockcell injects the built-in default router automatically.
-6. If `intentRouter.enabled = false`, runtime still resolves profiles, but it ultimately keeps only that profile's `Unknown` tool set.
-7. Every profile must configure `Unknown`, otherwise validation fails.
+6. If `intentRouter.enabled = false` and `loadAllTools = false`, runtime still resolves profiles, but it ultimately keeps only that profile's `Unknown` tool set.
+7. If `intentRouter.enabled = false` and `loadAllTools = true`, runtime exposes all currently available tools, then applies the active profile's `denyTools`.
+8. If `intentRouter.enabled = true`, `loadAllTools` is ignored and tool resolution still follows intent classification.
+9. Every profile must configure `Unknown`, otherwise validation fails.
+
+## Disable classification but keep all tools
+
+Some deployments do not want intent classification to filter tools, but still want the LLM to see the complete current tool set. Configure:
+
+```json
+{
+  "intentRouter": {
+    "enabled": false,
+    "loadAllTools": true,
+    "defaultProfile": "default",
+    "profiles": {
+      "default": {
+        "coreTools": [],
+        "intentTools": {
+          "Unknown": []
+        },
+        "denyTools": ["email", "exec"]
+      }
+    }
+  }
+}
+```
+
+In this mode:
+
+- `enabled: false` disables intent classification
+- `loadAllTools: true` returns all registered and currently available tools
+- `denyTools` still applies, which is useful when you want broad capability but still exclude high-risk tools
+- if `loadAllTools` is omitted, it defaults to `false`, preserving the conservative `Unknown`-only behavior
+
+## Add custom intent rules
+
+`intentRules` extends the built-in classifier with domain-specific vocabulary. It adds matching conditions; it does not replace built-in rules.
+
+```json
+{
+  "intentRouter": {
+    "enabled": true,
+    "intentRules": [
+      {
+        "category": "Finance",
+        "keywords": ["funding rate", "open interest", "net inflow"],
+        "patterns": ["(?i)funding\\s+rate", "(?i)open\\s+interest"],
+        "negative": ["not market data"],
+        "priority": 80
+      }
+    ]
+  }
+}
+```
+
+Fields:
+
+| Field | Meaning |
+|------|---------|
+| `category` | Required existing intent category, such as `Finance`, `FileOps`, or `WebSearch` |
+| `keywords` | Case-insensitive keywords; any hit matches the rule |
+| `patterns` | Regular expressions; invalid patterns are skipped with a warning |
+| `negative` | Negative keywords; if any is present, the rule is skipped |
+| `priority` | Rule priority, default `60`; currently used for rule ordering |
 
 ## Example 1: default assistant + ops assistant
 

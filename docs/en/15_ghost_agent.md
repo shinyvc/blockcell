@@ -42,6 +42,7 @@ These paths do not share the same switch:
 
 - `agents.ghost.enabled` controls only **scheduled background maintenance**.
 - Embedded learning is controlled by `agents.ghost.learning.enabled` and runs during normal assistant use.
+- For the full embedded-learning design, see the Chinese design note: [Article 27: Ghost Native learning loop](../27_ghost_learning_design.md).
 
 This separation is intentional. Learning must stay close to real conversations and task outcomes; scheduled maintenance should remain a hygiene loop, not the entry point for the learning loop.
 

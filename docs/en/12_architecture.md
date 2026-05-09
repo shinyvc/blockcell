@@ -42,7 +42,7 @@ Not for “showing off”, but for solid engineering reasons. This article analy
                              ↕
 ┌─────────────────────────────────────────────────────────────┐
 │                          Storage                              │
-│  SQLite (memory) │ FS (sessions/audit/skills/media/tasks/config) │
+│  SQLite (memory/workflows/ledger) │ RabitQ (optional vectors) │ FS │
 └─────────────────────────────────────────────────────────────┘
                              ↕
 ┌─────────────────────────────────────────────────────────────┐
@@ -61,9 +61,36 @@ The current blockcell architecture is no longer “one `AgentRuntime` for everyt
 - non-default agents live under `~/.blockcell/agents/<ID>/` with isolated `workspace / sessions / audit`
 - Gateway builds separate runtimes for enabled agents and routes external traffic with `channelAccountOwners.<channel>.<accountId>` first, then `channelOwners.<channel>` as fallback
 - `intentRouter` makes intent → tool resolution fully config-driven instead of hardcoded in runtime logic
-- background tasks live only in the memory of running processes and are removed immediately on completion; use the WebUI for live task status
+- `TaskManager` persists background task state under `workspace/.blockcell/tasks/`; unfinished tasks restored after restart are marked failed and are not replayed automatically; live progress is still surfaced through WebUI/Gateway events
 
 This is what enables the current “multi-agent + configurable tool routing + live WebUI task visibility” model.
+
+---
+
+## Current-version note: SystemEventOrchestrator and proactive background reports
+
+blockcell now has a structured background event path for “what happened in the background, and when should the user be told about it”:
+
+- `HeartbeatService` remains a **scheduled prompt injector**
+  - it continues to read `HEARTBEAT.md` and send internal messages to the Agent
+  - it does not aggregate events, merge summaries, or orchestrate proactive notifications
+- `AgentRuntime::run_loop` calls `SystemEventOrchestrator` from the `tick_interval` branch
+  - it reads the system event store
+  - turns `Critical` events into immediate notifications
+  - pushes `Normal` events into the main-session summary queue
+  - renders concise summaries once thresholds or timeouts are reached
+- Phase 1 producers are:
+  - `TaskManager`: background subtask lifecycle events
+  - `CronService`: scheduled job lifecycle events
+
+Current limits:
+
+- only `MainSession` summarization and delivery are supported
+- event storage and summary queues are still in-process memory and do not survive restarts
+- the main-session target is remembered from each agent's latest interactive inbound message
+- if an agent has no main-session target yet, events are recorded but not force-delivered
+
+This moves blockcell's proactive behavior from prompt-only judgment into platform infrastructure.
 
 ---
 
@@ -79,7 +106,7 @@ blockcell/
     ├── agent/              # runtime, context, intent classification
     ├── tools/              # 50+ built-in tools + registry
     ├── skills/             # Rhai engine, skill management, evolution service
-    ├── storage/            # SQLite memory, sessions, audit logs
+    ├── storage/            # SQLite memory, sessions, workflows, ledgers, and RabitQ vector index
     ├── channels/           # messaging adapters
     ├── providers/          # LLM provider clients
     ├── scheduler/          # cron scheduler
@@ -285,13 +312,15 @@ Rhai is designed for embedding in Rust: zero external runtime, natural sandboxin
 
 ---
 
-## Strategic use of SQLite
+## Strategic use of SQLite and RabitQ
 
-blockcell uses SQLite in three places:
+blockcell uses SQLite in several core places:
 
-1. **Memory**: `memory.db` with FTS5 search
+1. **Memory**: `memory.db` as canonical storage with FTS5 search and a vector-sync queue
 2. **Knowledge graph**: `knowledge_graphs/*.db`
 3. **Session history**: `sessions.db`
+4. **Durable workflows**: evolution workflow records, leases, and step checkpoints
+5. **Ghost learning ledger**: episodes, review runs, restricted tool actions, and review checkpoints
 
 Why not PostgreSQL or Redis?
 
@@ -299,6 +328,8 @@ Why not PostgreSQL or Redis?
 - **Fast enough**: excellent for single-user workloads
 - **Portable**: backup/migration is trivial
 - **FTS5 built-in**: no need for Elasticsearch
+
+RabitQ is only an optional enhancement layer. When `memory.vector` is enabled, blockcell syncs memory embeddings into RabitQ and fuses FTS5 candidates with vector candidates during retrieval. When it is disabled, SQLite + FTS5 remains the complete default path.
 
 ---
 
@@ -426,7 +457,7 @@ blockcell’s architecture reflects several core principles:
 2. **Rhai skills as mutable layer**: flexible, evolvable, sandboxed
 3. **Trait objects for extensibility**: tools/providers/channels are pluggable
 4. **Channel decoupling for maintainability**: clear message flow
-5. **SQLite for zero-ops storage**: simple and reliable
+5. **SQLite + optional RabitQ for zero-ops storage and semantic recall**: simple by default, enhanced when vector search is enabled
 
 This architecture gives blockcell strong extensibility while maintaining performance and security — whether adding tools, adding channels, or letting the AI evolve new capabilities.
 
@@ -442,7 +473,7 @@ At this point, you’ve finished the first 12 core articles in the series. So fa
 | 02 | 5-minute quickstart |
 | 03 | 50+ built-in tools |
 | 04 | Rhai skill system |
-| 05 | SQLite memory system |
+| 05 | SQLite + optional RabitQ memory system |
 | 06 | Multi-channel access |
 | 07 | CDP browser automation |
 | 08 | Gateway mode |

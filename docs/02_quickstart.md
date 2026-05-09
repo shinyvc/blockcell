@@ -91,7 +91,7 @@ blockcell setup
 **非交互式用法:**
 ```bash
 # 直接指定 provider 和 API key
-blockcell setup --provider deepseek --api-key sk-xxx --model deepseek-chat
+blockcell setup --provider deepseek --api-key sk-xxx --model deepseek-v4-pro
 
 # 同时配置渠道
 blockcell setup --provider kimi --api-key sk-xxx --channel telegram
@@ -144,9 +144,9 @@ nano ~/.blockcell/config.json5
 
 找到 `providers` 部分,填入你的 API Key。
 
-### 选项 A：使用 DeepSeek（最便宜，推荐新手）
+### 选项 A：使用 DeepSeek（推荐新手）
 
-DeepSeek 的 API 非常便宜，适合测试：
+`blockcell setup --provider deepseek` 当前默认会选择 `deepseek-v4-pro`，并按 1M 上下文配置 `maxContextTokens`。如果你想继续使用旧的 `deepseek-chat`，也可以显式传入 `--model deepseek-chat`。
 
 ```json
 {
@@ -158,11 +158,13 @@ DeepSeek 的 API 非常便宜，适合测试：
   },
   "agents": {
     "defaults": {
-      "model": "deepseek-chat",
+      "model": "deepseek-v4-pro",
       "provider": "deepseek",
+      "maxContextTokens": 1048576,
+      "reasoningEffort": "high",
       "modelPool": [
         {
-          "model": "deepseek-chat",
+          "model": "deepseek-v4-pro",
           "provider": "deepseek",
           "weight": 1,
           "priority": 1
@@ -269,7 +271,7 @@ blockcell status
 
 ```
 ✓ Config loaded
-✓ Provider: deepseek (deepseek-chat)
+✓ Provider: deepseek (deepseek-v4-pro)
 ✓ Workspace: ~/.blockcell/workspace
 ✓ Memory: SQLite (0 items)
 ✓ Skills: 0 user skills, 44 builtin skills
@@ -415,7 +417,7 @@ blockcell doctor
           "priority": 1
         },
         {
-          "model": "deepseek-chat",
+          "model": "deepseek-v4-pro",
           "provider": "deepseek",
           "weight": 1,
           "priority": 2
@@ -455,7 +457,7 @@ blockcell doctor
 `modelPool` 是一个可选的高级功能，用于配置多模型负载均衡和自动降级：
 
 **字段说明：**
-- `model`: 模型名称（如 "gpt-4o"、"deepseek-chat"）
+- `model`: 模型名称（如 "gpt-4o"、"deepseek-v4-pro"）
 - `provider`: 对应 providers 表中的 key
 - `weight`: 负载均衡权重（正整数，越大越优先被选中），默认 1
 - `priority`: 优先级（小数字 = 高优先级），同优先级内按 weight 加权随机，默认 1

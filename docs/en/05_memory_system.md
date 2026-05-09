@@ -15,15 +15,15 @@ blockcell’s memory system is designed to solve this.
 
 ---
 
-## Memory system architecture
+## Memory System Architecture
 
-blockcell’s memory system is built on **SQLite + FTS5** (full-text search).
+blockcell’s memory system is built on **SQLite canonical storage + FTS5 full-text search + optional RabitQ vector indexing**.
 
 ```
 ~/.blockcell/workspace/memory/memory.db
 ```
 
-It’s a local SQLite database that lives entirely on your machine — nothing is uploaded to any server.
+It’s a local SQLite database that lives entirely on your machine — nothing is uploaded to any server. When vector recall is enabled, blockcell also maintains a local sync queue and stores embeddings in a RabitQ index.
 
 ### Database schema
 
@@ -49,6 +49,15 @@ CREATE TABLE memory_items (
 CREATE VIRTUAL TABLE memory_fts USING fts5(
     title, summary, content, tags,
     content=memory_items
+);
+
+-- Optional vector-index sync queue, used when memory.vector is enabled
+CREATE TABLE memory_vector_queue (
+    id          TEXT PRIMARY KEY,
+    operation   TEXT NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT,
+    updated_at  TEXT NOT NULL
 );
 ```
 
@@ -111,7 +120,7 @@ blockcell categorizes memory along two dimensions:
 }
 ```
 
-This uses FTS5 full-text search (including Chinese tokenization support) and returns the most relevant memory items.
+This uses hybrid retrieval: FTS5 recalls text-relevant candidates, the optional RabitQ vector index adds semantic candidates when enabled, and blockcell returns the highest fused scores.
 
 ### `memory_forget` — delete memory
 
@@ -126,6 +135,35 @@ This uses FTS5 full-text search (including Chinese tokenization support) and ret
 ```
 
 Supports soft delete (recoverable) and batch deletes (filtered by scope/type/tags).
+
+---
+
+## Enabling Vector Recall
+
+Vector recall is optional and disabled by default. Enable it in `config.json5` under `memory.vector`:
+
+```json
+{
+  "memory": {
+    "vector": {
+      "enabled": true,
+      "provider": "openai",
+      "model": "text-embedding-3-small",
+      "uri": "./memory/vectors.rabitq",
+      "table": "memory_vectors"
+    }
+  }
+}
+```
+
+Field meanings:
+
+- `enabled`: whether the vector runtime is enabled; default is `false`
+- `provider` / `model`: embedding provider and model used for vector generation
+- `uri`: RabitQ index location, preferably relative to the workspace
+- `table`: vector table name; defaults to `memory_vectors`
+
+When enabled, blockcell first writes memory items into SQLite, then syncs embedding operations into RabitQ. If the provider/model is missing or does not support OpenAI-compatible embeddings, vector runtime initialization fails fast. Without vector recall, SQLite + FTS5 remains fully usable.
 
 ---
 
@@ -194,17 +232,17 @@ AI: Sure — starting the analysis...
 
 ## Memory query scoring
 
-FTS5 search results are ranked by a combined score:
+Memory search results are ranked by a fused score:
 
 ```
-Final score = BM25 relevance + importance bonus + recency bonus
+Final score = FTS/vector fused rank + importance bonus + recency bonus
 ```
 
-- **BM25**: a classic full-text relevance algorithm
+- **FTS/vector fusion**: FTS5 candidates and optional RabitQ vector candidates are merged with rank fusion
 - **Importance bonus**: `importance` (1–10), higher ranks earlier
 - **Recency bonus**: more recently updated items get extra weight
 
-This ensures that the most relevant, most important, and newest memories appear first in briefs.
+This ensures that the most relevant, most important, and newest memories appear first in briefs. If vector runtime is disabled, the search automatically falls back to SQLite + FTS5 only.
 
 ---
 
@@ -221,6 +259,7 @@ Maintenance includes:
 1. Purging expired short-term memories
 2. Purging soft-deleted memories older than 30 days (trash)
 3. Updating FTS5 indexes
+4. Retrying or writing pending vector-sync operations
 
 ---
 
@@ -233,11 +272,26 @@ blockcell memory list
 # Search memories
 blockcell memory search "stocks"
 
+# Show one memory item
+blockcell memory show <ID>
+
+# Delete one memory item
+blockcell memory delete <ID>
+
+# Clear memories by scope/type
+blockcell memory clear --scope short_term
+
 # Memory statistics
 blockcell memory stats
 
 # Clean expired memories
-blockcell memory clean
+blockcell memory maintenance --recycle-days 30
+
+# Retry vector sync queue
+blockcell memory retry-vector-sync --limit 100
+
+# Rebuild vector index
+blockcell memory reindex
 ```
 
 ---
@@ -257,17 +311,17 @@ store.migrate_from_files(&paths)
 
 ## Why SQLite + FTS5?
 
-A common question: why not use a vector database (e.g., Chroma, Pinecone)?
+A common question: why not put memory entirely in a vector database?
 
 Reasons blockcell chose SQLite + FTS5:
 
 1. **Zero extra services**: no additional server required
 2. **Local-first**: all data stays on-device for privacy
-3. **Good enough**: FTS5 keyword search is sufficient for personal assistant memory
+3. **Good enough baseline**: structured memories work well with SQLite + FTS5
 4. **Fast**: excellent read/write performance
 5. **Reliable**: SQLite is one of the most widely used databases in the world
 
-Vector databases can be stronger for semantic search, but they require embedding model calls (costing tokens and time). For structured memory items, keyword search is often more precise.
+The vector index is now an optional enhancement layer. When enabled, blockcell syncs memory embeddings to RabitQ and uses hybrid recall; when disabled, the system still works entirely through SQLite + FTS5.
 
 ---
 
@@ -277,6 +331,7 @@ blockcell’s memory system provides:
 
 - **Persistence**: local SQLite storage; no loss after restart
 - **Full-text search**: FTS5 supports Chinese keyword search
+- **Hybrid retrieval**: optional RabitQ vectors add semantic recall
 - **Smart injection**: injects the most relevant memory brief each chat
 - **Automatic maintenance**: expiration cleanup and soft-delete trash
 - **Privacy**: fully local; nothing is uploaded

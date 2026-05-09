@@ -51,7 +51,10 @@ blockcell setup
   },
   "agents": {
     "defaults": {
-      "model": "deepseek-chat"
+      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "maxContextTokens": 1048576,
+      "reasoningEffort": "high"
     }
   }
 }
@@ -76,7 +79,10 @@ blockcell setup
   },
   "agents": {
     "defaults": {
-      "model": "deepseek-chat"
+      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "maxContextTokens": 1048576,
+      "reasoningEffort": "high"
     }
   },
   "channels": {

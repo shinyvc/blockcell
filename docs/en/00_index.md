@@ -1,6 +1,6 @@
 # blockcell Technical Article Series: “A Self-Evolving AI Agent Framework”
 
-> The complete series index for blockcell. It currently contains 24 articles, all aligned to the real codebase and current product behavior.
+> The English series index for blockcell currently contains 23 articles, all aligned to the real codebase and current product behavior. The Chinese documentation includes additional advanced skill tutorials and the Ghost Native learning design.
 
 ---
 
@@ -35,7 +35,7 @@ For the naming story, see:
 | 08 | [Gateway mode](./08_gateway_mode.md) | HTTP API, WebSocket, and server deployment | Intermediate |
 | 09 | [Self-evolution](./09_self_evolution.md) | error-triggered upgrades, repair loops, and rollout ideas | Advanced |
 | 10 | [Finance in practice](./10_finance_use_case.md) | stock and crypto monitoring, alerts, and report workflows | Hands-on |
-| 11 | [Subagents and task concurrency](./11_subagents.md) | `spawn`, task decomposition, and concurrent execution | Advanced |
+| 11 | [Subagents and task concurrency](./11_subagents.md) | `agent` / `spawn`, Typed Agents, task decomposition, and concurrency | Advanced |
 | 12 | [Architecture deep dive](./12_architecture.md) | Rust crate layout, system boundaries, and core modules | Advanced |
 | 13 | [Message processing & evolution lifecycle](./13_message_processing_and_evolution.md) | the full path from input message to tools, memory, and evolution | Advanced |
 | 14 | [Name origin](./14_name_origin.md) | why the project is called blockcell | Appendix |
@@ -60,6 +60,8 @@ For the naming story, see:
 **Need production configuration guidance:** 02 → 08 → 17 → 18 → 19 → 20 → 21
 
 **Want the internal architecture:** 11 → 12 → 13 → 15 → 16
+
+**Need the latest Ghost Native learning design:** read the Chinese design note [Article 27](../27_ghost_learning_design.md).
 
 ---
 

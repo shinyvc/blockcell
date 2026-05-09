@@ -303,6 +303,31 @@ Actions: create, list, delete scheduled tasks
 
 ---
 
+### Multi-agent tools
+
+**`agent`** — launch Fork/Typed Agents
+```
+Fork mode: omit subagent_type, inherit current context, and return synchronously
+Typed Agent: set subagent_type, run in the background, and return task_id
+Built-in types: explore / plan / verification / viper / general
+```
+
+**`spawn`** — start a background subtask
+```
+Best for: explicitly requested background work or long-running tasks
+Limit: subtasks cannot call agent/spawn again, preventing recursive delegation
+```
+
+**`list_tasks`** — inspect background tasks
+```
+Supports: filtering by running/completed/failed/cancelled states
+Interactive command: /tasks
+```
+
+For details, see [Subagents and task concurrency](./11_subagents.md).
+
+---
+
 ### System information tool
 
 **`system_info`** — system probe

@@ -42,7 +42,7 @@ blockcell 选择了 Rust。
                               ↕
 ┌─────────────────────────────────────────────────────────────┐
 │                    存储层（Storage）                         │
-│  SQLite（记忆）  │  文件系统（会话/审计/技能/媒体/任务/配置） │
+│  SQLite（记忆/工作流/账本） │ RabitQ（可选向量） │ 文件系统   │
 └─────────────────────────────────────────────────────────────┘
                               ↕
 ┌─────────────────────────────────────────────────────────────┐
@@ -61,7 +61,7 @@ blockcell 选择了 Rust。
 - 非 `default` agent 使用 `~/.blockcell/agents/<ID>/` 下的独立 `workspace / sessions / audit`
 - Gateway 会为启用的 agent 建立独立 runtime，并按 `channelAccountOwners.<channel>.<accountId>` → `channelOwners.<channel>` 的优先级路由外部消息
 - `intentRouter` 负责把“意图 → 工具集合”的映射完全放进配置，而不是写死在运行时代码里
-- 后台任务仅存在于运行中进程的内存里，完成后立即移除；实时任务状态以 WebUI 为准
+- `TaskManager` 会把后台任务状态持久化到 `workspace/.blockcell/tasks/`；重启后未完成任务会以失败状态恢复，不会自动重放执行；实时进度仍以 WebUI/Gateway 事件为准
 
 这套设计让“多 agent + 可配置工具路由 + WebUI 实时任务视图”成为默认能力，而不再依赖过期的文件快照。
 
@@ -106,7 +106,7 @@ blockcell/
     ├── agent/              # Agent 运行时、上下文、意图分类
     ├── tools/              # 50+ 内置工具 + 工具注册表
     ├── skills/             # Rhai 引擎、技能管理、进化服务
-    ├── storage/            # SQLite 记忆、会话、审计日志
+    ├── storage/            # SQLite 记忆、会话、工作流、账本与 RabitQ 向量索引
     ├── channels/           # 消息渠道适配器
     ├── providers/          # LLM Provider 客户端
     ├── scheduler/          # Cron 调度器
@@ -315,13 +315,15 @@ Rhai 是专为 Rust 嵌入设计的脚本语言，零外部依赖，天然沙箱
 
 ---
 
-## SQLite 的战略性使用
+## SQLite 与 RabitQ 的战略性使用
 
-blockcell 在三个地方使用 SQLite：
+blockcell 在几个核心地方使用 SQLite：
 
-1. **记忆系统**：`memory.db`，FTS5 全文搜索
+1. **记忆系统**：`memory.db`，SQLite 主存储 + FTS5 全文搜索 + 向量同步队列
 2. **知识图谱**：`knowledge_graphs/*.db`，实体关系图
 3. **会话历史**：`sessions.db`，对话记录
+4. **持久化工作流**：进化 workflow、租约、step checkpoint
+5. **Ghost 学习账本**：episode、review run、受限工具动作和 review checkpoint
 
 为什么不用 PostgreSQL 或 Redis？
 
@@ -329,6 +331,8 @@ blockcell 在三个地方使用 SQLite：
 - **足够快**：对于单用户场景，SQLite 的性能绰绰有余
 - **可移植**：整个数据库就是一个文件，备份/迁移极简单
 - **FTS5**：内置全文搜索，不需要 Elasticsearch
+
+RabitQ 只作为可选增强层使用：开启 `memory.vector` 后，blockcell 会把记忆 embedding 同步到 RabitQ，并在检索时融合 FTS5 和向量候选；不开启时，SQLite + FTS5 仍然是完整可用的默认路径。
 
 ---
 
@@ -457,7 +461,7 @@ blockcell 的架构设计体现了几个核心原则：
 2. **Rhai 技能 = 可变层**：灵活、可进化、沙箱隔离
 3. **Trait 对象 = 可扩展性**：工具、Provider、渠道都可插拔
 4. **Channel 解耦 = 可维护性**：消息流清晰，组件独立
-5. **SQLite = 零运维存储**：简单可靠，无需外部服务
+5. **SQLite + 可选 RabitQ = 零运维主存储与语义增强**：默认简单可靠，需要语义召回时再开启向量索引
 
 这套架构让 blockcell 在保持高性能和安全性的同时，具备了极强的可扩展性——无论是添加新工具、新渠道，还是让 AI 自己进化出新能力。
 
@@ -473,7 +477,7 @@ blockcell 的架构设计体现了几个核心原则：
 | 02 | 5分钟快速上手 |
 | 03 | 50+ 内置工具详解 |
 | 04 | Rhai 技能系统 |
-| 05 | SQLite 记忆系统 |
+| 05 | SQLite + 可选 RabitQ 记忆系统 |
 | 06 | 多渠道接入 |
 | 07 | CDP 浏览器自动化 |
 | 08 | Gateway 服务模式 |

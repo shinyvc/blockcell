@@ -61,6 +61,97 @@ Parameters:
 
 ---
 
+## The `agent` Tool: Fork Mode and Typed Agents
+
+Since v0.1.6, complex multi-step work should usually use the newer `agent` tool. It serves a different role from `spawn`:
+
+- omit `subagent_type`: run in **Fork mode**, inheriting the parent conversation context and prompt cache, then return the result synchronously
+- set `subagent_type`: run a **Typed Agent** in the background, return a `task_id`, and expose progress through `/tasks`
+- Typed Agents check for another running task of the same type by default; pass `force: true` only when you really need another one
+
+Built-in types:
+
+| Type | Use case |
+|------|----------|
+| `explore` | Fast read-only codebase exploration |
+| `plan` | Implementation planning and architecture decomposition |
+| `verification` | Testing, validation, and issue discovery |
+| `viper` | Production code implementation and refactoring |
+| `general` | Complex multi-step tasks that do not fit a specialist type |
+
+Example:
+
+```json
+{
+  "tool": "agent",
+  "params": {
+    "subagent_type": "explore",
+    "prompt": "Inspect the task cancellation path under crates/agent and list key files and risks.",
+    "description": "Cancellation path review"
+  }
+}
+```
+
+Without `subagent_type`, the same tool runs in Fork mode:
+
+```json
+{
+  "tool": "agent",
+  "params": {
+    "prompt": "Based on the current conversation, summarize the implementation risks."
+  }
+}
+```
+
+### Custom Agent Definitions
+
+Typed Agents can be loaded from Markdown files:
+
+- user-level: `~/.blockcell/workspace/agents/*.md`
+- project-level: `<project>/.blockcell/agents/*.md`
+- load order: built-in → user-level → project-level; later definitions with the same name override earlier ones
+
+Example `~/.blockcell/workspace/agents/code-reviewer.md`:
+
+```markdown
+---
+name: code-reviewer
+description: "Use this agent when a completed implementation needs review."
+tools: "read_file, grep, glob, exec"
+max_turns: 30
+one_shot: true
+permission_mode: Inherit
+color: blue
+---
+
+# Code Reviewer
+
+Review changed files, identify bugs and regressions, and report findings with severity and file locations.
+```
+
+Common frontmatter fields:
+
+| Field | Meaning |
+|------|---------|
+| `name` | Agent type name, 3-50 letters/digits/hyphens; required |
+| `description` | When to use this Agent; injected into the parent Agent's selection context; required |
+| `tools` | Allowed tool whitelist, comma-separated; omitted means no extra whitelist |
+| `disallowed_tools` | Denied tools, comma-separated |
+| `max_turns` | Maximum turn count |
+| `one_shot` | Whether this is a one-shot task; one-shot Agents cannot receive more messages after completion |
+| `permission_mode` | `Inherit` or `Bubble` |
+| `isolation` | `None` or `Worktree`; useful for coding Agents that need git worktree isolation |
+| `model` | Model override; omitted means inherit from the parent Agent |
+| `skills` | Preloaded skill names, comma-separated |
+| `mcp_servers` | Referenced MCP servers |
+| `initial_prompt` | Prompt injected before the first user message |
+| `background` | Whether to always run in the background |
+| `color` | UI display color |
+
+To prevent recursive delegation, runtime automatically denies `agent` and `spawn` inside custom Agents.
+
+---
+
 ## A practical demo
 
 ```
@@ -178,6 +269,7 @@ Subagents run with a restricted toolset and cannot use certain “dangerous” t
 - task queries (`list_tasks`)
 
 **Subagents cannot use:**
+- `agent` (cannot launch Fork/Typed Agents; prevents recursive delegation)
 - `spawn` (cannot spawn more subagents; prevents infinite recursion)
 - `message` (cannot send messages directly to channels)
 - `cron` (cannot create scheduled tasks)

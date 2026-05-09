@@ -29,7 +29,7 @@ blockcell setup [OPTIONS]
 | `--force` | 重置现有配置为默认值后再开始设置 |
 | `--provider <NAME>` | 指定 LLM provider（deepseek/openai/kimi/anthropic/gemini/zhipu/minimax/ollama） |
 | `--api-key <KEY>` | 指定 provider 的 API key |
-| `--model <MODEL>` | 指定模型名（如 deepseek-chat、moonshot-v1-8k、claude-sonnet-4-20250514） |
+| `--model <MODEL>` | 指定模型名（如 deepseek-v4-pro、moonshot-v1-8k、claude-sonnet-4-20250514） |
 | `--channel <NAME>` | 可选渠道配置（telegram/feishu/wecom/dingtalk/lark/none；`skip` 也兼容） |
 | `--skip-provider-test` | 跳过保存后的 provider 配置验证 |
 
@@ -57,7 +57,7 @@ blockcell setup [OPTIONS]
 blockcell setup
 
 # 非交互式，直接指定 provider
-blockcell setup --provider deepseek --api-key sk-xxx --model deepseek-chat
+blockcell setup --provider deepseek --api-key sk-xxx --model deepseek-v4-pro
 
 # 同时配置渠道
 blockcell setup --provider kimi --api-key sk-xxx --channel telegram
@@ -94,7 +94,7 @@ blockcell onboard [OPTIONS]
 | `--interactive` | 交互式向导模式 |
 | `--provider <NAME>` | 指定 LLM provider（如 deepseek、openai、kimi、anthropic） |
 | `--api-key <KEY>` | 指定 provider 的 API key |
-| `--model <MODEL>` | 指定模型名（如 deepseek-chat、moonshot-v1-8k） |
+| `--model <MODEL>` | 指定模型名（如 deepseek-v4-pro、moonshot-v1-8k） |
 | `--channels-only` | 仅更新渠道配置，跳过 provider 设置 |
 
 **示例：**
@@ -103,7 +103,7 @@ blockcell onboard [OPTIONS]
 blockcell onboard
 
 # 非交互式，直接指定 provider
-blockcell onboard --provider deepseek --api-key sk-xxx --model deepseek-chat
+blockcell onboard --provider deepseek --api-key sk-xxx --model deepseek-v4-pro
 
 # 仅重新配置渠道
 blockcell onboard --channels-only
@@ -147,18 +147,26 @@ blockcell agent -a ops -s work:finance
 blockcell agent --agent ops --model gpt-4o --provider openai
 ```
 
-**交互模式内置命令：**
+**统一斜杠命令：**
 
-在交互模式中，以 `/` 开头的输入为内置命令：
+在 CLI 交互模式中，以 `/` 开头的输入会先进入统一斜杠命令处理器。Gateway/WebSocket 与外部渠道也复用同一套处理逻辑；大多数命令本地执行，不消耗 LLM token，只有 `/learn` 和 `/compact` 会转交 runtime 继续处理。
 
 | 命令 | 说明 |
 |------|------|
 | `/help` | 显示帮助 |
+| `/tasks [status]` | 查看后台任务，可按 `running` / `completed` / `failed` / `cancelled` 过滤 |
 | `/tools` | 列出已加载工具 |
 | `/skills` | 列出已加载技能 |
-| `/status` | 显示系统状态 |
+| `/learn <描述>` | 让 Agent 学习一个新技能，会调用 LLM |
 | `/clear` | 清空当前会话历史 |
+| `/compact` | 手动触发会话历史压缩 |
+| `/clear-skills` | 清理技能学习/进化记录 |
+| `/forget-skill <名称>` | 删除指定技能的学习/进化记录 |
+| `/session-metrics [--json|--reset|--layer N]` | 查看或重置 7 层记忆系统指标 |
+| `/log status|level <LEVEL>|filter <TEXT>|console on/off|file on/off|clear` | 动态控制日志系统 |
 | `/exit` 或 `/quit` | 退出 |
+
+`/quit` 和 `/exit` 只在 CLI 模式可用；在外部渠道里会返回不可用提示。命令名必须完整匹配，例如 `/skills now` 不会误触发 `/skills`。
 
 ---
 
@@ -313,7 +321,7 @@ blockcell config set <KEY> <VALUE>
 
 **示例：**
 ```bash
-blockcell config set agents.defaults.model "deepseek-chat"
+blockcell config set agents.defaults.model "deepseek-v4-pro"
 blockcell config set network.proxy "http://127.0.0.1:7890"
 blockcell config set agents.defaults.maxTokens 4096
 ```

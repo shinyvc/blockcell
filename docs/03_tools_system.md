@@ -302,6 +302,31 @@ AI: office_write create_pptx，生成 report.pptx
 
 ---
 
+### 🤖 多智能体工具
+
+**`agent`** — 启动 Fork/Typed Agent
+```
+Fork 模式：省略 subagent_type，继承当前上下文并同步返回结果
+Typed Agent：指定 subagent_type，后台执行并返回 task_id
+内置类型：explore / plan / verification / viper / general
+```
+
+**`spawn`** — 启动后台子任务
+```
+适合：用户明确要求后台执行，或任务预计耗时较长
+限制：子任务不能继续调用 agent/spawn，防止递归失控
+```
+
+**`list_tasks`** — 查询后台任务
+```
+支持：按 running/completed/failed/cancelled 等状态过滤
+对应交互命令：/tasks
+```
+
+详细用法见：[子智能体与任务并发](./11_subagents.md)。
+
+---
+
 ### 🔧 系统信息工具
 
 **`system_info`** — 系统探针

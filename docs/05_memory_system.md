@@ -57,7 +57,7 @@ CREATE TABLE memory_vector_queue (
   operation TEXT NOT NULL,
   attempts INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
-  updated_at INTEGER NOT NULL
+  updated_at TEXT NOT NULL
 );
 ```
 

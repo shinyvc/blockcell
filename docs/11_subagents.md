@@ -61,6 +61,97 @@ blockcell 的**子智能体（Subagent）系统**解决了这个问题。
 
 ---
 
+## `agent` 工具：Fork 模式与 Typed Agent
+
+v0.1.6 之后，复杂多步任务推荐使用新的 `agent` 工具。它和 `spawn` 的定位不同：
+
+- 省略 `subagent_type`：进入 **Fork 模式**，继承父会话上下文和 prompt cache，同步执行并直接返回结果
+- 指定 `subagent_type`：进入 **Typed Agent 模式**，后台启动指定类型的 agent，返回 `task_id` 并进入 `/tasks` 进度视图
+- 同类型 Typed Agent 默认会做重复运行检查；确实需要并行启动时可传 `force: true`
+
+内置类型包括：
+
+| 类型 | 适用场景 |
+|------|----------|
+| `explore` | 快速、只读地探索代码库 |
+| `plan` | 设计实现方案、拆解架构步骤 |
+| `verification` | 跑测试、验证结果、尝试发现问题 |
+| `viper` | 编写生产代码、重构和实现功能 |
+| `general` | 无法归入专门类型的复杂多步任务 |
+
+调用示例：
+
+```json
+{
+  "tool": "agent",
+  "params": {
+    "subagent_type": "explore",
+    "prompt": "检查 crates/agent 中任务取消链路的实现，列出关键文件和潜在风险",
+    "description": "取消链路检查"
+  }
+}
+```
+
+如果不传 `subagent_type`，则是 Fork 模式：
+
+```json
+{
+  "tool": "agent",
+  "params": {
+    "prompt": "基于当前对话上下文，整理一份简短的实现风险清单"
+  }
+}
+```
+
+### 自定义 Agent 定义
+
+Typed Agent 可以从 Markdown 文件加载：
+
+- 用户级：`~/.blockcell/workspace/agents/*.md`
+- 项目级：`<project>/.blockcell/agents/*.md`
+- 加载顺序：内置 → 用户级 → 项目级；后加载的同名 Agent 会覆盖前者
+
+示例 `~/.blockcell/workspace/agents/code-reviewer.md`：
+
+```markdown
+---
+name: code-reviewer
+description: "Use this agent when a completed implementation needs review."
+tools: "read_file, grep, glob, exec"
+max_turns: 30
+one_shot: true
+permission_mode: Inherit
+color: blue
+---
+
+# Code Reviewer
+
+Review changed files, identify bugs and regressions, and report findings with severity and file locations.
+```
+
+常用 frontmatter 字段：
+
+| 字段 | 说明 |
+|------|------|
+| `name` | Agent 类型名，3-50 个字母/数字/连字符，必填 |
+| `description` | 使用场景描述，会注入给主 Agent 作为选择依据，必填 |
+| `tools` | 允许工具白名单，逗号分隔；缺省表示不额外限制 |
+| `disallowed_tools` | 禁止工具列表，逗号分隔 |
+| `max_turns` | 最大轮次限制 |
+| `one_shot` | 是否一次性任务；一次性 Agent 完成后不能继续被发送消息 |
+| `permission_mode` | `Inherit` 或 `Bubble` |
+| `isolation` | `None` 或 `Worktree`，代码实现类 Agent 可用 worktree 隔离 |
+| `model` | 覆盖使用的模型；缺省继承父 Agent |
+| `skills` | 预加载 skill 名称，逗号分隔 |
+| `mcp_servers` | 可引用的 MCP server 列表 |
+| `initial_prompt` | 首轮提示注入 |
+| `background` | 是否始终后台运行 |
+| `color` | UI 展示颜色 |
+
+为避免递归失控，运行时会自动禁止自定义 Agent 再调用 `agent` 和 `spawn`。
+
+---
+
 ## 实际演示
 
 ```
@@ -178,6 +269,7 @@ async fn run_loop(&mut self) {
 - 查询任务状态（list_tasks）
 
 **子智能体不能使用：**
+- `agent`（不能再启动 Fork/Typed Agent，防止递归委派）
 - `spawn`（不能再派生子智能体，防止无限递归）
 - `message`（不能直接发消息到渠道）
 - `cron`（不能创建定时任务）

@@ -118,9 +118,9 @@ nano ~/.blockcell/config.json5
 
 Find the `providers` section and fill in your API key.
 
-### Option A: DeepSeek (cheap; recommended for beginners)
+### Option A: DeepSeek (recommended for beginners)
 
-DeepSeek’s API is very inexpensive and great for testing:
+`blockcell setup --provider deepseek` currently defaults to `deepseek-v4-pro` and configures a 1M-token `maxContextTokens` value. You can still pass `--model deepseek-chat` explicitly if you want the older chat model.
 
 ```json
 {
@@ -132,7 +132,10 @@ DeepSeek’s API is very inexpensive and great for testing:
   },
   "agents": {
     "defaults": {
-      "model": "deepseek-chat"
+      "model": "deepseek-v4-pro",
+      "provider": "deepseek",
+      "maxContextTokens": 1048576,
+      "reasoningEffort": "high"
     }
   }
 }
@@ -205,7 +208,7 @@ Example output:
 
 ```
 ✓ Config loaded
-✓ Provider: deepseek (deepseek-chat)
+✓ Provider: deepseek (deepseek-v4-pro)
 ✓ Workspace: ~/.blockcell/workspace
 ✓ Memory: SQLite (0 items)
 ✓ Skills: 0 user skills, 44 builtin skills
