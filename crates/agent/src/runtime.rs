@@ -9335,7 +9335,11 @@ impl LightweightRuntimeHandle {
             .output()
             .await;
 
-        if output.is_err() || !output.unwrap().status.success() {
+        if let Ok(output) = output {
+            if !output.status.success() {
+                tracing::warn!("Failed to remove worktree: {}", worktree_name);
+            }
+        } else {
             tracing::warn!("Failed to remove worktree: {}", worktree_name);
         }
 
@@ -9345,8 +9349,10 @@ impl LightweightRuntimeHandle {
             .output()
             .await;
 
-        if output.is_ok() && output.unwrap().status.success() {
-            tracing::info!("Cleaned up worktree and branch {}", worktree_name);
+        if let Ok(output) = output {
+            if output.status.success() {
+                tracing::info!("Cleaned up worktree and branch {}", worktree_name);
+            }
         }
     }
 }

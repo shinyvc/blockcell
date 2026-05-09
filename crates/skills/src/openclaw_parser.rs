@@ -76,6 +76,7 @@ struct OpenClawInstallSpecRaw {
 /// 1. meta.yaml / meta.json（BlockCell 原生格式，短描述）
 /// 2. SKILL.md frontmatter（OpenClaw 格式）
 /// 3. SKILL.md 正文首行（fallback）
+///
 /// 返回空字符串表示无描述。
 pub fn read_skill_description(skill_dir: &Path) -> String {
     // 1. meta.yaml（BlockCell 原生格式优先）
@@ -114,8 +115,7 @@ pub fn read_skill_description(skill_dir: &Path) -> String {
             let content = content.replace("\r\n", "\n");
 
             // OpenClaw 格式：用 serde_yaml 解析 frontmatter
-            if content.starts_with("---") {
-                let rest = &content[3..];
+            if let Some(rest) = content.strip_prefix("---") {
                 if let Some(end) = rest.find("\n---") {
                     let yaml = rest[..end].trim();
                     if let Ok(val) = serde_yaml::from_str::<serde_json::Value>(yaml) {

@@ -294,6 +294,7 @@ fn collect_skill_search_entries_recursive(
     check_skill: &dyn Fn(&std::path::Path, &str, &str) -> Option<serde_json::Value>,
     out: &mut Vec<serde_json::Value>,
 ) {
+    let _ = query; // only used in recursion
     if !dir.exists() {
         return;
     }
@@ -399,6 +400,7 @@ fn collect_skill_search_entries_filtered_recursive(
     check_skill: &dyn Fn(&std::path::Path, &str, &str) -> Option<serde_json::Value>,
     out: &mut Vec<serde_json::Value>,
 ) {
+    let _ = query; // only used in recursion
     if !dir.exists() {
         return;
     }

@@ -858,8 +858,14 @@ mod tests {
 
     #[test]
     fn test_path_traversal_security() {
+        use std::fs;
+
         // 测试路径遍历安全：文件名匹配不应绕过目录边界检查
-        let memory_dir = Path::new("/safe/memory/dir");
+        // 使用临时目录确保 memory_dir 存在（is_auto_mem_path 要求目录存在才允许创建新文件）
+        let temp_dir = std::env::temp_dir().join("blockcell_test_path_traversal");
+        fs::create_dir_all(&temp_dir).ok();
+        let memory_dir = &temp_dir;
+        let memory_dir_str = memory_dir.to_str().unwrap();
 
         // 路径不在 memory_dir 内，即使文件名匹配也应返回 false
         assert!(!is_auto_mem_path("/etc/user.md", memory_dir));
@@ -870,20 +876,20 @@ mod tests {
 
         // 路径在 memory_dir 内且不含 .. 组件时，即使路径不存在也返回 true
         // 这是允许创建新文件的合理行为
-        let result = is_auto_mem_path("/safe/memory/dir/user.md", memory_dir);
+        let new_file_path = format!("{}/user.md", memory_dir_str);
+        let result = is_auto_mem_path(&new_file_path, memory_dir);
         assert!(
             result,
             "path under memory_dir without .. should be allowed for new file creation"
         );
 
         // 路径遍历攻击：含 .. 组件的路径即使在 memory_dir 前缀下也应被拒绝
-        assert!(!is_auto_mem_path(
-            "/safe/memory/dir/../../../etc/passwd",
-            memory_dir
-        ));
-        assert!(!is_auto_mem_path(
-            "/safe/memory/dir/../../root/.ssh/id_rsa",
-            memory_dir
-        ));
+        let traversal_path1 = format!("{}/../../../etc/passwd", memory_dir_str);
+        assert!(!is_auto_mem_path(&traversal_path1, memory_dir));
+        let traversal_path2 = format!("{}/../../root/.ssh/id_rsa", memory_dir_str);
+        assert!(!is_auto_mem_path(&traversal_path2, memory_dir));
+
+        // 清理临时目录
+        fs::remove_dir_all(&temp_dir).ok();
     }
 }
