@@ -2851,11 +2851,15 @@ var init_store = __esm({
                 ...m,
                 content: finalContent ?? m.content,
                 streaming: false,
+                // message_done 携带 reasoning_content 时更新 reasoning 字段
+                reasoning: event.reasoning_content ?? m.reasoning,
                 media: event.media && event.media.length > 0 ? [.../* @__PURE__ */ new Set([...m.media || [], ...event.media])] : m.media
               }));
             } else if (lastMsg?.role === "assistant" && !lastMsg.streaming && (lastMsg.content || "") === (event.content || "")) {
               state.updateLastAssistantMessage((m) => ({
                 ...m,
+                // message_done 携带 reasoning_content 时补入 reasoning 字段
+                reasoning: event.reasoning_content ?? m.reasoning,
                 media: event.media && event.media.length > 0 ? [.../* @__PURE__ */ new Set([...m.media || [], ...event.media])] : m.media,
                 highlight: m.highlight || highlight
               }));
@@ -2864,6 +2868,7 @@ var init_store = __esm({
                 id: nextMsgId(),
                 role: "assistant",
                 content: event.content || "",
+                reasoning: event.reasoning_content || void 0,
                 timestamp: Date.now(),
                 streaming: false,
                 media: event.media && event.media.length > 0 ? event.media : void 0,
@@ -2914,18 +2919,32 @@ var init_store = __esm({
           }
           case "thinking": {
             set((s) => {
+              const delta = event.content || "";
+              if (!delta) return {};
               const lastMsg = s.messages[s.messages.length - 1];
               if (lastMsg?.role === "assistant" && lastMsg.streaming) {
                 const msgs = [...s.messages];
                 for (let i = msgs.length - 1; i >= 0; i--) {
                   if (msgs[i].role === "assistant") {
-                    msgs[i] = { ...msgs[i], reasoning: (msgs[i].reasoning || "") + (event.content || "") };
+                    msgs[i] = { ...msgs[i], reasoning: (msgs[i].reasoning || "") + delta };
                     break;
                   }
                 }
                 return { messages: msgs };
               }
-              return {};
+              return {
+                messages: [
+                  ...s.messages,
+                  {
+                    id: nextMsgId(),
+                    role: "assistant",
+                    content: "",
+                    reasoning: delta,
+                    timestamp: Date.now(),
+                    streaming: true
+                  }
+                ]
+              };
             });
             break;
           }
@@ -3289,6 +3308,41 @@ test("session_bound names a new session from the first user message before refre
   assert.equal(sessions.length, 1);
   assert.equal(sessions[0].id, "default_1777350000000");
   assert.equal(sessions[0].name, "\u67E5\u770B\u6DF1\u5733\u660E\u5929\u5929\u6C14");
+});
+test("thinking event creates streaming assistant message when no assistant exists", () => {
+  resetStore();
+  const store = useChatStore2.getState();
+  store.handleWsEvent({ type: "thinking", chat_id: "chat-1", content: "\u6211\u5728\u601D\u8003" });
+  const { messages } = useChatStore2.getState();
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].role, "assistant");
+  assert.equal(messages[0].streaming, true);
+  assert.equal(messages[0].reasoning, "\u6211\u5728\u601D\u8003");
+  assert.equal(messages[0].content, "");
+});
+test("token after thinking appends to the same assistant message", () => {
+  resetStore();
+  const store = useChatStore2.getState();
+  store.handleWsEvent({ type: "thinking", chat_id: "chat-1", content: "\u6211\u5728\u601D\u8003" });
+  store.handleWsEvent({ type: "token", chat_id: "chat-1", delta: "\u4F60\u597D\uFF01" });
+  const { messages } = useChatStore2.getState();
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].role, "assistant");
+  assert.equal(messages[0].reasoning, "\u6211\u5728\u601D\u8003");
+  assert.equal(messages[0].content, "\u4F60\u597D\uFF01");
+  assert.equal(messages[0].streaming, true);
+});
+test("message_done preserves reasoning and ends streaming after thinking-first flow", () => {
+  resetStore();
+  const store = useChatStore2.getState();
+  store.handleWsEvent({ type: "thinking", chat_id: "chat-1", content: "\u6211\u5728\u601D\u8003" });
+  store.handleWsEvent({ type: "token", chat_id: "chat-1", delta: "\u4F60\u597D\uFF01" });
+  store.handleWsEvent({ type: "message_done", chat_id: "chat-1", content: "\u4F60\u597D\uFF01" });
+  const { messages } = useChatStore2.getState();
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].streaming, false);
+  assert.equal(messages[0].reasoning, "\u6211\u5728\u601D\u8003");
+  assert.equal(messages[0].content, "\u4F60\u597D\uFF01");
 });
 /*! Bundled license information:
 

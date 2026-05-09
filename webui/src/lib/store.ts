@@ -354,6 +354,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             ...m,
             content: finalContent ?? m.content,
             streaming: false,
+            // message_done 携带 reasoning_content 时更新 reasoning 字段
+            reasoning: event.reasoning_content ?? m.reasoning,
             media: event.media && event.media.length > 0
               ? [...new Set([...(m.media || []), ...event.media])]
               : m.media,
@@ -365,17 +367,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
         ) {
           state.updateLastAssistantMessage((m) => ({
             ...m,
+            // message_done 携带 reasoning_content 时补入 reasoning 字段
+            reasoning: event.reasoning_content ?? m.reasoning,
             media: event.media && event.media.length > 0
               ? [...new Set([...(m.media || []), ...event.media])]
               : m.media,
             highlight: m.highlight || highlight,
           }));
         } else {
-          // New complete message
+          // Non-streaming path (outbound bridge, background delivery, etc.)
           state.addMessage({
             id: nextMsgId(),
             role: 'assistant',
             content: event.content || '',
+            reasoning: event.reasoning_content || undefined,
             timestamp: Date.now(),
             streaming: false,
             media: event.media && event.media.length > 0 ? event.media : undefined,
@@ -435,18 +440,35 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'thinking': {
         // 直接使用 set() 并在回调中获取最新状态，确保流式追加正确
         set((s) => {
+          const delta = event.content || '';
+          if (!delta) return {};
+
           const lastMsg = s.messages[s.messages.length - 1];
           if (lastMsg?.role === 'assistant' && lastMsg.streaming) {
             const msgs = [...s.messages];
             for (let i = msgs.length - 1; i >= 0; i--) {
               if (msgs[i].role === 'assistant') {
-                msgs[i] = { ...msgs[i], reasoning: (msgs[i].reasoning || '') + (event.content || '') };
+                msgs[i] = { ...msgs[i], reasoning: (msgs[i].reasoning || '') + delta };
                 break;
               }
             }
             return { messages: msgs };
           }
-          return {}; // 无变化
+
+          // thinking 先于 token 到达时，创建 assistant streaming message
+          return {
+            messages: [
+              ...s.messages,
+              {
+                id: nextMsgId(),
+                role: 'assistant',
+                content: '',
+                reasoning: delta,
+                timestamp: Date.now(),
+                streaming: true,
+              },
+            ],
+          };
         });
         break;
       }

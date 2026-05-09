@@ -146,6 +146,11 @@ enum WsEvent {
         chat_id: String,
         task_id: String,
         content: String,
+        /// LLM 推理/思考内容（如 DeepSeek thinking mode）。
+        /// 作为独立字段发送，前端可在折叠的"思考"区域渲染，
+        /// 而非混入 content 正文。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
         tool_calls: usize,
         duration_ms: u64,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

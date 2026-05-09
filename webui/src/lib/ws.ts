@@ -29,6 +29,7 @@ export interface WsEvent {
   task_id?: string;
   delta?: string;
   content?: string;
+  reasoning_content?: string;
   tool?: string;
   call_id?: string;
   params?: any;

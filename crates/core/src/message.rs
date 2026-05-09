@@ -56,6 +56,10 @@ pub struct OutboundMessage {
     pub account_id: Option<String>,
     pub chat_id: String,
     pub content: String,
+    /// LLM 推理/思考内容（如 DeepSeek thinking mode）。
+    /// 渠道可用此在 content 前插入换行分隔后拼接显示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
     #[serde(default)]
@@ -76,10 +80,21 @@ impl OutboundMessage {
             account_id: None,
             chat_id: chat_id.to_string(),
             content: content.to_string(),
+            reasoning_content: None,
             reply_to: None,
             media: vec![],
             metadata: serde_json::Value::Null,
             skip_ws_echo: false,
+        }
+    }
+
+    /// 返回完整显示内容，将 reasoning（如有）拼接到 content 前面，
+    /// 用换行分隔。**仅用于 CLI 打印 / debug / UI 展示辅助**，
+    /// 不要用于 Telegram/Slack 等外部渠道发送（渠道应直接用 content）。
+    pub fn display_content(&self) -> String {
+        match &self.reasoning_content {
+            Some(r) if !r.is_empty() => format!("{}\n{}", r, self.content),
+            _ => self.content.clone(),
         }
     }
 }

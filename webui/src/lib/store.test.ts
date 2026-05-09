@@ -192,3 +192,49 @@ test('session_bound names a new session from the first user message before refre
   assert.equal(sessions[0].id, 'default_1777350000000');
   assert.equal(sessions[0].name, '查看深圳明天天气');
 });
+
+// ── Thinking-first streaming tests ──
+
+test('thinking event creates streaming assistant message when no assistant exists', () => {
+  resetStore();
+  const store = useChatStore.getState();
+
+  store.handleWsEvent({ type: 'thinking', chat_id: 'chat-1', content: '我在思考' });
+
+  const { messages } = useChatStore.getState();
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].role, 'assistant');
+  assert.equal(messages[0].streaming, true);
+  assert.equal(messages[0].reasoning, '我在思考');
+  assert.equal(messages[0].content, '');
+});
+
+test('token after thinking appends to the same assistant message', () => {
+  resetStore();
+  const store = useChatStore.getState();
+
+  store.handleWsEvent({ type: 'thinking', chat_id: 'chat-1', content: '我在思考' });
+  store.handleWsEvent({ type: 'token', chat_id: 'chat-1', delta: '你好！' });
+
+  const { messages } = useChatStore.getState();
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].role, 'assistant');
+  assert.equal(messages[0].reasoning, '我在思考');
+  assert.equal(messages[0].content, '你好！');
+  assert.equal(messages[0].streaming, true);
+});
+
+test('message_done preserves reasoning and ends streaming after thinking-first flow', () => {
+  resetStore();
+  const store = useChatStore.getState();
+
+  store.handleWsEvent({ type: 'thinking', chat_id: 'chat-1', content: '我在思考' });
+  store.handleWsEvent({ type: 'token', chat_id: 'chat-1', delta: '你好！' });
+  store.handleWsEvent({ type: 'message_done', chat_id: 'chat-1', content: '你好！' });
+
+  const { messages } = useChatStore.getState();
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].streaming, false);
+  assert.equal(messages[0].reasoning, '我在思考');
+  assert.equal(messages[0].content, '你好！');
+});

@@ -122,7 +122,13 @@ fn collect_skill_entries_recursive(
                 // 若同时是 skill 包（含 manifest.json），也递归扫描子目录
                 // 使用 sub_category 保持路径完整，确保子 skill 可被 SkillFileStore 解析
                 if path.join("manifest.json").exists() {
-                    collect_skill_entries_recursive(&path, source, &sub_category, disabled_skills, out);
+                    collect_skill_entries_recursive(
+                        &path,
+                        source,
+                        &sub_category,
+                        disabled_skills,
+                        out,
+                    );
                 }
                 continue;
             }
