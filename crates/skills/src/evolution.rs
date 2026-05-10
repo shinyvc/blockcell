@@ -397,10 +397,19 @@ impl SkillEvolution {
             if let Some(ref dir) = record.context.staging_skills_dir {
                 let p = PathBuf::from(dir);
                 if p.is_absolute() {
-                    // Validate: staging dir must be within the skills directory tree
-                    // to prevent path traversal attacks
+                    // Validate: staging dir must be within the workspace directory tree
+                    // (the parent of skills_dir) to prevent path traversal attacks.
+                    // This allows sibling directories like workspace/import_staging/skills
+                    // while rejecting arbitrary paths outside the workspace.
                     if let Ok(canonical_staging) = p.canonicalize() {
                         if let Ok(canonical_skills) = self.skills_dir.canonicalize() {
+                            let canonical_workspace = canonical_skills.parent();
+                            if let Some(workspace) = canonical_workspace {
+                                if canonical_staging.starts_with(workspace) {
+                                    return p;
+                                }
+                            }
+                            // Fallback: also accept if staging is within skills_dir itself
                             if canonical_staging.starts_with(&canonical_skills) {
                                 return p;
                             }
@@ -408,7 +417,7 @@ impl SkillEvolution {
                     }
                     warn!(
                         path = %dir,
-                        "staging_skills_dir is outside skills directory tree, ignoring"
+                        "staging_skills_dir is outside workspace directory tree, ignoring"
                     );
                 }
             }
@@ -2736,12 +2745,17 @@ or\n\
             // Clean up the staging root directory after successful promote.
             // The skill subdirectory was already moved/removed above, but the
             // parent staging directory (staging_skills_dir) may still exist as
-            // an orphan. Remove it to prevent accumulation of empty staging dirs.
+            // an orphan. Only remove it if empty to avoid deleting other staged skills.
             if let Some(ref staging_dir) = record.context.staging_skills_dir {
                 let staging_path = PathBuf::from(staging_dir);
                 if staging_path.exists() {
-                    if let Err(e) = std::fs::remove_dir_all(&staging_path) {
-                        warn!(path = %staging_dir, error = %e, "Failed to clean up staging directory after promote");
+                    // Try to remove only if the directory is empty
+                    if std::fs::read_dir(&staging_path)
+                        .is_ok_and(|mut entries| entries.next().is_none())
+                    {
+                        if let Err(e) = std::fs::remove_dir(&staging_path) {
+                            warn!(path = %staging_dir, error = %e, "Failed to clean up empty staging directory after promote");
+                        }
                     }
                 }
             }
@@ -2872,12 +2886,20 @@ or\n\
 
         // 先写入临时文件
         std::fs::write(&temp_file, &json)?;
-        // On Windows, rename fails if destination exists — remove it first
+        // Atomically replace the record file.
+        // On Windows, rename over existing file fails, so we use a backup-based approach:
+        // 1. Rename existing file to .bak (preserves data if next step fails)
+        // 2. Rename temp file to target
+        // 3. Remove .bak backup
+        // If step 2 fails, the .bak file can be restored; no data loss.
         if record_file.exists() {
-            let _ = std::fs::remove_file(&record_file);
+            let backup_path = record_file.with_extension("json.bak");
+            let _ = std::fs::rename(&record_file, &backup_path);
+            std::fs::rename(&temp_file, &record_file)?;
+            let _ = std::fs::remove_file(&backup_path);
+        } else {
+            std::fs::rename(&temp_file, &record_file)?;
         }
-        // 原子重命名（同一文件系统上是原子操作）
-        std::fs::rename(&temp_file, &record_file)?;
 
         Ok(())
     }

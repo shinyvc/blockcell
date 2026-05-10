@@ -1438,11 +1438,20 @@ impl CoreEvolution {
         ));
         let json = serde_json::to_string_pretty(record)?;
         std::fs::write(&temp_file, &json)?;
-        // On Windows, rename fails if destination exists — remove it first
+        // Atomically replace the record file.
+        // On Windows, rename over existing file fails, so we use a backup-based approach:
+        // 1. Rename existing file to .bak (preserves data if next step fails)
+        // 2. Rename temp file to target
+        // 3. Remove .bak backup
+        // If step 2 fails, the .bak file can be restored; no data loss.
         if record_file.exists() {
-            let _ = std::fs::remove_file(&record_file);
+            let backup_path = record_file.with_extension("json.bak");
+            let _ = std::fs::rename(&record_file, &backup_path);
+            std::fs::rename(&temp_file, &record_file)?;
+            let _ = std::fs::remove_file(&backup_path);
+        } else {
+            std::fs::rename(&temp_file, &record_file)?;
         }
-        std::fs::rename(&temp_file, &record_file)?;
         Ok(())
     }
 
