@@ -155,12 +155,37 @@ impl VersionManager {
             )));
         }
 
-        // 取列表中的倒数第二个版本（比 parent_version 字段更可靠，
-        // 因为 parent_version 可能指向已被 cleanup_old_versions 删除的版本）
-        let prev_version = &history.versions[history.versions.len() - 2];
-        let prev_version_str = prev_version.version.clone();
-        let current_version_str = history.current_version.clone();
+        // Find the current version entry to get its parent_version
+        let current_version = &history.current_version;
+        let current_entry = history.versions.iter().find(|v| &v.version == current_version);
 
+        // Try parent_version field first (more reliable than index-based lookup),
+        // then fall back to the second-to-last entry if parent_version is missing
+        // or points to a version that was cleaned up.
+        let prev_version_str = if let Some(entry) = current_entry {
+            if let Some(ref parent_ver) = entry.parent_version {
+                // Verify the parent version still exists in history
+                if history.versions.iter().any(|v| &v.version == parent_ver) {
+                    parent_ver.clone()
+                } else {
+                    // Parent was cleaned up — fall back to index-based
+                    warn!(
+                        skill = %skill_name,
+                        parent = %parent_ver,
+                        "Parent version was cleaned up, falling back to index-based rollback"
+                    );
+                    history.versions[history.versions.len() - 2].version.clone()
+                }
+            } else {
+                // No parent_version field — fall back to index-based
+                history.versions[history.versions.len() - 2].version.clone()
+            }
+        } else {
+            // Current version not found in list — fall back to index-based
+            history.versions[history.versions.len() - 2].version.clone()
+        };
+
+        let current_version_str = history.current_version.clone();
         self.switch_to_version(skill_name, &prev_version_str)?;
 
         warn!(
@@ -566,9 +591,24 @@ impl VersionManager {
         }
 
         let skill_dir = self.skills_dir.join(skill_name);
+        // Write snapshot to a temp dir first, then swap — avoids broken state on crash.
+        // If the process crashes after clearing but before copying, the temp dir still
+        // has the data and we can retry.
+        let temp_restore_dir = skill_dir.with_extension("restore_tmp");
 
+        // Clean up any leftover temp dir from a previous failed restore
+        if temp_restore_dir.exists() {
+            let _ = std::fs::remove_dir_all(&temp_restore_dir);
+        }
+
+        Self::copy_dir_contents(&snapshot_dir, &temp_restore_dir, &["version.json"])?;
         Self::clear_skill_asset_tree(&skill_dir)?;
-        Self::copy_dir_contents(&snapshot_dir, &skill_dir, &["version.json"])?;
+
+        // Move from temp to skill dir — if this fails, temp_restore_dir still has the data
+        Self::copy_dir_contents(&temp_restore_dir, &skill_dir, &[])?;
+
+        // Clean up temp dir
+        let _ = std::fs::remove_dir_all(&temp_restore_dir);
 
         Ok(())
     }

@@ -9,8 +9,11 @@ use blockcell_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+static CORE_RECORD_TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn default_max_attempts() -> u32 {
     3
@@ -1226,6 +1229,17 @@ impl CoreEvolution {
         // Check 3: For scripts, try a dry-run with empty input
         match record.provider_kind {
             ProviderKind::Process | ProviderKind::BuiltIn => {
+                // Use cmd on Windows, bash on Unix
+                #[cfg(target_os = "windows")]
+                let output = tokio::process::Command::new("cmd")
+                    .arg("/C")
+                    .arg(artifact_path)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn();
+
+                #[cfg(not(target_os = "windows"))]
                 let output = tokio::process::Command::new("bash")
                     .arg(artifact_path)
                     .stdin(std::process::Stdio::piped())
@@ -1411,9 +1425,24 @@ impl CoreEvolution {
 
     fn save_record(&self, record: &CoreEvolutionRecord) -> Result<()> {
         std::fs::create_dir_all(&self.records_dir)?;
-        let file = self.records_dir.join(format!("{}.json", record.id));
+        let record_file = self.records_dir.join(format!("{}.json", record.id));
+        // Write-tmp-then-rename: avoids file corruption if process crashes mid-write
+        let counter = CORE_RECORD_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let temp_file = self.records_dir.join(format!(
+            "{}.json.tmp_{}_{}_{}",
+            record.id,
+            chrono::Utc::now().timestamp_millis(),
+            pid,
+            counter
+        ));
         let json = serde_json::to_string_pretty(record)?;
-        std::fs::write(file, json)?;
+        std::fs::write(&temp_file, &json)?;
+        // On Windows, rename fails if destination exists — remove it first
+        if record_file.exists() {
+            let _ = std::fs::remove_file(&record_file);
+        }
+        std::fs::rename(&temp_file, &record_file)?;
         Ok(())
     }
 

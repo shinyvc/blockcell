@@ -397,7 +397,19 @@ impl SkillEvolution {
             if let Some(ref dir) = record.context.staging_skills_dir {
                 let p = PathBuf::from(dir);
                 if p.is_absolute() {
-                    return p;
+                    // Validate: staging dir must be within the skills directory tree
+                    // to prevent path traversal attacks
+                    if let Ok(canonical_staging) = p.canonicalize() {
+                        if let Ok(canonical_skills) = self.skills_dir.canonicalize() {
+                            if canonical_staging.starts_with(&canonical_skills) {
+                                return p;
+                            }
+                        }
+                    }
+                    warn!(
+                        path = %dir,
+                        "staging_skills_dir is outside skills directory tree, ignoring"
+                    );
                 }
             }
         }
@@ -2458,8 +2470,10 @@ or\n\
                     return Ok((false, Some(message)));
                 }
                 Err(e) => {
+                    // Syntax checker unavailable — treat as failure rather than
+                    // silently passing an unverified script.
                     return Ok((
-                        true,
+                        false,
                         Some(format!(
                             "Syntax checker unavailable or failed to run: {}",
                             e
@@ -2718,6 +2732,19 @@ or\n\
                 to = %self.skills_dir.display(),
                 "🚚 [promote] External skill promoted into main skills directory"
             );
+
+            // Clean up the staging root directory after successful promote.
+            // The skill subdirectory was already moved/removed above, but the
+            // parent staging directory (staging_skills_dir) may still exist as
+            // an orphan. Remove it to prevent accumulation of empty staging dirs.
+            if let Some(ref staging_dir) = record.context.staging_skills_dir {
+                let staging_path = PathBuf::from(staging_dir);
+                if staging_path.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&staging_path) {
+                        warn!(path = %staging_dir, error = %e, "Failed to clean up staging directory after promote");
+                    }
+                }
+            }
         }
 
         // 通过 VersionManager 创建版本快照
@@ -2845,6 +2872,10 @@ or\n\
 
         // 先写入临时文件
         std::fs::write(&temp_file, &json)?;
+        // On Windows, rename fails if destination exists — remove it first
+        if record_file.exists() {
+            let _ = std::fs::remove_file(&record_file);
+        }
         // 原子重命名（同一文件系统上是原子操作）
         std::fs::rename(&temp_file, &record_file)?;
 
