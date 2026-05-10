@@ -81,13 +81,32 @@ pub struct GhostMaintenanceService {
     sync_tracker: SyncTracker,
 }
 
+/// Default cron schedule used when the configured schedule is invalid.
+/// Runs every 6 hours: minute=0, hour=every-6th, dom=*, month=*, dow=*
+const DEFAULT_CRON_SCHEDULE: &str = "0 */6 * * *";
+
 impl GhostMaintenanceService {
+    /// Normalize and validate a cron schedule expression.
+    ///
+    /// The `cron` crate expects 6 or 7 fields (with optional seconds prefix).
+    /// - 5 fields (min hour dom month dow): prepend "0" seconds field.
+    /// - 6 fields (sec min hour dom month dow): use as-is.
+    /// - 7 fields (sec min hour dom month dow year): use as-is.
+    /// Any other field count falls back to [`DEFAULT_CRON_SCHEDULE`].
     fn normalize_cron_schedule(expr: &str) -> String {
-        let parts: Vec<&str> = expr.split_whitespace().filter(|p| !p.is_empty()).collect();
-        if parts.len() == 5 {
-            format!("0 {}", expr.trim())
-        } else {
-            expr.trim().to_string()
+        let trimmed = expr.trim();
+        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+        match fields.len() {
+            5 => format!("0 {}", trimmed),
+            6 | 7 => trimmed.to_string(),
+            _ => {
+                warn!(
+                    schedule = %trimmed,
+                    field_count = fields.len(),
+                    "Invalid cron schedule (expected 5-7 fields), using default"
+                );
+                format!("0 {}", DEFAULT_CRON_SCHEDULE)
+            }
         }
     }
 

@@ -310,6 +310,9 @@ pub struct EvolutionService {
     config: EvolutionServiceConfig,
     /// 可选的 LLM provider，设置后 tick() 会自动驱动完整进化 pipeline
     llm_provider: Option<Arc<dyn LLMProvider>>,
+    /// Callback invoked after a successful skill deployment.
+    /// Used to invalidate caches (e.g. SkillDocCache) in the runtime.
+    deploy_callback: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl EvolutionService {
@@ -628,6 +631,7 @@ impl EvolutionService {
             pipeline_locks: Arc::new(Mutex::new(HashSet::new())),
             config,
             llm_provider: None,
+            deploy_callback: None,
         }
     }
 
@@ -635,6 +639,13 @@ impl EvolutionService {
     /// 应在 agent 启动时调用，传入与主 agent 相同的 provider。
     pub fn set_llm_provider(&mut self, provider: Arc<dyn LLMProvider>) {
         self.llm_provider = Some(provider);
+    }
+
+    /// Set a callback to be invoked after a successful skill deployment.
+    /// The callback receives the skill name as its argument.
+    /// Used to invalidate caches (e.g. SkillDocCache) after evolution deploy.
+    pub fn set_deploy_callback(&mut self, callback: Arc<dyn Fn(&str) + Send + Sync>) {
+        self.deploy_callback = Some(callback);
     }
 
     /// 报告技能执行错误
@@ -1242,6 +1253,10 @@ impl EvolutionService {
                         skill_name
                     );
                     // Observation stats already initialized in run_single_evolution
+                    // Invoke deploy callback to invalidate caches (e.g. SkillDocCache)
+                    if let Some(ref cb) = self.deploy_callback {
+                        cb(skill_name);
+                    }
                 }
                 Ok(false) => {
                     warn!(
@@ -1721,9 +1736,8 @@ impl EvolutionService {
             }
         };
 
-        let mut active = self.active_evolutions.lock().await;
-        let active_count_before = active.len();
-
+        // Collect candidate records first (before acquiring any locks)
+        let mut candidates: Vec<(String, String)> = Vec::new(); // (skill_name, evolution_id)
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_none_or(|e| e != "json") {
@@ -1740,26 +1754,44 @@ impl EvolutionService {
                 Err(_) => continue,
             };
 
-            // Adopt every state the durable worker can resume, plus observation.
-            let dominated = Self::is_in_progress_status(&record.status);
-            if !dominated {
+            if !Self::is_in_progress_status(&record.status) {
                 continue;
             }
 
-            // Skip if already tracked
-            if active.contains_key(&record.skill_name) {
+            candidates.push((record.skill_name.clone(), record.id.clone()));
+        }
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        // Acquire pipeline locks to avoid conflicts with concurrent pipeline processing.
+        // Check each candidate against both active_evolutions and pipeline_locks.
+        let pipeline_guard = self.pipeline_locks.lock().await;
+        let mut active = self.active_evolutions.lock().await;
+        let active_count_before = active.len();
+
+        for (skill_name, evolution_id) in candidates {
+            // Skip if already tracked in active_evolutions
+            if active.contains_key(&skill_name) {
+                continue;
+            }
+
+            // Skip if already being processed by the pipeline
+            if pipeline_guard.contains(&evolution_id) {
                 continue;
             }
 
             info!(
-                skill = %record.skill_name,
-                evolution_id = %record.id,
-                status = ?record.status,
-                "🧠 [自进化] 从磁盘发现孤立的进化记录，已接管: {} ({:?})",
-                record.id, record.status
+                skill = %skill_name,
+                evolution_id = %evolution_id,
+                "🧠 [自进化] 从磁盘发现孤立的进化记录，已接管: {}",
+                evolution_id
             );
-            active.insert(record.skill_name.clone(), record.id.clone());
+            active.insert(skill_name, evolution_id);
         }
+
+        drop(pipeline_guard);
 
         let adopted = active.len() - active_count_before;
         if adopted > 0 {

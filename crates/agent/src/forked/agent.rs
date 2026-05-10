@@ -1974,14 +1974,15 @@ fn validate_skill_frontmatter(content: &str) -> Vec<String> {
 
     // 提取 frontmatter 内容
     let after_first = &trimmed[3..]; // skip leading ---
-    let fm_end = after_first.find("\n---");
-    if fm_end.is_none() {
-        // 尝试只到文件末尾
-        issues.push("Unclosed YAML frontmatter: missing closing '---'".to_string());
-        return issues;
-    }
+    let fm_end = match after_first.find("\n---") {
+        Some(pos) => pos,
+        None => {
+            issues.push("Unclosed YAML frontmatter: missing closing '---'".to_string());
+            return issues;
+        }
+    };
 
-    let fm_content = &after_first[..fm_end.unwrap()];
+    let fm_content = &after_first[..fm_end];
 
     // 检查必需的 name 字段 (包括空值检查)
     let has_valid_name = fm_content.lines().any(|line| {

@@ -127,7 +127,7 @@ fn check_patterns(code: &str, patterns: &[(&str, &str)], violations: &mut Vec<St
     for &(pattern, description) in patterns {
         if code.contains(pattern) {
             violations.push(StaticViolation {
-                severity: "warning",
+                severity: "error", // Dangerous operations must block deployment
                 rule: "dangerous_operation",
                 message: format!("{}: found `{}`", description, pattern),
             });
@@ -147,8 +147,8 @@ fn check_rhai_specific(code: &str, violations: &mut Vec<StaticViolation>) {
         });
     }
 
-    // Check for while true without break
-    if code.contains("while true") && !code.contains("break") {
+    // Check for while true without break (covers both "while true" and "while (true)")
+    if (code.contains("while true") || code.contains("while (true)")) && !code.contains("break") {
         violations.push(StaticViolation {
             severity: "error",
             rule: "infinite_loop",
@@ -346,10 +346,11 @@ import os
 os.system("rm -rf /")
 "#;
         let result = static_audit(&SkillType::Python, code);
+        assert!(!result.passed, "dangerous patterns should cause audit to fail");
         assert!(result
             .violations
             .iter()
-            .any(|v| v.rule == "dangerous_operation"));
+            .any(|v| v.rule == "dangerous_operation" && v.severity == "error"));
     }
 
     #[test]

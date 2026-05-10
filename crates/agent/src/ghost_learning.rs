@@ -140,9 +140,9 @@ impl GhostLearningPolicy {
             }
             GhostLearningBoundaryKind::DelegationEnd
             | GhostLearningBoundaryKind::EvolutionSuccess => {
-                if boundary.success {
-                    return LearningDecision::ReviewAfterResponse;
-                }
+                // Both successful and failed delegations/evolutions should be reviewed.
+                // Failures are important learning opportunities.
+                return LearningDecision::ReviewAfterResponse;
             }
             GhostLearningBoundaryKind::TurnEnd => {}
         }

@@ -238,6 +238,19 @@ impl EvolutionWorker {
                                 }
                             }
                         } else {
+                            // Check for cancellation before requeueing the next step
+                            if self.cancelled(&workflow) {
+                                info!(workflow_id = %workflow.id, "Workflow cancelled between steps");
+                                let _ = self.store.update_workflow_status_if_owned(
+                                    &workflow.id,
+                                    &self.worker_id,
+                                    "Cancelled",
+                                    None,
+                                );
+                                let _ = self.store.release_lease(&workflow.id, &self.worker_id);
+                                return;
+                            }
+
                             match self.store.update_workflow_status_if_owned(
                                 &workflow.id,
                                 &self.worker_id,
@@ -434,6 +447,17 @@ impl EvolutionWorker {
         });
 
         (stop_tx, handle)
+    }
+
+    /// Check whether the workflow has a pending cancel event.
+    fn cancelled(&self, workflow: &WorkflowRecord) -> bool {
+        match self.store.read_pending_events(&workflow.id) {
+            Ok(events) => events.iter().any(|event| event.event_type == "cancel"),
+            Err(e) => {
+                warn!(workflow_id = %workflow.id, error = %e, "Failed to read pending events for cancellation check");
+                false
+            }
+        }
     }
 
     /// Recover workflows with expired leases and retry-eligible workflows.

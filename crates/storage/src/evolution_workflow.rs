@@ -67,6 +67,19 @@ pub struct EvolutionWorkflowStore {
 }
 
 impl EvolutionWorkflowStore {
+    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        match self.inner.lock() {
+            Ok(guard) => Ok(guard),
+            Err(poisoned) => {
+                // Recover from mutex poisoning: the Connection is still valid,
+                // we just need to regain access. into_inner() gives us the
+                // Connection regardless of poison state.
+                tracing::warn!("evolution workflow mutex was poisoned, recovering");
+                Ok(poisoned.into_inner())
+            }
+        }
+    }
+
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path).map_err(map_sqlite_error)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
@@ -80,7 +93,7 @@ impl EvolutionWorkflowStore {
     }
 
     fn init_schema(&self) -> Result<()> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS evo_workflows (
                 id TEXT PRIMARY KEY,
@@ -143,7 +156,7 @@ impl EvolutionWorkflowStore {
     ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = now_rfc3339();
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         conn.execute(
             "INSERT INTO evo_workflows (id, capability_id, description, provider_kind, status, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, 'Requested', ?5, ?6)",
@@ -155,7 +168,7 @@ impl EvolutionWorkflowStore {
 
     /// Check if a capability already has an active or blocked workflow.
     pub fn is_active_or_blocked(&self, capability_id: &str) -> Result<bool> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM evo_workflows
@@ -177,7 +190,7 @@ impl EvolutionWorkflowStore {
         worker_id: &str,
         lease_duration_secs: i64,
     ) -> Result<Option<WorkflowRecord>> {
-        let mut conn = lock_conn(&self.inner);
+        let mut conn = self.lock_conn()?;
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let lease_until = (now + chrono::Duration::seconds(lease_duration_secs)).to_rfc3339();
@@ -248,7 +261,7 @@ impl EvolutionWorkflowStore {
         worker_id: &str,
         lease_duration_secs: i64,
     ) -> Result<bool> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let lease_until = (now + chrono::Duration::seconds(lease_duration_secs)).to_rfc3339();
@@ -264,7 +277,7 @@ impl EvolutionWorkflowStore {
 
     /// Release the lease on a workflow (after completion or error).
     pub fn release_lease(&self, workflow_id: &str, worker_id: &str) -> Result<bool> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now_str = now_rfc3339();
         let updated = conn
             .execute(
@@ -281,8 +294,14 @@ impl EvolutionWorkflowStore {
     /// Resets Claimed workflows with expired leases back to Requested,
     /// and also recovers RetryScheduled workflows whose backoff has elapsed.
     pub fn recover_expired_leases(&self) -> Result<Vec<WorkflowRecord>> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now_str = now_rfc3339();
+
+        // Wrap recovery in a transaction for atomicity.
+        // If the process crashes between the two UPDATEs, partial recovery
+        // won't happen — the transaction will be rolled back.
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(map_sqlite_error)?;
 
         // 1. Reset expired leases back to Requested
         conn.execute(
@@ -296,9 +315,6 @@ impl EvolutionWorkflowStore {
         .map_err(map_sqlite_error)?;
 
         // 2. Recover RetryScheduled workflows whose backoff has elapsed
-        //    (updated_at + backoff < now). For simplicity, RetryScheduled
-        //    workflows are always recoverable — the worker will check
-        //    attempt < max_attempts before running.
         conn.execute(
             "UPDATE evo_workflows
              SET lease_owner = NULL, lease_until = NULL, updated_at = ?1
@@ -341,6 +357,9 @@ impl EvolutionWorkflowStore {
             .map_err(map_sqlite_error)?
             .filter_map(|r| r.ok())
             .collect();
+
+        conn.execute_batch("COMMIT").map_err(map_sqlite_error)?;
+
         Ok(records)
     }
 
@@ -350,7 +369,7 @@ impl EvolutionWorkflowStore {
     /// Sets status to RetryScheduled and updates updated_at to now
     /// (the worker will use updated_at + backoff to determine when to retry).
     pub fn schedule_retry(&self, workflow_id: &str, last_error: Option<&str>) -> Result<()> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now_str = now_rfc3339();
 
         // Read current attempt to determine backoff
@@ -395,7 +414,7 @@ impl EvolutionWorkflowStore {
 
     /// Cancel a workflow by ID. Sets status to Cancelled and releases lease.
     pub fn cancel_workflow(&self, workflow_id: &str) -> Result<()> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now_str = now_rfc3339();
         conn.execute(
             "UPDATE evo_workflows
@@ -409,7 +428,7 @@ impl EvolutionWorkflowStore {
 
     /// Retry a failed or blocked workflow. Resets attempt and sets status to Requested.
     pub fn retry_workflow(&self, workflow_id: &str) -> Result<()> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now_str = now_rfc3339();
         conn.execute(
             "UPDATE evo_workflows
@@ -433,7 +452,7 @@ impl EvolutionWorkflowStore {
     ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = now_rfc3339();
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         conn.execute(
             "INSERT INTO evo_workflow_steps (id, workflow_id, step_name, status, input_json, started_at)
              VALUES (?1, ?2, ?3, 'Running', ?4, ?5)",
@@ -445,7 +464,7 @@ impl EvolutionWorkflowStore {
 
     /// Mark a step as completed.
     pub fn complete_step(&self, step_id: &str, output_json: Option<&str>) -> Result<()> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now = now_rfc3339();
         conn.execute(
             "UPDATE evo_workflow_steps SET status = 'Completed', output_json = ?1, finished_at = ?2
@@ -464,7 +483,7 @@ impl EvolutionWorkflowStore {
         worker_id: &str,
         output_json: Option<&str>,
     ) -> Result<bool> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now = now_rfc3339();
         let updated = conn
             .execute(
@@ -484,7 +503,7 @@ impl EvolutionWorkflowStore {
 
     /// Mark a step as failed.
     pub fn fail_step(&self, step_id: &str, error: &str) -> Result<()> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now = now_rfc3339();
         conn.execute(
             "UPDATE evo_workflow_steps SET status = 'Failed', error = ?1, finished_at = ?2
@@ -503,7 +522,7 @@ impl EvolutionWorkflowStore {
         worker_id: &str,
         error: &str,
     ) -> Result<bool> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now = now_rfc3339();
         let updated = conn
             .execute(
@@ -523,7 +542,7 @@ impl EvolutionWorkflowStore {
 
     /// Get the last completed step for a workflow.
     pub fn get_last_completed_step(&self, workflow_id: &str) -> Result<Option<StepRecord>> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, workflow_id, step_name, status, input_json, output_json,
@@ -564,7 +583,7 @@ impl EvolutionWorkflowStore {
         status: &str,
         last_error: Option<&str>,
     ) -> Result<()> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now = now_rfc3339();
         conn.execute(
             "UPDATE evo_workflows SET status = ?1, last_error = ?2, updated_at = ?3
@@ -583,7 +602,7 @@ impl EvolutionWorkflowStore {
         status: &str,
         last_error: Option<&str>,
     ) -> Result<bool> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now = now_rfc3339();
         let updated = conn
             .execute(
@@ -598,7 +617,7 @@ impl EvolutionWorkflowStore {
 
     /// Increment the attempt counter.
     pub fn increment_attempt(&self, workflow_id: &str) -> Result<()> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now = now_rfc3339();
         conn.execute(
             "UPDATE evo_workflows SET attempt = attempt + 1, updated_at = ?1
@@ -616,7 +635,7 @@ impl EvolutionWorkflowStore {
         worker_id: &str,
         last_error: Option<&str>,
     ) -> Result<bool> {
-        let mut conn = lock_conn(&self.inner);
+        let mut conn = self.lock_conn()?;
         let now_str = now_rfc3339();
         let tx = conn.transaction().map_err(map_sqlite_error)?;
 
@@ -687,7 +706,7 @@ impl EvolutionWorkflowStore {
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let now = now_rfc3339();
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         conn.execute(
             "INSERT INTO evo_workflow_events (id, workflow_id, event_type, payload_json, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -699,7 +718,7 @@ impl EvolutionWorkflowStore {
 
     /// Read pending control events for a workflow.
     pub fn read_pending_events(&self, workflow_id: &str) -> Result<Vec<EventRecord>> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, workflow_id, event_type, payload_json, created_at
@@ -729,7 +748,7 @@ impl EvolutionWorkflowStore {
 
     /// List workflows, optionally filtered by status.
     pub fn list_workflows(&self, status_filter: Option<&str>) -> Result<Vec<WorkflowRecord>> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let sql = match status_filter {
             Some(_) => "SELECT id, capability_id, description, provider_kind, status, attempt, max_attempts,
                                priority, created_at, updated_at, lease_owner, lease_until, last_error
@@ -776,7 +795,7 @@ impl EvolutionWorkflowStore {
 
     /// Get a specific workflow by ID.
     pub fn get_workflow(&self, workflow_id: &str) -> Result<Option<WorkflowRecord>> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, capability_id, description, provider_kind, status, attempt, max_attempts,
@@ -810,7 +829,7 @@ impl EvolutionWorkflowStore {
 
     /// Unblock a capability (set Blocked workflows back to Requested).
     pub fn unblock_capability(&self, capability_id: &str) -> Result<u32> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let now_str = now_rfc3339();
         let count = conn
             .execute(
@@ -824,7 +843,7 @@ impl EvolutionWorkflowStore {
 
     /// Get steps for a workflow.
     pub fn get_steps(&self, workflow_id: &str) -> Result<Vec<StepRecord>> {
-        let conn = lock_conn(&self.inner);
+        let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, workflow_id, step_name, status, input_json, output_json,
@@ -858,12 +877,6 @@ impl EvolutionWorkflowStore {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-fn lock_conn(inner: &Arc<Mutex<Connection>>) -> std::sync::MutexGuard<'_, Connection> {
-    inner
-        .lock()
-        .expect("evolution_workflow store mutex poisoned")
-}
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()

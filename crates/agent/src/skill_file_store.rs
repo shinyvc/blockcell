@@ -717,7 +717,7 @@ fn find_skill_dirs_named(root: &Path, name: &str, matches: &mut Vec<PathBuf>) ->
 }
 
 fn snapshot_skill_key(skill_name: &str) -> String {
-    skill_name.replace('/', "~").replace('\\', "~")
+    skill_name.replace(['/', '\\'], "~")
 }
 
 fn validate_skill_relative_path(path: &str) -> Result<PathBuf> {
