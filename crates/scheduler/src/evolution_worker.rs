@@ -366,9 +366,14 @@ impl EvolutionWorker {
                 warn!(
                     workflow_id = %workflow.id,
                     error = %e,
-                    "Failed to query last completed step, starting from beginning"
+                    "Failed to query last completed step — skipping to avoid re-running completed steps"
                 );
-                Some(EvolutionStep::first())
+                // Return None instead of restarting from the beginning.
+                // If we restart from EvolutionStep::first() on a DB error, we risk
+                // re-running already-completed steps, which wastes LLM calls and
+                // could corrupt the workflow state. The workflow will be retried
+                // on the next tick after the DB issue resolves.
+                None
             }
         }
     }

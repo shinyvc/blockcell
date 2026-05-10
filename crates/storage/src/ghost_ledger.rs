@@ -94,6 +94,7 @@ impl GhostLedger {
             "
             PRAGMA journal_mode=WAL;
             PRAGMA foreign_keys=ON;
+            PRAGMA busy_timeout=5000;
             ",
         )
         .map_err(map_sqlite_error)?;
@@ -715,9 +716,16 @@ impl GhostLedger {
     }
 
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.inner
-            .lock()
-            .map_err(|e| Error::Storage(format!("Ghost ledger database lock error: {}", e)))
+        match self.inner.lock() {
+            Ok(guard) => Ok(guard),
+            Err(poisoned) => {
+                // Recover from mutex poisoning: the Connection is still valid,
+                // we just need to regain access. into_inner() gives us the
+                // Connection regardless of poison state.
+                tracing::warn!("ghost ledger mutex was poisoned, recovering");
+                Ok(poisoned.into_inner())
+            }
+        }
     }
 
     fn latest_episode_field(&self, field: &str) -> Result<Option<String>> {

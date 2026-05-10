@@ -188,9 +188,18 @@ impl LearningCoordinator {
             return existing_action.cloned().unwrap_or(LearningAction::Skip);
         }
 
-        // Now that dedup passed, actually trigger the nudge (which resets counters)
-        let _memory_nudge = engine.check_memory_nudge();
-        let _skill_nudge = engine.check_skill_nudge();
+        // Now that dedup passed, actually trigger the nudge (which resets counters).
+        // Only call check_*_nudge() for the nudges that are actually due,
+        // to avoid resetting counters for nudges that aren't due yet.
+        // Previously, both check_memory_nudge() and check_skill_nudge() were
+        // called unconditionally, which could reset the skill counter even
+        // when only a memory nudge was due (and vice versa).
+        if memory_due {
+            let _memory_nudge = engine.check_memory_nudge();
+        }
+        if skill_due {
+            let _skill_nudge = engine.check_skill_nudge();
+        }
 
         // Determine action — use pre-captured counts
         let new_action = if memory_due && skill_due {
@@ -406,9 +415,7 @@ impl LearningCoordinator {
     /// 从配置更新 ghost 学习策略（支持热重载）
     pub fn update_ghost_policy(&self, config: &blockcell_core::config::GhostLearningConfig) {
         let new_policy = GhostLearningPolicy::from_config(config);
-        if let Ok(mut guard) = self.ghost_policy.lock() {
-            *guard = new_policy;
-        }
+        *self.ghost_policy.lock().unwrap_or_else(recover_mutex) = new_policy;
     }
 
     /// Check if self-improve review is enabled

@@ -221,7 +221,7 @@ impl GhostMaintenanceService {
                     "Ghost: invalid cron schedule, falling back to every 4 hours"
                 );
                 // Fallback: every 4 hours
-                "0 0 */4 * * *".parse::<cron::Schedule>().unwrap()
+                "0 0 */4 * * *".parse::<cron::Schedule>().expect("hardcoded fallback cron schedule is valid")
             }
         };
 

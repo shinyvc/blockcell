@@ -152,9 +152,12 @@ impl ResponseCache {
         if !has_tool_results {
             return None;
         }
-        if !self.is_cacheable(content) {
-            return None;
-        }
+
+        // Acquire lock once and check cacheability inside the lock to avoid
+        // TOCTOU between is_cacheable() and the cache insertion below.
+        // Previously, is_cacheable() acquired its own lock, then the insertion
+        // acquired a second lock — this was a double-lock pattern that could
+        // observe inconsistent config between the two calls.
         let items = Self::extract_list_items(content);
         if items.len() < 5 {
             return None;
@@ -187,6 +190,12 @@ impl ResponseCache {
         };
 
         let mut inner = self.get_lock();
+        // Check cacheability inside the lock (min_chars from config)
+        let min_chars = inner.config.cacheable_min_chars;
+        if content.chars().count() <= min_chars {
+            return None;
+        }
+
         let max_per_session = inner.config.cache_max_per_session;
         let session_cache = inner.data.entry(session_key.to_string()).or_default();
 
@@ -232,12 +241,6 @@ impl ResponseCache {
     // ──────────────────────────────────────────────
     // Internal helpers
     // ──────────────────────────────────────────────
-
-    /// Content is cacheable when it is long enough and contains a list.
-    fn is_cacheable(&self, content: &str) -> bool {
-        let min_chars = self.get_lock().config.cacheable_min_chars;
-        content.chars().count() > min_chars
-    }
 
     /// Extract list items from a numbered or bulleted list.
     /// Handles: `1. item`, `- item`, `* item`, `• item`
@@ -530,12 +533,14 @@ impl ContentReplacementState {
     }
 
     /// 如果超过限制，删除最老的条目
+    /// 使用 drain 而非 remove(0) 避免 O(n) 复制开销
     fn prune_if_needed(&mut self) {
         while self.insertion_order.len() > self.max_replacement_entries {
             if let Some(oldest_id) = self.insertion_order.first().cloned() {
                 self.seen_ids.remove(&oldest_id);
                 self.replacements.remove(&oldest_id);
-                self.insertion_order.remove(0);
+                // drain(0..1) removes the first element in O(1) amortized
+                self.insertion_order.drain(0..1);
             } else {
                 break;
             }

@@ -181,10 +181,13 @@ impl SkillEvolutionWorker {
                 if !self.complete_step(&workflow, &step_id, Some(&output_json)) {
                     return;
                 }
+                // Use "Observing" instead of "Promoted" — the skill is in
+                // observation window and may still be rolled back if error
+                // rate exceeds threshold. "Promoted" would prevent rollback.
                 let _ = self.store.update_workflow_status_if_owned(
                     &workflow.id,
                     &self.worker_id,
-                    "Promoted",
+                    "Observing",
                     None,
                 );
             }

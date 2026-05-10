@@ -147,7 +147,20 @@ impl GhostLearningPolicy {
             GhostLearningBoundaryKind::TurnEnd => {}
         }
 
+        // Failed turns are important learning opportunities — they often contain
+        // correction signals, reusable lessons, or method insights that should be
+        // reviewed. Previously, all failed turns were silently ignored, which meant
+        // the system never learned from its mistakes.
         if !boundary.success {
+            if boundary.correction_count > 0
+                || boundary.preference_correction_count > 0
+                || boundary.tool_call_count > 0
+                || boundary.complexity_score >= 3
+                || boundary.reusable_lesson.is_some()
+            {
+                return LearningDecision::ReviewAfterResponse;
+            }
+            // Trivial failures (no tools, no corrections, low complexity) can be ignored
             return LearningDecision::Ignore;
         }
 

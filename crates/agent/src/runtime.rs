@@ -9872,7 +9872,11 @@ async fn run_subagent_task(
         sub_runtime.outbound_tx = Some(tx);
     }
     if let Some(at) = abort_token {
-        sub_runtime.abort_token = at;
+        sub_runtime.abort_token = at.clone();
+        // Register the AbortToken with the task manager so that /tasks cancel
+        // can trigger chain cancellation. Without this registration, cancelling
+        // a task via TaskManager would not propagate to the subagent runtime.
+        task_manager.register_abort_token(&task_id, at);
     }
     if let Err(e) = sub_runtime.init_memory_file_store() {
         tracing::warn!(error = %e, "Failed to initialize subagent file memory store");

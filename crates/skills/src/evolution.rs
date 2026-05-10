@@ -872,8 +872,10 @@ impl SkillEvolution {
                             (false, Some(format!("Python syntax error:\n{}", stderr)))
                         }
                         Err(e) => {
-                            warn!(evolution_id = %evolution_id, "🔨 [compile] python3 not found, skipping syntax check: {}", e);
-                            (true, None)
+                            warn!(evolution_id = %evolution_id, "🔨 [compile] python3 not found, cannot verify Python syntax: {}", e);
+                            // Fail safe: cannot verify syntax without python3,
+                            // rather than silently passing potentially broken code
+                            (false, Some(format!("python3 not available for syntax check: {}", e)))
                         }
                     }
                 }
@@ -2155,6 +2157,13 @@ impl SkillEvolution {
         extract_with_marker(response, "```yaml").or_else(|| extract_with_marker(response, "```yml"))
     }
 
+    /// Sanitize content for embedding inside a markdown code fence.
+    /// Replaces triple-backtick sequences to prevent code fence escape
+    /// (prompt injection via generated script content).
+    fn sanitize_for_code_fence(content: &str) -> String {
+        content.replace("```", "\u{200B}``\u{200B}`")
+    }
+
     fn build_audit_prompt(
         &self,
         context: &EvolutionContext,
@@ -2168,7 +2177,7 @@ impl SkillEvolution {
             context.skill_name
         ));
 
-        prompt.push_str(&format!("Code:\n```rhai\n{}\n```\n\n", script_content));
+        prompt.push_str(&format!("Code:\n```rhai\n{}\n```\n\n", Self::sanitize_for_code_fence(script_content)));
 
         prompt.push_str("\
 Check for the following Rhai-specific issues:\n\
@@ -2289,7 +2298,7 @@ or\n\
             context.skill_name
         ));
 
-        prompt.push_str(&format!("Code:\n```python\n{}\n```\n\n", script_content));
+        prompt.push_str(&format!("Code:\n```python\n{}\n```\n\n", Self::sanitize_for_code_fence(script_content)));
 
         prompt.push_str("\
 Check for the following issues:\n\
@@ -2319,7 +2328,7 @@ or\n\
             context.skill_name
         ));
 
-        prompt.push_str(&format!("Code:\n```\n{}\n```\n\n", script_content));
+        prompt.push_str(&format!("Code:\n```\n{}\n```\n\n", Self::sanitize_for_code_fence(script_content)));
 
         prompt.push_str(
             "Check for the following issues:\n\
