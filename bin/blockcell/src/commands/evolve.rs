@@ -1,5 +1,5 @@
 use blockcell_core::{Config, Paths};
-use blockcell_skills::evolution::{EvolutionRecord, EvolutionStatus, LLMProvider};
+use blockcell_skills::evolution::{EvolutionRecord, EvolutionStatus, LLMProvider, SkillEvolution};
 use blockcell_skills::is_builtin_tool;
 use blockcell_skills::service::{EvolutionService, EvolutionServiceConfig};
 use std::io::Write;
@@ -411,12 +411,20 @@ pub async fn rollback(skill_name: &str, to: Option<String>) -> anyhow::Result<()
                 println!("  Patch: {}", patch.patch_id);
             }
             println!();
-            println!("  ℹ️  Rollback of skill evolution records is informational only.");
+
+            // Execute actual rollback: restore skill files to previous version
+            let skills_dir = paths.workspace().join("skills");
+            let evolution = SkillEvolution::new(skills_dir, 60);
+            evolution
+                .rollback(&target_record.id, "CLI rollback request")
+                .await
+                .map_err(|e| anyhow::anyhow!("Rollback failed: {}", e))?;
+
+            println!("  ✅ Skill '{}' has been rolled back to previous version.", skill_name);
             println!(
-                "  The actual skill files in workspace/skills/{} remain unchanged.",
+                "  Skill files in workspace/skills/{} have been restored.",
                 skill_name
             );
-            println!("  To restore a previous skill version, manually revert the files in that directory.");
         }
     }
 
@@ -448,21 +456,23 @@ fn derive_skill_name(description: &str) -> String {
     // For CJK or other non-ASCII descriptions, generate a stable short name
     // by taking the first few characters and appending a short hash
     let preview: String = description.chars().take(8).collect();
-    // Simple hash: sum of char values mod 9999
+    // FNV-1a inspired hash for better distribution, mod 999999 to reduce collision risk
     let hash_val: u32 = description
         .chars()
-        .fold(0u32, |acc, c| acc.wrapping_add(c as u32).wrapping_mul(31))
-        % 9999;
+        .fold(2166136261u32, |acc, c| {
+            acc.wrapping_mul(16777619).wrapping_add(c as u32)
+        })
+        % 999999;
 
     // Transliterate common Chinese skill keywords to English
     let keyword = match_chinese_keyword(description);
     if let Some(kw) = keyword {
-        format!("{}_{:04}", kw, hash_val)
+        format!("{}_{:06}", kw, hash_val)
     } else if preview.is_empty() {
         format!("skill_{}", chrono::Utc::now().timestamp())
     } else {
         // Use hash-based name since CJK chars aren't safe for all filesystems
-        format!("skill_{:04}", hash_val)
+        format!("skill_{:06}", hash_val)
     }
 }
 
@@ -886,8 +896,15 @@ fn load_all_records(records_dir: &std::path::Path) -> Vec<EvolutionRecord> {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "json") {
                 if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(record) = serde_json::from_str::<EvolutionRecord>(&content) {
-                        records.push(record);
+                    match serde_json::from_str::<EvolutionRecord>(&content) {
+                        Ok(record) => records.push(record),
+                        Err(e) => {
+                            eprintln!(
+                                "  ⚠️  Skipping corrupted record {}: {}",
+                                path.display(),
+                                e
+                            );
+                        }
                     }
                 }
             }

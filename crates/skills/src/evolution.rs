@@ -414,11 +414,16 @@ impl SkillEvolution {
                                 return p;
                             }
                         }
+                        warn!(
+                            path = %dir,
+                            "staging_skills_dir is outside workspace directory tree, ignoring"
+                        );
+                    } else {
+                        warn!(
+                            path = %dir,
+                            "staging_skills_dir canonicalize failed — path may not exist, ignoring"
+                        );
                     }
-                    warn!(
-                        path = %dir,
-                        "staging_skills_dir is outside workspace directory tree, ignoring"
-                    );
                 }
             }
         }
@@ -482,6 +487,18 @@ impl SkillEvolution {
         llm_provider: &dyn LLMProvider,
     ) -> Result<GeneratedPatch> {
         let mut record = self.load_record(evolution_id)?;
+
+        // Precondition: must be in Triggered state (or Generating for retry)
+        if !matches!(
+            record.status,
+            EvolutionStatus::Triggered | EvolutionStatus::Generating
+        ) {
+            return Err(Error::Evolution(format!(
+                "Cannot generate patch: expected status Triggered, got {:?}",
+                record.status
+            )));
+        }
+
         record.status = EvolutionStatus::Generating;
         self.save_record(&record)?;
 
@@ -681,6 +698,18 @@ impl SkillEvolution {
         llm_provider: &dyn LLMProvider,
     ) -> Result<AuditResult> {
         let mut record = self.load_record(evolution_id)?;
+
+        // Precondition: must be in Generated state (or Auditing for retry)
+        if !matches!(
+            record.status,
+            EvolutionStatus::Generated | EvolutionStatus::Auditing
+        ) {
+            return Err(Error::Evolution(format!(
+                "Cannot audit patch: expected status Generated, got {:?}",
+                record.status
+            )));
+        }
+
         record.status = EvolutionStatus::Auditing;
         self.save_record(&record)?;
 
@@ -1423,6 +1452,7 @@ impl SkillEvolution {
     }
 
     /// Helper: resolve skill root dir by name (handles staged vs normal)
+    /// Applies the same path traversal validation as `skill_root_dir_for_record`.
     fn skill_root_dir_by_name(
         &self,
         _skill_name: &str,
@@ -1433,7 +1463,29 @@ impl SkillEvolution {
             if let Some(dir) = staging_dir {
                 let p = PathBuf::from(dir);
                 if p.is_absolute() {
-                    return p;
+                    // Validate: staging dir must be within the workspace directory tree
+                    // to prevent path traversal attacks (same logic as skill_root_dir_for_record).
+                    if let Ok(canonical_staging) = p.canonicalize() {
+                        if let Ok(canonical_skills) = self.skills_dir.canonicalize() {
+                            let canonical_workspace = canonical_skills.parent();
+                            if let Some(workspace) = canonical_workspace {
+                                if canonical_staging.starts_with(workspace) {
+                                    return p;
+                                }
+                            }
+                            if canonical_staging.starts_with(&canonical_skills) {
+                                return p;
+                            }
+                        }
+                    }
+                    warn!(
+                        path = %dir,
+                        "skill_root_dir_for_record: staging_skills_dir is outside workspace directory tree, ignoring"
+                    );
+                    warn!(
+                        path = %dir,
+                        "skill_root_dir_by_name: staging_skills_dir is outside workspace directory tree, ignoring"
+                    );
                 }
             }
         }
@@ -2511,9 +2563,12 @@ or\n\
     }
 
     fn extract_diff_from_response(&self, response: &str) -> Result<String> {
-        // Try ```diff block first (for patching existing skills)
-        if let Some(start) = response.find("```diff") {
+        // Try ```diff block (for patching existing skills).
+        // Use rfind to get the LAST occurrence, which is typically the actual
+        // code block in LLM output (earlier ones may be in explanation text).
+        if let Some(start) = response.rfind("```diff") {
             let after_marker = start + 7;
+            // Find the first closing ``` after the opening marker
             if let Some(end) = response[after_marker..].find("```") {
                 let diff = &response[after_marker..after_marker + end];
                 return Ok(diff.trim().to_string());
@@ -2521,7 +2576,7 @@ or\n\
         }
 
         // Try ```rhai block (for new skill creation — full script output)
-        if let Some(start) = response.find("```rhai") {
+        if let Some(start) = response.rfind("```rhai") {
             let after_marker = start + 7;
             if let Some(end) = response[after_marker..].find("```") {
                 let script = &response[after_marker..after_marker + end];
@@ -2530,7 +2585,7 @@ or\n\
         }
 
         // Try ```python block (for Python skill creation)
-        if let Some(start) = response.find("```python") {
+        if let Some(start) = response.rfind("```python") {
             let after_marker = start + 9;
             if let Some(end) = response[after_marker..].find("```") {
                 let script = &response[after_marker..after_marker + end];
@@ -2539,7 +2594,7 @@ or\n\
         }
 
         // Try ```markdown block (for prompt-only skills)
-        if let Some(start) = response.find("```markdown") {
+        if let Some(start) = response.rfind("```markdown") {
             let after_marker = start + 11;
             if let Some(end) = response[after_marker..].find("```") {
                 let md = &response[after_marker..after_marker + end];
@@ -2548,7 +2603,7 @@ or\n\
         }
 
         // Try generic ``` block
-        if let Some(start) = response.find("```") {
+        if let Some(start) = response.rfind("```") {
             let after_marker = start + 3;
             let content_start = response[after_marker..]
                 .find('\n')
@@ -2650,7 +2705,11 @@ or\n\
         skill_name: &str,
         script_content: &str,
     ) -> Result<(bool, Option<String>)> {
-        let temp_path = std::env::temp_dir().join(format!("{}_compile.rhai", skill_name));
+        let temp_path = std::env::temp_dir().join(format!(
+            "{}_compile_{}.rhai",
+            skill_name,
+            RECORD_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::write(&temp_path, script_content)?;
 
         info!(
@@ -2714,10 +2773,25 @@ or\n\
         // If this is a staged external skill, promote it into the main skills dir now.
         if record.context.staged {
             let dest_skill_dir = self.skills_dir.join(&record.skill_name);
-            if dest_skill_dir.exists() {
-                std::fs::remove_dir_all(&dest_skill_dir)?;
-            }
             std::fs::create_dir_all(&self.skills_dir)?;
+
+            // Atomic promotion: rename old → .bak, rename new → dest, then delete .bak.
+            // This avoids data loss if rename fails after remove_dir_all succeeds.
+            if dest_skill_dir.exists() {
+                let bak_dir = dest_skill_dir.with_extension("bak");
+                // Clean up any previous .bak first
+                if bak_dir.exists() {
+                    std::fs::remove_dir_all(&bak_dir).ok();
+                }
+                if let Err(e) = std::fs::rename(&dest_skill_dir, &bak_dir) {
+                    warn!(
+                        skill = %record.skill_name,
+                        error = %e,
+                        "Failed to rename existing skill dir to .bak, falling back to remove_dir_all"
+                    );
+                    std::fs::remove_dir_all(&dest_skill_dir)?;
+                }
+            }
 
             // Prefer atomic rename if possible; fallback to copy+remove.
             if let Err(e) = std::fs::rename(&staged_skill_dir, &dest_skill_dir) {
@@ -2728,6 +2802,18 @@ or\n\
                 );
                 copy_dir_all(&staged_skill_dir, &dest_skill_dir)?;
                 std::fs::remove_dir_all(&staged_skill_dir).ok();
+            }
+
+            // Clean up .bak directory after successful promotion
+            let bak_dir = dest_skill_dir.with_extension("bak");
+            if bak_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&bak_dir) {
+                    warn!(
+                        skill = %record.skill_name,
+                        error = %e,
+                        "Failed to clean up .bak directory after skill promotion"
+                    );
+                }
             }
 
             if let Some(meta) = self.extract_yaml_from_response(&patch.explanation) {

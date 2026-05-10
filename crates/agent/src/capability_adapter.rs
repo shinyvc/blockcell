@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use blockcell_core::types::ChatMessage;
-use blockcell_core::{ProviderKind, Result};
+use blockcell_core::{Error, ProviderKind, Result};
 use blockcell_providers::Provider;
 use blockcell_skills::{CapabilityRegistry, CoreEvolution, LLMProvider};
 use blockcell_storage::EvolutionWorkflowStore;
@@ -270,7 +270,7 @@ impl EvolutionWorkflowStoreAdapter {
 impl EvolutionWorkflowStoreOps for EvolutionWorkflowStoreAdapter {
     fn list_workflows_json(&self, status_filter: Option<&str>) -> Result<Value> {
         let workflows = self.inner.list_workflows(status_filter)?;
-        Ok(serde_json::to_value(&workflows).unwrap_or(json!([])))
+        serde_json::to_value(&workflows).map_err(Error::from)
     }
 
     fn get_workflow_json(&self, workflow_id: &str) -> Result<Value> {
@@ -283,7 +283,7 @@ impl EvolutionWorkflowStoreOps for EvolutionWorkflowStoreAdapter {
 
     fn get_workflow_steps_json(&self, workflow_id: &str) -> Result<Value> {
         let steps = self.inner.get_steps(workflow_id)?;
-        Ok(serde_json::to_value(&steps).unwrap_or(json!([])))
+        serde_json::to_value(&steps).map_err(Error::from)
     }
 
     fn cancel_workflow(&self, workflow_id: &str) -> Result<Value> {

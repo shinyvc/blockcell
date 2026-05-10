@@ -310,6 +310,9 @@ pub struct EvolutionService {
     config: EvolutionServiceConfig,
     /// 可选的 LLM provider，设置后 tick() 会自动驱动完整进化 pipeline
     llm_provider: Option<Arc<dyn LLMProvider>>,
+    /// Callback invoked after a successful skill deployment.
+    /// Used to invalidate caches (e.g. SkillDocCache) in the runtime.
+    deploy_callback: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl EvolutionService {
@@ -628,6 +631,7 @@ impl EvolutionService {
             pipeline_locks: Arc::new(Mutex::new(HashSet::new())),
             config,
             llm_provider: None,
+            deploy_callback: None,
         }
     }
 
@@ -635,6 +639,13 @@ impl EvolutionService {
     /// 应在 agent 启动时调用，传入与主 agent 相同的 provider。
     pub fn set_llm_provider(&mut self, provider: Arc<dyn LLMProvider>) {
         self.llm_provider = Some(provider);
+    }
+
+    /// Set a callback to be invoked after a successful skill deployment.
+    /// The callback receives the skill name as its argument.
+    /// Used to invalidate caches (e.g. SkillDocCache) after evolution deploy.
+    pub fn set_deploy_callback(&mut self, callback: Arc<dyn Fn(&str) + Send + Sync>) {
+        self.deploy_callback = Some(callback);
     }
 
     /// 报告技能执行错误
@@ -1242,6 +1253,10 @@ impl EvolutionService {
                         skill_name
                     );
                     // Observation stats already initialized in run_single_evolution
+                    // Invoke deploy callback to invalidate caches (e.g. SkillDocCache)
+                    if let Some(ref cb) = self.deploy_callback {
+                        cb(skill_name);
+                    }
                 }
                 Ok(false) => {
                     warn!(

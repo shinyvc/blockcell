@@ -1126,6 +1126,15 @@ impl SkillManager {
         Ok(new_skills)
     }
 
+    /// Invalidate the doc cache for a specific skill after evolution deployment.
+    /// This ensures the next access reads fresh SKILL.md content from disk.
+    pub fn invalidate_skill_cache(&mut self, skill_name: &str) {
+        if let Some(skill) = self.skills.get_mut(skill_name) {
+            skill.cached_docs = None;
+            debug!(skill = %skill_name, "Invalidated doc cache for skill after evolution deploy");
+        }
+    }
+
     pub fn invalidate_prompt_snapshot(paths: &Paths) -> Result<()> {
         let snapshot_path = paths.skills_dir().join(SKILLS_PROMPT_SNAPSHOT_FILE);
         if snapshot_path.exists() {
@@ -1164,7 +1173,13 @@ impl SkillManager {
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         std::fs::write(&tmp_path, serde_json::to_string_pretty(&snapshot)?)?;
-        std::fs::rename(tmp_path, snapshot_path)?;
+        if let Err(e) = std::fs::rename(&tmp_path, &snapshot_path) {
+            // On Windows, rename may fail if the target is open. Fall back to
+            // copy+remove, and log a warning about the orphan temp file.
+            warn!(error = %e, "Failed to rename snapshot temp file, falling back to copy+remove");
+            std::fs::copy(&tmp_path, &snapshot_path)?;
+            let _ = std::fs::remove_file(&tmp_path);
+        }
         Ok(())
     }
 

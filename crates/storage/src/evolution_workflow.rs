@@ -7,7 +7,7 @@
 //!
 //! Follows the GhostLedger pattern: `Arc<Mutex<Connection>>` + WAL + UUID v4 + RFC 3339.
 
-use blockcell_core::{Error, Result};
+use blockcell_core::Result;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -68,9 +68,16 @@ pub struct EvolutionWorkflowStore {
 
 impl EvolutionWorkflowStore {
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.inner
-            .lock()
-            .map_err(|e| Error::Storage(format!("evolution workflow lock poisoned: {e}")))
+        match self.inner.lock() {
+            Ok(guard) => Ok(guard),
+            Err(poisoned) => {
+                // Recover from mutex poisoning: the Connection is still valid,
+                // we just need to regain access. into_inner() gives us the
+                // Connection regardless of poison state.
+                tracing::warn!("evolution workflow mutex was poisoned, recovering");
+                Ok(poisoned.into_inner())
+            }
+        }
     }
 
     pub fn open(db_path: &Path) -> Result<Self> {
@@ -290,6 +297,12 @@ impl EvolutionWorkflowStore {
         let conn = self.lock_conn()?;
         let now_str = now_rfc3339();
 
+        // Wrap recovery in a transaction for atomicity.
+        // If the process crashes between the two UPDATEs, partial recovery
+        // won't happen — the transaction will be rolled back.
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(map_sqlite_error)?;
+
         // 1. Reset expired leases back to Requested
         conn.execute(
             "UPDATE evo_workflows
@@ -302,9 +315,6 @@ impl EvolutionWorkflowStore {
         .map_err(map_sqlite_error)?;
 
         // 2. Recover RetryScheduled workflows whose backoff has elapsed
-        //    (updated_at + backoff < now). For simplicity, RetryScheduled
-        //    workflows are always recoverable — the worker will check
-        //    attempt < max_attempts before running.
         conn.execute(
             "UPDATE evo_workflows
              SET lease_owner = NULL, lease_until = NULL, updated_at = ?1
@@ -347,6 +357,9 @@ impl EvolutionWorkflowStore {
             .map_err(map_sqlite_error)?
             .filter_map(|r| r.ok())
             .collect();
+
+        conn.execute_batch("COMMIT").map_err(map_sqlite_error)?;
+
         Ok(records)
     }
 
