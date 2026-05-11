@@ -157,7 +157,10 @@ impl VersionManager {
 
         // Find the current version entry to get its parent_version
         let current_version = &history.current_version;
-        let current_entry = history.versions.iter().find(|v| &v.version == current_version);
+        let current_entry = history
+            .versions
+            .iter()
+            .find(|v| &v.version == current_version);
 
         // Try parent_version field first (more reliable than index-based lookup),
         // then fall back to the second-to-last entry if parent_version is missing

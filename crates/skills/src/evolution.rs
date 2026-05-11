@@ -875,7 +875,10 @@ impl SkillEvolution {
                             warn!(evolution_id = %evolution_id, "🔨 [compile] python3 not found, cannot verify Python syntax: {}", e);
                             // Fail safe: cannot verify syntax without python3,
                             // rather than silently passing potentially broken code
-                            (false, Some(format!("python3 not available for syntax check: {}", e)))
+                            (
+                                false,
+                                Some(format!("python3 not available for syntax check: {}", e)),
+                            )
                         }
                     }
                 }
@@ -1610,7 +1613,10 @@ impl SkillEvolution {
         }
 
         if let Some(error) = &context.error_stack {
-            prompt.push_str(&format!("## Error\n```\n{}\n```\n\n", Self::sanitize_for_code_fence(error)));
+            prompt.push_str(&format!(
+                "## Error\n```\n{}\n```\n\n",
+                Self::sanitize_for_code_fence(error)
+            ));
         }
 
         // Existing source code
@@ -1689,7 +1695,10 @@ impl SkillEvolution {
                 context.skill_name
             ));
             if let Some(error) = &context.error_stack {
-                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", Self::sanitize_for_code_fence(error)));
+                prompt.push_str(&format!(
+                    "## Issue\n```\n{}\n```\n\n",
+                    Self::sanitize_for_code_fence(error)
+                ));
             }
         }
 
@@ -1708,14 +1717,20 @@ impl SkillEvolution {
                 if let Ok(md) = std::fs::read_to_string(&staged_md) {
                     if !md.trim().is_empty() {
                         prompt.push_str("## Current Staged SKILL.md (reference)\n");
-                        prompt.push_str(&format!("```markdown\n{}\n```\n\n", Self::sanitize_for_code_fence(&md)));
+                        prompt.push_str(&format!(
+                            "```markdown\n{}\n```\n\n",
+                            Self::sanitize_for_code_fence(&md)
+                        ));
                     }
                 }
                 let staged_meta = staged_skill_dir.join("meta.yaml");
                 if let Ok(meta) = std::fs::read_to_string(&staged_meta) {
                     if !meta.trim().is_empty() {
                         prompt.push_str("## Current Staged meta.yaml (reference)\n");
-                        prompt.push_str(&format!("```yaml\n{}\n```\n\n", Self::sanitize_for_code_fence(&meta)));
+                        prompt.push_str(&format!(
+                            "```yaml\n{}\n```\n\n",
+                            Self::sanitize_for_code_fence(&meta)
+                        ));
                     }
                 }
             }
@@ -2020,7 +2035,10 @@ impl SkillEvolution {
                 context.skill_name
             ));
             if let Some(error) = &context.error_stack {
-                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", Self::sanitize_for_code_fence(error)));
+                prompt.push_str(&format!(
+                    "## Issue\n```\n{}\n```\n\n",
+                    Self::sanitize_for_code_fence(error)
+                ));
             }
         }
 
@@ -2043,7 +2061,8 @@ impl SkillEvolution {
                 .unwrap_or("text");
             prompt.push_str(&format!(
                 "## Current Script Content\n```{}\n{}\n```\n\n",
-                fence, Self::sanitize_for_code_fence(snippet)
+                fence,
+                Self::sanitize_for_code_fence(snippet)
             ));
         }
 
@@ -2092,7 +2111,10 @@ impl SkillEvolution {
         }
 
         prompt.push_str("## Previous Content (has issues)\n");
-        prompt.push_str(&format!("```\n{}\n```\n\n", Self::sanitize_for_code_fence(&current_feedback.previous_code)));
+        prompt.push_str(&format!(
+            "```\n{}\n```\n\n",
+            Self::sanitize_for_code_fence(&current_feedback.previous_code)
+        ));
         prompt.push_str(&format!(
             "## Issues Found ({})\n{}\n\n",
             current_feedback.stage, current_feedback.feedback
@@ -2177,7 +2199,10 @@ impl SkillEvolution {
             context.skill_name
         ));
 
-        prompt.push_str(&format!("Code:\n```rhai\n{}\n```\n\n", Self::sanitize_for_code_fence(script_content)));
+        prompt.push_str(&format!(
+            "Code:\n```rhai\n{}\n```\n\n",
+            Self::sanitize_for_code_fence(script_content)
+        ));
 
         prompt.push_str("\
 Check for the following Rhai-specific issues:\n\
@@ -2207,7 +2232,10 @@ or\n\
             context.skill_name
         ));
 
-        prompt.push_str(&format!("Content:\n```markdown\n{}\n```\n\n", Self::sanitize_for_code_fence(md_content)));
+        prompt.push_str(&format!(
+            "Content:\n```markdown\n{}\n```\n\n",
+            Self::sanitize_for_code_fence(md_content)
+        ));
 
         prompt.push_str("\
 Check for the following issues:\n\
@@ -2260,7 +2288,10 @@ or\n\
                 context.skill_name
             ));
             if let Some(error) = &context.error_stack {
-                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", Self::sanitize_for_code_fence(error)));
+                prompt.push_str(&format!(
+                    "## Issue\n```\n{}\n```\n\n",
+                    Self::sanitize_for_code_fence(error)
+                ));
             }
         }
 
@@ -2298,7 +2329,10 @@ or\n\
             context.skill_name
         ));
 
-        prompt.push_str(&format!("Code:\n```python\n{}\n```\n\n", Self::sanitize_for_code_fence(script_content)));
+        prompt.push_str(&format!(
+            "Code:\n```python\n{}\n```\n\n",
+            Self::sanitize_for_code_fence(script_content)
+        ));
 
         prompt.push_str("\
 Check for the following issues:\n\
@@ -2328,7 +2362,10 @@ or\n\
             context.skill_name
         ));
 
-        prompt.push_str(&format!("Code:\n```\n{}\n```\n\n", Self::sanitize_for_code_fence(script_content)));
+        prompt.push_str(&format!(
+            "Code:\n```\n{}\n```\n\n",
+            Self::sanitize_for_code_fence(script_content)
+        ));
 
         prompt.push_str(
             "Check for the following issues:\n\

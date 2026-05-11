@@ -1245,7 +1245,8 @@ impl CoreEvolution {
                     checks.push(ValidationCheck {
                         name: "dry_run".to_string(),
                         passed: true,
-                        message: "Shell script dry-run skipped on Windows (bash unavailable)".to_string(),
+                        message: "Shell script dry-run skipped on Windows (bash unavailable)"
+                            .to_string(),
                     });
                 }
 

@@ -420,7 +420,10 @@ pub async fn rollback(skill_name: &str, to: Option<String>) -> anyhow::Result<()
                 .await
                 .map_err(|e| anyhow::anyhow!("Rollback failed: {}", e))?;
 
-            println!("  ✅ Skill '{}' has been rolled back to previous version.", skill_name);
+            println!(
+                "  ✅ Skill '{}' has been rolled back to previous version.",
+                skill_name
+            );
             println!(
                 "  Skill files in workspace/skills/{} have been restored.",
                 skill_name
@@ -457,12 +460,9 @@ fn derive_skill_name(description: &str) -> String {
     // by taking the first few characters and appending a short hash
     let preview: String = description.chars().take(8).collect();
     // FNV-1a inspired hash for better distribution, mod 999999 to reduce collision risk
-    let hash_val: u32 = description
-        .chars()
-        .fold(2166136261u32, |acc, c| {
-            acc.wrapping_mul(16777619).wrapping_add(c as u32)
-        })
-        % 999999;
+    let hash_val: u32 = description.chars().fold(2166136261u32, |acc, c| {
+        acc.wrapping_mul(16777619).wrapping_add(c as u32)
+    }) % 999999;
 
     // Transliterate common Chinese skill keywords to English
     let keyword = match_chinese_keyword(description);
@@ -899,11 +899,7 @@ fn load_all_records(records_dir: &std::path::Path) -> Vec<EvolutionRecord> {
                     match serde_json::from_str::<EvolutionRecord>(&content) {
                         Ok(record) => records.push(record),
                         Err(e) => {
-                            eprintln!(
-                                "  ⚠️  Skipping corrupted record {}: {}",
-                                path.display(),
-                                e
-                            );
+                            eprintln!("  ⚠️  Skipping corrupted record {}: {}", path.display(), e);
                         }
                     }
                 }
