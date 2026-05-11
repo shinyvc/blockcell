@@ -337,12 +337,16 @@ impl EvolutionWorker {
                 );
             }
             NextStepResult::QueryFailed => {
-                // DB查询失败，不标记为Promoted，释放租约等待下次重试
-                warn!(workflow_id = %workflow.id, "DB查询失败，跳过本次tick，等待下次重试");
+                // DB查询失败，保留租约直接返回，等待租约过期后由recover_expired_leases恢复
+                // 注意：不能释放租约，否则status保持Claimed但lease为空，
+                // claim_next只查Requested/RetryScheduled，recover_expired_leases要求
+                // lease_until IS NOT NULL，两边都不匹配会导致workflow永久卡住
+                warn!(workflow_id = %workflow.id, "DB查询失败，保留租约等待过期恢复");
+                return;
             }
         }
 
-        // 9. Release lease
+        // 9. Release lease (QueryFailed分支已提前return，不会执行到这里)
         match self.store.release_lease(&workflow.id, &self.worker_id) {
             Ok(true) => {}
             Ok(false) => {

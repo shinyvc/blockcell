@@ -1708,14 +1708,14 @@ impl SkillEvolution {
                 if let Ok(md) = std::fs::read_to_string(&staged_md) {
                     if !md.trim().is_empty() {
                         prompt.push_str("## Current Staged SKILL.md (reference)\n");
-                        prompt.push_str(&format!("```markdown\n{}\n```\n\n", md));
+                        prompt.push_str(&format!("```markdown\n{}\n```\n\n", Self::sanitize_for_code_fence(&md)));
                     }
                 }
                 let staged_meta = staged_skill_dir.join("meta.yaml");
                 if let Ok(meta) = std::fs::read_to_string(&staged_meta) {
                     if !meta.trim().is_empty() {
                         prompt.push_str("## Current Staged meta.yaml (reference)\n");
-                        prompt.push_str(&format!("```yaml\n{}\n```\n\n", meta));
+                        prompt.push_str(&format!("```yaml\n{}\n```\n\n", Self::sanitize_for_code_fence(&meta)));
                     }
                 }
             }
@@ -1845,7 +1845,7 @@ impl SkillEvolution {
         prompt.push_str("## Previous Code (has issues)\n");
         prompt.push_str(&format!(
             "```rhai\n{}\n```\n\n",
-            current_feedback.previous_code
+            Self::sanitize_for_code_fence(&current_feedback.previous_code)
         ));
 
         // Current feedback
@@ -1926,7 +1926,7 @@ impl SkillEvolution {
         prompt.push_str("## Previous Content (has issues)\n");
         prompt.push_str(&format!(
             "```markdown\n{}\n```\n\n",
-            current_feedback.previous_code
+            Self::sanitize_for_code_fence(&current_feedback.previous_code)
         ));
 
         prompt.push_str(&format!("## Issues Found ({})\n", current_feedback.stage));
@@ -2207,7 +2207,7 @@ or\n\
             context.skill_name
         ));
 
-        prompt.push_str(&format!("Content:\n```markdown\n{}\n```\n\n", md_content));
+        prompt.push_str(&format!("Content:\n```markdown\n{}\n```\n\n", Self::sanitize_for_code_fence(md_content)));
 
         prompt.push_str("\
 Check for the following issues:\n\
