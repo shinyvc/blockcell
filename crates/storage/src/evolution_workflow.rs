@@ -947,7 +947,9 @@ mod tests {
         assert_eq!(claimed.id, workflow_id);
         assert_eq!(claimed.lease_owner.as_deref(), Some("worker-a"));
 
-        let second_claim = second_store.claim_next("worker-b", 60, None).expect("claim");
+        let second_claim = second_store
+            .claim_next("worker-b", 60, None)
+            .expect("claim");
         assert!(second_claim.is_none());
 
         let stored = first_store

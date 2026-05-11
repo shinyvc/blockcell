@@ -8703,21 +8703,23 @@ impl AgentRuntime {
 
         // 在 ForkChild 上下文中执行（同时作用域化 AbortToken 和 AgentContext，
         // 确保 current_abort_token() 在子代理内部返回正确的 child token）
-        scope_abort_token(abort_token_for_scope, scope_agent_context(identity.clone(), async {
-            info!(
-                agent_id = %identity.agent_id,
-                role = "fork-child",
-                "Executing fork mode"
-            );
+        scope_abort_token(
+            abort_token_for_scope,
+            scope_agent_context(identity.clone(), async {
+                info!(
+                    agent_id = %identity.agent_id,
+                    role = "fork-child",
+                    "Executing fork mode"
+                );
 
-            // 构建 Fork 消息
-            let safe_prompt = Self::sanitize_fork_prompt(&prompt);
-            let fork_messages = vec![
-                ChatMessage::system(
-                    "You are a forked agent. Execute directly without spawning subagents.",
-                ),
-                ChatMessage::user(&format!(
-                    "<fork_directive>\n\
+                // 构建 Fork 消息
+                let safe_prompt = Self::sanitize_fork_prompt(&prompt);
+                let fork_messages = vec![
+                    ChatMessage::system(
+                        "You are a forked agent. Execute directly without spawning subagents.",
+                    ),
+                    ChatMessage::user(&format!(
+                        "<fork_directive>\n\
                     RULES:\n\
                     1. Do NOT spawn sub-agents; execute directly.\n\
                     2. Do NOT converse; execute and report results.\n\
@@ -8725,47 +8727,51 @@ impl AgentRuntime {
                     4. Keep report under 500 words.\n\
                     \n\
                     Task: {}",
-                    safe_prompt
-                )),
-            ];
+                        safe_prompt
+                    )),
+                ];
 
-            // 构建缓存安全参数，填入父对话历史以继承上下文
-            let cache_safe_params = CacheSafeParams {
-                fork_context_messages: parent_history,
-                ..CacheSafeParams::default()
-            };
+                // 构建缓存安全参数，填入父对话历史以继承上下文
+                let cache_safe_params = CacheSafeParams {
+                    fork_context_messages: parent_history,
+                    ..CacheSafeParams::default()
+                };
 
-            // 构建 SubagentOverrides，传递 AbortToken
-            let overrides = SubagentOverrides {
-                abort_token: Some(child_abort_token),
-                ..Default::default()
-            };
+                // 构建 SubagentOverrides，传递 AbortToken
+                let overrides = SubagentOverrides {
+                    abort_token: Some(child_abort_token),
+                    ..Default::default()
+                };
 
-            // 构建 ForkedAgentParams（使用 builder 模式）
-            let params = ForkedAgentParams::builder()
-                .provider_pool(self.provider_pool.clone())
-                .prompt_messages(fork_messages)
-                .cache_safe_params(cache_safe_params)
-                .fork_label("fork")
-                .max_turns(10)
-                .agent_type(None)
-                .disallowed_tools(vec!["agent".to_string(), "spawn".to_string()])
-                .one_shot(true)
-                .overrides(overrides)
-                .build()
-                .map_err(|e| {
-                    blockcell_core::Error::Tool(format!("ForkedAgentParams build failed: {}", e))
-                })?;
+                // 构建 ForkedAgentParams（使用 builder 模式）
+                let params = ForkedAgentParams::builder()
+                    .provider_pool(self.provider_pool.clone())
+                    .prompt_messages(fork_messages)
+                    .cache_safe_params(cache_safe_params)
+                    .fork_label("fork")
+                    .max_turns(10)
+                    .agent_type(None)
+                    .disallowed_tools(vec!["agent".to_string(), "spawn".to_string()])
+                    .one_shot(true)
+                    .overrides(overrides)
+                    .build()
+                    .map_err(|e| {
+                        blockcell_core::Error::Tool(format!(
+                            "ForkedAgentParams build failed: {}",
+                            e
+                        ))
+                    })?;
 
-            // 执行 Fork Agent
-            let result = run_forked_agent(params)
-                .await
-                .map_err(|e| blockcell_core::Error::Tool(format!("Fork failed: {}", e)))?;
+                // 执行 Fork Agent
+                let result = run_forked_agent(params)
+                    .await
+                    .map_err(|e| blockcell_core::Error::Tool(format!("Fork failed: {}", e)))?;
 
-            Ok(result
-                .final_content
-                .unwrap_or_else(|| "Fork completed with no output".to_string()))
-        }))  // scope_agent_context + scope_abort_token
+                Ok(result
+                    .final_content
+                    .unwrap_or_else(|| "Fork completed with no output".to_string()))
+            }),
+        ) // scope_agent_context + scope_abort_token
         .await
     }
 
@@ -9153,7 +9159,8 @@ impl AgentRuntime {
 
                     // 清理 worktree（主 spawn 的清理代码因 panic 不会执行）
                     if let Some(ref wt_path) = guard_worktree_path {
-                        let wt_name = format!("agent-{}", &guard_task_id[..16.min(guard_task_id.len())]);
+                        let wt_name =
+                            format!("agent-{}", &guard_task_id[..16.min(guard_task_id.len())]);
                         let status_result = tokio::process::Command::new("git")
                             .args(["status", "--porcelain"])
                             .current_dir(wt_path)

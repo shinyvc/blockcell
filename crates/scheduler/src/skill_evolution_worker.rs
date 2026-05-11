@@ -89,22 +89,23 @@ impl SkillEvolutionWorker {
             warn!(error = %e, "Failed to sync pending skill evolution records");
         }
 
-        let workflow = match self
-            .store
-            .claim_next(&self.worker_id, self.lease_duration_secs, Some("skill"))
-        {
-            Ok(Some(workflow)) => workflow,
-            Ok(None) => {
-                if let Err(e) = self.service.tick_observations().await {
-                    warn!(error = %e, "Skill evolution observation tick failed");
+        let workflow =
+            match self
+                .store
+                .claim_next(&self.worker_id, self.lease_duration_secs, Some("skill"))
+            {
+                Ok(Some(workflow)) => workflow,
+                Ok(None) => {
+                    if let Err(e) = self.service.tick_observations().await {
+                        warn!(error = %e, "Skill evolution observation tick failed");
+                    }
+                    return;
                 }
-                return;
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to claim skill evolution workflow");
-                return;
-            }
-        };
+                Err(e) => {
+                    error!(error = %e, "Failed to claim skill evolution workflow");
+                    return;
+                }
+            };
 
         info!(
             worker_id = %self.worker_id,
@@ -263,7 +264,11 @@ impl SkillEvolutionWorker {
 
         // Check if the evolution pipeline is already running via EvolutionService.tick().
         // If so, wait for it to complete (with timeout) to avoid duplicate processing.
-        if self.service.is_evolution_pipeline_active(evolution_id).await {
+        if self
+            .service
+            .is_evolution_pipeline_active(evolution_id)
+            .await
+        {
             info!(
                 evolution_id = %evolution_id,
                 "Skill evolution pipeline already in progress via tick(), waiting for completion"
@@ -272,7 +277,11 @@ impl SkillEvolutionWorker {
             let start = std::time::Instant::now();
             while start.elapsed() < max_wait {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if !self.service.is_evolution_pipeline_active(evolution_id).await {
+                if !self
+                    .service
+                    .is_evolution_pipeline_active(evolution_id)
+                    .await
+                {
                     break;
                 }
             }
