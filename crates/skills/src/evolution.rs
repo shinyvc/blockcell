@@ -1610,14 +1610,14 @@ impl SkillEvolution {
         }
 
         if let Some(error) = &context.error_stack {
-            prompt.push_str(&format!("## Error\n```\n{}\n```\n\n", error));
+            prompt.push_str(&format!("## Error\n```\n{}\n```\n\n", Self::sanitize_for_code_fence(error)));
         }
 
         // Existing source code
         if let Some(snippet) = &context.source_snippet {
             prompt.push_str(&format!(
                 "## Current SKILL.rhai Source\n```rhai\n{}\n```\n\n",
-                snippet
+                Self::sanitize_for_code_fence(snippet)
             ));
         }
 
@@ -1689,14 +1689,14 @@ impl SkillEvolution {
                 context.skill_name
             ));
             if let Some(error) = &context.error_stack {
-                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", error));
+                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", Self::sanitize_for_code_fence(error)));
             }
         }
 
         if let Some(snippet) = &context.source_snippet {
             prompt.push_str(&format!(
                 "## Current SKILL.md Content\n```markdown\n{}\n```\n\n",
-                snippet
+                Self::sanitize_for_code_fence(snippet)
             ));
         }
 
@@ -2020,7 +2020,7 @@ impl SkillEvolution {
                 context.skill_name
             ));
             if let Some(error) = &context.error_stack {
-                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", error));
+                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", Self::sanitize_for_code_fence(error)));
             }
         }
 
@@ -2043,7 +2043,7 @@ impl SkillEvolution {
                 .unwrap_or("text");
             prompt.push_str(&format!(
                 "## Current Script Content\n```{}\n{}\n```\n\n",
-                fence, snippet
+                fence, Self::sanitize_for_code_fence(snippet)
             ));
         }
 
@@ -2092,7 +2092,7 @@ impl SkillEvolution {
         }
 
         prompt.push_str("## Previous Content (has issues)\n");
-        prompt.push_str(&format!("```\n{}\n```\n\n", current_feedback.previous_code));
+        prompt.push_str(&format!("```\n{}\n```\n\n", Self::sanitize_for_code_fence(&current_feedback.previous_code)));
         prompt.push_str(&format!(
             "## Issues Found ({})\n{}\n\n",
             current_feedback.stage, current_feedback.feedback
@@ -2260,14 +2260,14 @@ or\n\
                 context.skill_name
             ));
             if let Some(error) = &context.error_stack {
-                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", error));
+                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", Self::sanitize_for_code_fence(error)));
             }
         }
 
         if let Some(snippet) = &context.source_snippet {
             prompt.push_str(&format!(
                 "## Current SKILL.py Content\n```python\n{}\n```\n\n",
-                snippet
+                Self::sanitize_for_code_fence(snippet)
             ));
         }
 
@@ -2484,7 +2484,7 @@ or\n\
         prompt.push_str("## Previous Content (has issues)\n");
         prompt.push_str(&format!(
             "```python\n{}\n```\n\n",
-            current_feedback.previous_code
+            Self::sanitize_for_code_fence(&current_feedback.previous_code)
         ));
 
         prompt.push_str(&format!("## Issues Found ({})\n", current_feedback.stage));

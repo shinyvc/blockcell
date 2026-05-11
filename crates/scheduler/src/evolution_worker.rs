@@ -35,6 +35,18 @@ pub struct EvolutionWorker {
     wakeup: Notify,
 }
 
+/// Result of determining the next evolution step.
+///
+/// Distinguishes three cases so the caller can decide correctly:
+/// - `Step(EvolutionStep)` — there is a next step to run
+/// - `NoStep` — all steps are already complete (legitimate terminal)
+/// - `QueryFailed` — DB query failed; do NOT assume completion
+enum NextStepResult {
+    Step(EvolutionStep),
+    NoStep,
+    QueryFailed,
+}
+
 impl EvolutionWorker {
     pub fn new(store: EvolutionWorkflowStore, engine: Arc<Mutex<CoreEvolution>>) -> Self {
         let worker_id = uuid::Uuid::new_v4().to_string();
@@ -148,7 +160,7 @@ impl EvolutionWorker {
         let mut wake_after_release = false;
 
         match next_step {
-            Some(step) => {
+            NextStepResult::Step(step) => {
                 // Insert step record
                 let step_id = match self.store.insert_step(&workflow.id, step.name(), None) {
                     Ok(id) => id,
@@ -314,17 +326,19 @@ impl EvolutionWorker {
                     }
                 }
             }
-            None => {
-                // No next step — workflow should already be in terminal state.
-                // This can happen if all steps were already completed.
-                debug!(workflow_id = %workflow.id, "No pending step found, workflow may be complete");
-                // Ensure status is Promoted if not already terminal
+            NextStepResult::NoStep => {
+                // 所有步骤已完成，标记为 Promoted
+                debug!(workflow_id = %workflow.id, "所有步骤已完成，标记为 Promoted");
                 let _ = self.store.update_workflow_status_if_owned(
                     &workflow.id,
                     &self.worker_id,
                     "Promoted",
                     None,
                 );
+            }
+            NextStepResult::QueryFailed => {
+                // DB查询失败，不标记为Promoted，释放租约等待下次重试
+                warn!(workflow_id = %workflow.id, "DB查询失败，跳过本次tick，等待下次重试");
             }
         }
 
@@ -348,7 +362,8 @@ impl EvolutionWorker {
     ///
     /// Looks at the last completed step in the store and returns the next one.
     /// If no steps have been completed, returns the first step (BuildPrompt).
-    fn determine_next_step(&self, workflow: &WorkflowRecord) -> Option<EvolutionStep> {
+    /// Returns `NextStepResult` to distinguish legitimate completion from DB errors.
+    fn determine_next_step(&self, workflow: &WorkflowRecord) -> NextStepResult {
         match self.store.get_last_completed_step(&workflow.id) {
             Ok(Some(last_step)) => {
                 debug!(
@@ -356,11 +371,14 @@ impl EvolutionWorker {
                     last_step = %last_step.step_name,
                     "Found last completed step"
                 );
-                EvolutionStep::next_after(&last_step.step_name)
+                match EvolutionStep::next_after(&last_step.step_name) {
+                    Some(step) => NextStepResult::Step(step),
+                    None => NextStepResult::NoStep,
+                }
             }
             Ok(None) => {
                 // No completed steps — start from the beginning
-                Some(EvolutionStep::first())
+                NextStepResult::Step(EvolutionStep::first())
             }
             Err(e) => {
                 warn!(
@@ -368,12 +386,10 @@ impl EvolutionWorker {
                     error = %e,
                     "Failed to query last completed step — skipping to avoid re-running completed steps"
                 );
-                // Return None instead of restarting from the beginning.
-                // If we restart from EvolutionStep::first() on a DB error, we risk
-                // re-running already-completed steps, which wastes LLM calls and
-                // could corrupt the workflow state. The workflow will be retried
-                // on the next tick after the DB issue resolves.
-                None
+                // Return QueryFailed instead of None.
+                // The caller must NOT mark the workflow as Promoted on DB failure.
+                // The workflow will be retried on the next tick after the DB issue resolves.
+                NextStepResult::QueryFailed
             }
         }
     }

@@ -1129,8 +1129,11 @@ impl CoreEvolution {
                         return Err(Error::Evolution(format!("Python syntax error: {}", stderr)));
                     }
                     Err(e) => {
-                        // python3 不可用，跳过语法检查
-                        warn!("python3 不可用，跳过语法检查: {}", e);
+                        // python3 不可用，拒绝通过语法检查
+                        warn!("python3 不可用，拒绝通过语法检查: {}", e);
+                        return Err(Error::Evolution(
+                            "python3 不可用: 无法验证 Python 语法，拒绝部署".to_string(),
+                        ));
                     }
                     _ => {}
                 }

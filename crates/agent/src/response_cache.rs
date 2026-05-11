@@ -303,8 +303,8 @@ impl ResponseCache {
         session_key.hash(&mut hasher);
         ts.hash(&mut hasher);
         let h = hasher.finish();
-        // 8 lowercase hex chars
-        format!("{:08x}", h & 0xFFFF_FFFF)
+        // 16 lowercase hex chars (full u64)
+        format!("{:016x}", h)
     }
 }
 
@@ -584,6 +584,8 @@ impl ContentReplacementState {
 
         // 从 records 恢复 replacements
         for record in records {
+            // 将 record 的 tool_use_id 加入 seen_ids，维持 "一旦决定，永不更改" 不变量
+            state.seen_ids.insert(record.tool_use_id.clone());
             state
                 .replacements
                 .insert(record.tool_use_id.clone(), record.replacement.clone());
@@ -596,6 +598,8 @@ impl ContentReplacementState {
         // 从继承的 replacements 填充空缺
         if let Some(inherited) = inherited_replacements {
             for (id, replacement) in inherited {
+                // 将继承的 ID 也加入 seen_ids
+                state.seen_ids.insert(id.clone());
                 if !state.replacements.contains_key(id) {
                     state.replacements.insert(id.clone(), replacement.clone());
                     if !state.insertion_order.contains(id) {
@@ -604,6 +608,9 @@ impl ContentReplacementState {
                 }
             }
         }
+
+        // 强制执行 max_replacement_entries 限制
+        state.prune_if_needed();
 
         state
     }
