@@ -88,15 +88,19 @@ impl FileTracker {
     }
 
     /// 获取最近读取的文件（按时间排序）
+    ///
+    /// 不再按完整文件 token 数过滤，而是保留所有记录。
+    /// 大文件的摘要(summary)已在 record_read 时截断，输出阶段
+    /// 由 build_recovery_message 按 summary/token budget 截断。
+    /// 这避免了大文件即使有安全摘要也被完全排除的问题。
     pub fn get_recent_files(
         &self,
         max_files: usize,
-        max_tokens_per_file: usize,
+        _max_tokens_per_file: usize,
     ) -> Vec<&FileRecord> {
         let mut records: Vec<_> = self
             .records
             .values()
-            .filter(|r| r.estimated_tokens <= max_tokens_per_file)
             .collect();
 
         // 按读取时间降序排序（最近的优先）

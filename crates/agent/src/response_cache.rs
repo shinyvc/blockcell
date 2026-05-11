@@ -737,29 +737,73 @@ fn sanitize_tool_use_id(tool_use_id: &str) -> String {
 /// 清理策略：
 /// 1. 使用 session_file_stem 替换特殊字符为下划线
 /// 2. 只保留字母、数字、连字符和下划线
-/// 3. 限制长度
+/// 3. 对非 ASCII 部分追加稳定短 hash 防止不同会话映射到同一目录
+/// 4. 限制长度（先为 hash 后缀预留空间，再截断 prefix，避免 hash 被截掉）
 fn sanitize_session_key(session_key: &str) -> String {
     // 首先使用 session_file_stem 替换特殊字符（保持语义一致性）
     let stem = blockcell_core::session_file_stem(session_key);
 
-    // 然后过滤掉任何剩余的危险字符（防御性编程）
-    let sanitized: String = stem
+    // 分离 ASCII-safe 部分和非 ASCII 部分
+    let ascii_safe: String = stem
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
 
-    // 如果清理后为空，使用默认值
-    if sanitized.is_empty() {
-        return format!("session-{}", uuid::Uuid::new_v4().simple());
+    let has_non_ascii = stem.chars().any(|c| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
+
+    // 如果有非 ASCII 字符被过滤掉，追加原始 session_key 的 SHA256 短 hash
+    // 以保证不同非 ASCII 会话不会映射到同一目录，且同一 session 多次清理结果一致
+    let result = if has_non_ascii {
+        // 使用原始 session_key（而非 stem）计算 hash，保证稳定性
+        let hash = sha256_short_hash(session_key);
+        // 关键修复：先为 hash 后缀预留空间，再截断 prefix
+        // 格式为 "{prefix}-{hash}"，hash 固定 12 字符，分隔符 1 字符
+        let suffix_len = 1 + hash.len(); // "-" + hash = 13
+        let max_total = 64usize;
+        let prefix_max = max_total.saturating_sub(suffix_len);
+        let prefix = truncate_ascii_boundary(&ascii_safe, prefix_max);
+        // 如果 prefix 截断后为空或只有分隔符，使用稳定 hash 作为前缀
+        if prefix.trim_matches('-').is_empty() {
+            format!("session-{}", hash)
+        } else {
+            format!("{}-{}", prefix.trim_end_matches('-'), hash)
+        }
+    } else {
+        ascii_safe
+    };
+
+    // 如果清理后为空（极端情况：纯非 ASCII + 无 ASCII-safe 部分），使用稳定 hash
+    if result.is_empty() || result.trim_matches('-').is_empty() {
+        return format!("session-{}", sha256_short_hash(session_key));
     }
 
-    // 限制长度 (UUID 格式通常是 36 字符，允许稍长，按字符边界安全截断)
-    if sanitized.len() > 64 {
-        let boundary = sanitized.floor_char_boundary(64);
-        sanitized[..boundary].to_string()
+    // 非 ASCII 情况已在上面保证不超过 64 字符，这里只处理纯 ASCII 的情况
+    if result.len() > 64 {
+        let boundary = result.floor_char_boundary(64);
+        result[..boundary].to_string()
     } else {
-        sanitized
+        result
     }
+}
+
+/// 按字符边界安全截断 ASCII 字符串到指定字节长度
+fn truncate_ascii_boundary(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        return s.to_string();
+    }
+    let boundary = s.floor_char_boundary(max_len);
+    s[..boundary].to_string()
+}
+
+/// 计算 SHA256 的短 hash（前 12 字符），用于稳定区分非 ASCII 会话
+fn sha256_short_hash(input: &str) -> String {
+    use std::fmt::Write;
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(input.as_bytes());
+    let mut hex = String::with_capacity(12);
+    for byte in &digest[..6] {
+        write!(hex, "{:02x}", byte).unwrap();
+    }
+    hex
 }
 
 /// 构建内存 fallback 替换消息（当磁盘持久化失败时）

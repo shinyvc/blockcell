@@ -186,13 +186,16 @@ impl EvolutionWorkflowStore {
     /// Atomically claim the next available workflow.
     /// Returns None if no workflow is available.
     ///
-    /// If `provider_kind` is `Some`, only claims workflows with that provider_kind,
-    /// preventing cross-contamination between core evolution and skill evolution workers.
+    /// If `provider_kind` is `Some`, only claims workflows with that provider_kind.
+    /// If `exclude_provider_kind` is `Some`, excludes workflows with that provider_kind.
+    /// Both filters can be combined to prevent cross-contamination between
+    /// core evolution and skill evolution workers.
     pub fn claim_next(
         &self,
         worker_id: &str,
         lease_duration_secs: i64,
         provider_kind: Option<&str>,
+        exclude_provider_kind: Option<&str>,
     ) -> Result<Option<WorkflowRecord>> {
         let mut conn = self.lock_conn()?;
         let now = Utc::now();
@@ -211,9 +214,10 @@ impl EvolutionWorkflowStore {
                    AND attempt < max_attempts
                    AND (lease_until IS NULL OR lease_until < ?1)
                    AND (?2 IS NULL OR provider_kind = ?2)
+                   AND (?3 IS NULL OR provider_kind != ?3)
                  ORDER BY priority DESC, created_at ASC
                  LIMIT 1",
-                params![now_str, provider_kind],
+                params![now_str, provider_kind, exclude_provider_kind],
                 |row| row.get(0),
             )
             .optional()
@@ -709,6 +713,34 @@ impl EvolutionWorkflowStore {
         Ok(true)
     }
 
+    /// 将 workflow 延迟（defer）而不增加 attempt。
+    ///
+    /// 用于 StillRunning / WaitingForProvider 等非失败场景：
+    /// 设置状态为 RetryScheduled，lease_until 为 now + backoff_secs，
+    /// 清空 lease_owner，不增加 attempt。
+    /// claim_next 只在 lease_until < now 时领取，所以 backoff 期间不会被抢回。
+    pub fn defer_workflow_if_owned(
+        &self,
+        workflow_id: &str,
+        worker_id: &str,
+        backoff_secs: i64,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self.lock_conn()?;
+        let now_str = now_rfc3339();
+        let lease_until = (Utc::now() + chrono::Duration::seconds(backoff_secs)).to_rfc3339();
+        let updated = conn
+            .execute(
+                "UPDATE evo_workflows
+                 SET status = 'RetryScheduled', last_error = ?1, lease_owner = NULL,
+                     lease_until = ?2, updated_at = ?3
+                 WHERE id = ?4 AND lease_owner = ?5",
+                params![note, lease_until, now_str, workflow_id, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(updated == 1)
+    }
+
     // ── Events ──────────────────────────────────────────────────────────
 
     /// Append an event to the workflow event log.
@@ -941,14 +973,14 @@ mod tests {
             .expect("enqueue");
 
         let claimed = first_store
-            .claim_next("worker-a", 60, None)
+            .claim_next("worker-a", 60, None, None)
             .expect("claim")
             .expect("claimed workflow");
         assert_eq!(claimed.id, workflow_id);
         assert_eq!(claimed.lease_owner.as_deref(), Some("worker-a"));
 
         let second_claim = second_store
-            .claim_next("worker-b", 60, None)
+            .claim_next("worker-b", 60, None, None)
             .expect("claim");
         assert!(second_claim.is_none());
 
@@ -966,7 +998,7 @@ mod tests {
             .enqueue("cap.test", "test capability", "process")
             .expect("enqueue");
         let claimed = store
-            .claim_next("worker-a", 60, None)
+            .claim_next("worker-a", 60, None, None)
             .expect("claim")
             .expect("claimed workflow");
         let step_id = store
@@ -994,7 +1026,7 @@ mod tests {
             .enqueue("cap.test", "test capability", "process")
             .expect("enqueue");
         let claimed = store
-            .claim_next("worker-a", 60, None)
+            .claim_next("worker-a", 60, None, None)
             .expect("claim")
             .expect("claimed workflow");
         let step_id = store
@@ -1012,10 +1044,38 @@ mod tests {
             .expect("release lease"));
 
         let reclaimed = store
-            .claim_next("worker-b", 60, None)
+            .claim_next("worker-b", 60, None, None)
             .expect("reclaim")
             .expect("workflow should be claimable again");
         assert_eq!(reclaimed.id, workflow_id);
         assert_eq!(reclaimed.lease_owner.as_deref(), Some("worker-b"));
+    }
+
+    #[test]
+    fn claim_next_excludes_provider_kind() {
+        let (_dir, store) = open_temp_store();
+        // Enqueue a skill workflow and a core workflow
+        let skill_id = store
+            .enqueue("cap.skill", "skill evolution", "skill")
+            .expect("enqueue skill");
+        let core_id = store
+            .enqueue("cap.core", "core evolution", "process")
+            .expect("enqueue core");
+
+        // Core worker excludes "skill" — should only claim the core workflow
+        let claimed = store
+            .claim_next("core-worker", 60, None, Some("skill"))
+            .expect("claim")
+            .expect("claimed workflow");
+        assert_eq!(claimed.id, core_id);
+        assert_eq!(claimed.provider_kind, "process");
+
+        // Skill worker with provider_kind="skill" — should only claim the skill workflow
+        let skill_claimed = store
+            .claim_next("skill-worker", 60, Some("skill"), None)
+            .expect("claim")
+            .expect("claimed workflow");
+        assert_eq!(skill_claimed.id, skill_id);
+        assert_eq!(skill_claimed.provider_kind, "skill");
     }
 }

@@ -320,7 +320,7 @@ fn default_attempt() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EvolutionStatus {
     Triggered,
     Generating,

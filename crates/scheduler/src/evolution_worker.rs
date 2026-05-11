@@ -99,10 +99,12 @@ impl EvolutionWorker {
         }
 
         // 2. Claim next workflow
-        let workflow = match self
-            .store
-            .claim_next(&self.worker_id, self.lease_duration_secs, None)
-        {
+        let workflow = match self.store.claim_next(
+            &self.worker_id,
+            self.lease_duration_secs,
+            None,
+            Some("skill"),
+        ) {
             Ok(Some(w)) => w,
             Ok(None) => {
                 debug!(worker_id = %self.worker_id, "No workflow to claim");

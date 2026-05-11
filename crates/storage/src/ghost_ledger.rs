@@ -104,6 +104,7 @@ impl GhostLedger {
             db_path: db_path.to_path_buf(),
         };
         ledger.init_schema()?;
+        ledger.migrate_schema()?;
         Ok(ledger)
     }
 
@@ -355,14 +356,55 @@ impl GhostLedger {
         Ok(())
     }
 
-    pub fn claim_reviewable_episodes(&self, limit: usize) -> Result<Vec<GhostEpisodeRecord>> {
+    /// Update episode status only if the caller still owns the review lease.
+    /// Returns false if ownership check fails (lease lost or stolen by another worker).
+    pub fn update_episode_status_if_review_owned(
+        &self,
+        episode_id: &str,
+        worker_id: &str,
+        status: &str,
+    ) -> Result<bool> {
+        let now = now_rfc3339();
+        let conn = self.lock_conn()?;
+        let affected = conn
+            .execute(
+                "
+                UPDATE episodes
+                SET status = ?2, updated_at = ?3
+                WHERE id = ?1 AND review_owner = ?4
+                ",
+                params![episode_id, status, now, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(affected == 1)
+    }
+
+    /// Claim reviewable episodes with lease semantics.
+    ///
+    /// 为每个 claim 的 episode 设置 review_owner 和 review_lease_until，
+    /// 防止长耗时 review 被另一个 worker 当成 stale 重复 claim。
+    ///
+    /// Claim 条件：
+    /// - status IN ('pending_review', 'review_failed')
+    /// - status = 'reviewing' 且 review_lease_until < now（lease 过期）
+    ///
+    /// 注意：不再使用 updated_at < 10分钟 作为 stale 判断，
+    /// 因为合法但耗时的 review 可能超过 10 分钟。
+    /// 现在通过 review_lease_until 判断：只要 lease 未过期，
+    /// 其他 worker 就不会 claim 这个 episode。
+    pub fn claim_reviewable_episodes(
+        &self,
+        limit: usize,
+        worker_id: &str,
+        lease_duration_secs: i64,
+    ) -> Result<Vec<GhostEpisodeRecord>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
 
         let now = now_rfc3339();
-        // Recover episodes stuck in "reviewing" for more than 10 minutes (e.g. after crash)
-        let stale_cutoff = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        let lease_until =
+            (Utc::now() + chrono::Duration::seconds(lease_duration_secs)).to_rfc3339();
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction().map_err(map_sqlite_error)?;
         let rows = {
@@ -372,14 +414,14 @@ impl GhostLedger {
                     SELECT id, boundary_kind, subject_key, status, summary, metadata_json, created_at, updated_at
                     FROM episodes
                     WHERE status IN ('pending_review', 'review_failed')
-                       OR (status = 'reviewing' AND updated_at < ?2)
+                       OR (status = 'reviewing' AND (review_lease_until IS NULL OR review_lease_until < ?2))
                     ORDER BY created_at ASC, id ASC
                     LIMIT ?1
                     ",
                 )
                 .map_err(map_sqlite_error)?;
             let rows = stmt
-                .query_map(params![limit as i64, stale_cutoff], |row| {
+                .query_map(params![limit as i64, now], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -408,32 +450,75 @@ impl GhostLedger {
             _updated_at,
         ) in rows
         {
-            tx.execute(
+            // 原子化 claim：设置 status='reviewing' + review_owner + review_lease_until
+            let affected = tx.execute(
                 "
                 UPDATE episodes
-                SET status = 'reviewing', updated_at = ?3
+                SET status = 'reviewing', updated_at = ?3,
+                    review_owner = ?4, review_lease_until = ?5
                 WHERE id = ?1 AND (
                     status IN ('pending_review', 'review_failed')
-                    OR (status = 'reviewing' AND updated_at < ?2)
+                    OR (status = 'reviewing' AND (review_lease_until IS NULL OR review_lease_until < ?2))
                 )
                 ",
-                params![id, stale_cutoff, now],
-            )
-            .map_err(map_sqlite_error)?;
-            claimed.push(GhostEpisodeRecord {
-                id,
-                boundary_kind,
-                subject_key,
-                status: "reviewing".to_string(), // 返回事务提交后的实际状态
-                summary,
-                metadata: decode_json(&metadata_json)?,
-                created_at,
-                updated_at: now.clone(), // 更新为当前时间
-            });
+                params![id, now, now, worker_id, lease_until],
+            ).map_err(map_sqlite_error)?;
+            // 只有真正赢得 UPDATE 竞争的才放入返回列表
+            if affected == 1 {
+                claimed.push(GhostEpisodeRecord {
+                    id,
+                    boundary_kind,
+                    subject_key,
+                    status: "reviewing".to_string(),
+                    summary,
+                    metadata: decode_json(&metadata_json)?,
+                    created_at,
+                    updated_at: now.clone(),
+                });
+            }
         }
 
         tx.commit().map_err(map_sqlite_error)?;
         Ok(claimed)
+    }
+
+    /// 延长 review lease，防止长耗时 review 被当成 stale 重新 claim。
+    ///
+    /// review loop 执行期间应定期调用此方法 heartbeat 延长 lease。
+    pub fn heartbeat_review_lease(
+        &self,
+        episode_id: &str,
+        worker_id: &str,
+        lease_duration_secs: i64,
+    ) -> Result<bool> {
+        let now = now_rfc3339();
+        let lease_until =
+            (Utc::now() + chrono::Duration::seconds(lease_duration_secs)).to_rfc3339();
+        let conn = self.lock_conn()?;
+        let affected = conn
+            .execute(
+                "UPDATE episodes
+                 SET updated_at = ?1, review_lease_until = ?2
+                 WHERE id = ?3 AND review_owner = ?4",
+                params![now, lease_until, episode_id, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(affected == 1)
+    }
+
+    /// 释放 review lease（review 完成或失败后调用）。
+    pub fn release_review_lease(&self, episode_id: &str, worker_id: &str) -> Result<bool> {
+        let now = now_rfc3339();
+        let conn = self.lock_conn()?;
+        let affected = conn
+            .execute(
+                "UPDATE episodes
+                 SET review_owner = NULL, review_lease_until = NULL, updated_at = ?1
+                 WHERE id = ?2 AND review_owner = ?3",
+                params![now, episode_id, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(affected == 1)
     }
 
     pub fn insert_review_run(&self, run: NewGhostReviewRun) -> Result<String> {
@@ -662,7 +747,9 @@ impl GhostLedger {
                 summary TEXT NOT NULL,
                 metadata_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                review_owner TEXT,
+                review_lease_until TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_ghost_episodes_status ON episodes(status);
@@ -718,6 +805,30 @@ impl GhostLedger {
             ",
         )
         .map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
+    /// 为已有数据库添加新列（review lease 语义）
+    fn migrate_schema(&self) -> Result<()> {
+        let conn = self.lock_conn()?;
+        // 添加 review_owner 和 review_lease_until 列（如果不存在）
+        // SQLite ALTER TABLE ADD COLUMN 在列已存在时会报错，需要逐个尝试
+        for col_sql in [
+            "ALTER TABLE episodes ADD COLUMN review_owner TEXT",
+            "ALTER TABLE episodes ADD COLUMN review_lease_until TEXT",
+        ] {
+            match conn.execute_batch(col_sql) {
+                Ok(()) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("duplicate column name") {
+                        tracing::debug!("ghost ledger migration: column already exists, skipping");
+                    } else {
+                        return Err(map_sqlite_error(e));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -921,7 +1032,9 @@ mod tests {
             .update_episode_status(&failed_id, "review_failed")
             .unwrap();
 
-        let claimed = ledger.claim_reviewable_episodes(10).unwrap();
+        let claimed = ledger
+            .claim_reviewable_episodes(10, "test-worker", 600)
+            .unwrap();
         let claimed_ids = claimed
             .iter()
             .map(|episode| episode.id.as_str())

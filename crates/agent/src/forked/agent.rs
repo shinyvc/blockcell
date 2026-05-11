@@ -694,10 +694,13 @@ fn validate_path_safety(path: &str) -> Result<(), ForkedAgentError> {
         ));
     }
 
-    // 检查路径遍历
-    if path.contains("..") {
+    // 检查路径遍历：先词法归一化，再检查是否逃逸到父目录。
+    // 原始路径中的 ".." 在归一化后可能合法（如 "src/../lib" → "lib"），
+    // 仅当归一化后的路径仍以 ".." 开头时才拒绝（表示逃逸到工作目录之外）。
+    let normalized = normalize_path_lexically(Path::new(path));
+    if normalized.components().any(|c| c == std::path::Component::ParentDir) {
         return Err(ForkedAgentError::ToolError(
-            "Path traversal detected: '..' not allowed".to_string(),
+            "Path traversal detected: path escapes working directory".to_string(),
         ));
     }
 
@@ -734,16 +737,57 @@ fn resolve_forked_path(
     };
 
     if let Some(base) = working_dir {
-        // 先尝试用 canonicalize 解析真实路径（防 symlink 逃逸）
-        // 如果路径不存在则回退到词法检查
         let base = match std::fs::canonicalize(base) {
             Ok(real) => real,
             Err(_) => normalize_path_lexically(base),
         };
+
+        // Resolve the nearest existing ancestor to get the real path,
+        // then append the remaining non-existent suffix. This prevents
+        // symlink escape when the target path doesn't fully exist yet
+        // (e.g. workdir/link_to_outside/new_file where new_file doesn't exist).
         let resolved = match std::fs::canonicalize(&resolved) {
             Ok(real) => real,
-            Err(_) => normalize_path_lexically(&resolved),
+            Err(_) => {
+                // Walk up to find the nearest existing ancestor, canonicalize it,
+                // then append the remaining components.
+                let mut existing_ancestor = resolved.clone();
+                let mut suffix = PathBuf::new();
+                loop {
+                    if existing_ancestor.as_os_str().is_empty() {
+                        // Reached root without finding existing path —
+                        // fall back to lexical check (no symlinks possible above root)
+                        break normalize_path_lexically(&resolved);
+                    }
+                    if existing_ancestor.exists() {
+                        match std::fs::canonicalize(&existing_ancestor) {
+                            Ok(real_ancestor) => {
+                                break real_ancestor.join(suffix);
+                            }
+                            Err(_) => {
+                                // canonicalize failed even though path exists
+                                // (e.g. permission error) — reject for safety
+                                return Err(ForkedAgentError::ToolError(format!(
+                                    "Cannot resolve real path of '{}': permission denied or broken symlink",
+                                    existing_ancestor.display()
+                                )));
+                            }
+                        }
+                    }
+                    // Move up one component
+                    if let Some(parent) = existing_ancestor.parent() {
+                        if let Some(file_name) = existing_ancestor.file_name() {
+                            suffix = PathBuf::from(file_name).join(suffix);
+                        }
+                        existing_ancestor = parent.to_path_buf();
+                    } else {
+                        // Reached filesystem root
+                        break normalize_path_lexically(&resolved);
+                    }
+                }
+            }
         };
+
         if !resolved.starts_with(&base) {
             return Err(ForkedAgentError::ToolError(format!(
                 "Path '{}' is outside isolated working directory '{}'",
