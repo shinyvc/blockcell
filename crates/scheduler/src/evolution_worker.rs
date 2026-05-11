@@ -101,7 +101,7 @@ impl EvolutionWorker {
         // 2. Claim next workflow
         let workflow = match self
             .store
-            .claim_next(&self.worker_id, self.lease_duration_secs)
+            .claim_next(&self.worker_id, self.lease_duration_secs, None)
         {
             Ok(Some(w)) => w,
             Ok(None) => {
@@ -446,6 +446,8 @@ impl EvolutionWorker {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut consecutive_failures = 0u32;
+            const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
             loop {
                 tokio::select! {
@@ -455,6 +457,7 @@ impl EvolutionWorker {
                     _ = interval.tick() => {
                         match store.renew_lease(&workflow_id, &worker_id, lease_duration_secs) {
                             Ok(true) => {
+                                consecutive_failures = 0;
                                 debug!(workflow_id = %workflow_id, worker_id = %worker_id, "Renewed evolution workflow lease");
                             }
                             Ok(false) => {
@@ -462,8 +465,12 @@ impl EvolutionWorker {
                                 break;
                             }
                             Err(e) => {
-                                warn!(workflow_id = %workflow_id, worker_id = %worker_id, error = %e, "Failed to heartbeat evolution workflow lease");
-                                break;
+                                consecutive_failures += 1;
+                                warn!(workflow_id = %workflow_id, worker_id = %worker_id, error = %e, consecutive_failures = consecutive_failures, max_retries = MAX_CONSECUTIVE_FAILURES, "Failed to heartbeat evolution workflow lease (will retry)");
+                                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                                    warn!(workflow_id = %workflow_id, worker_id = %worker_id, "Too many consecutive heartbeat failures, giving up lease");
+                                    break;
+                                }
                             }
                         }
                     }

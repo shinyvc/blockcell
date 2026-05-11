@@ -6442,7 +6442,9 @@ impl AgentRuntime {
         if !final_response.is_empty() {
             if let Some(mode) = deferred_review_mode.take() {
                 if self.learning_coordinator.is_self_improve_enabled() {
-                    self.learning_coordinator.review_started();
+                    // Counter already incremented by try_start_review() in
+                    // check_memory_nudge()/check_skill_nudge() — do NOT call
+                    // review_started() here to avoid double increment.
                     let notify = Some((msg.channel.clone(), msg.chat_id.clone()));
                     self.spawn_review(mode, deferred_review_snapshot, notify);
                 }
@@ -6640,10 +6642,10 @@ impl AgentRuntime {
                                 );
                                 // 标记需要刷新缓存
                                 reload_flag_for_type
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    .store(true, std::sync::atomic::Ordering::Release);
                                 // 标记需要重新加载游标状态（通知主线程）
                                 cursor_reload_flag_for_type
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    .store(true, std::sync::atomic::Ordering::Release);
                             } else {
                                 warn!(
                                     memory_type = memory_type.name(),
@@ -8697,9 +8699,11 @@ impl AgentRuntime {
 
         // 获取当前 AbortToken 并创建 child token（用于链式取消）
         let child_abort_token = current_abort_token().map(|t| t.child()).unwrap_or_default();
+        let abort_token_for_scope = child_abort_token.clone();
 
-        // 在 ForkChild 上下文中执行
-        scope_agent_context(identity.clone(), async {
+        // 在 ForkChild 上下文中执行（同时作用域化 AbortToken 和 AgentContext，
+        // 确保 current_abort_token() 在子代理内部返回正确的 child token）
+        scope_abort_token(abort_token_for_scope, scope_agent_context(identity.clone(), async {
             info!(
                 agent_id = %identity.agent_id,
                 role = "fork-child",
@@ -8761,7 +8765,7 @@ impl AgentRuntime {
             Ok(result
                 .final_content
                 .unwrap_or_else(|| "Fork completed with no output".to_string()))
-        })
+        }))  // scope_agent_context + scope_abort_token
         .await
     }
 
@@ -8924,6 +8928,9 @@ impl AgentRuntime {
         let skills_dir_for_spawn = self.paths.skills_dir();
 
         // 启动后台执行
+        // 克隆 worktree_path 和 paths 给 guard task（用于 panic 时的 worktree 清理）
+        let guard_worktree_path = worktree_path.clone();
+        let guard_paths = paths.clone();
         let join_handle = tokio::spawn(async move {
             // Wrap in both AbortToken and AgentIdentity context for chain cancellation
             let result = scope_abort_token(
@@ -9133,6 +9140,7 @@ impl AgentRuntime {
 
         // Guard: if tokio::spawn fails (runtime shutdown) or task panics,
         // mark the task as Failed to prevent it from being stuck in Running state.
+        // Also clean up worktree on panic since the main spawn closure's cleanup code won't run.
         let guard_task_manager = self.task_manager.clone();
         let guard_task_id = task_id.clone();
         tokio::spawn(async move {
@@ -9142,6 +9150,33 @@ impl AgentRuntime {
                     guard_task_manager
                         .set_failed(&guard_task_id, "Agent task panicked")
                         .await;
+
+                    // 清理 worktree（主 spawn 的清理代码因 panic 不会执行）
+                    if let Some(ref wt_path) = guard_worktree_path {
+                        let wt_name = format!("agent-{}", &guard_task_id[..16.min(guard_task_id.len())]);
+                        let status_result = tokio::process::Command::new("git")
+                            .args(["status", "--porcelain"])
+                            .current_dir(wt_path)
+                            .output()
+                            .await;
+                        let has_uncommitted = status_result
+                            .as_ref()
+                            .is_ok_and(|o| o.status.success() && !o.stdout.is_empty());
+                        if has_uncommitted {
+                            warn!(worktree = %wt_name, "Worktree has uncommitted changes (panic), preserving for manual review");
+                        } else {
+                            let _ = tokio::process::Command::new("git")
+                                .args(["worktree", "remove", &wt_path.display().to_string()])
+                                .current_dir(guard_paths.workspace())
+                                .output()
+                                .await;
+                            let _ = tokio::process::Command::new("git")
+                                .args(["branch", "-D", &wt_name])
+                                .current_dir(guard_paths.workspace())
+                                .output()
+                                .await;
+                        }
+                    }
                 } else {
                     // Cancelled/aborted — this is normal (e.g. /tasks cancel), don't mark as failed
                     warn!(task_id = %guard_task_id, "Typed agent task was cancelled/aborted");
@@ -9610,6 +9645,9 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
             None
         };
 
+        // 克隆给 guard task（用于 panic 时的 worktree 清理）
+        let guard_worktree_path = worktree_path.clone();
+        let guard_workspace = workspace.clone();
         let join_handle = tokio::spawn(async move {
             // Wrap in both AbortToken and AgentIdentity context for chain cancellation
             let result = scope_abort_token(
@@ -9777,6 +9815,7 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
 
         // Guard: if tokio::spawn fails (runtime shutdown) or task panics,
         // mark the task as Failed to prevent it from being stuck in Running state.
+        // Also clean up worktree on panic since the main spawn closure's cleanup code won't run.
         let guard_task_manager = self.task_manager.clone();
         let guard_task_id = task_id.clone();
         tokio::spawn(async move {
@@ -9789,6 +9828,11 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
                     guard_task_manager
                         .set_failed(&guard_task_id, &format!("Task panicked: {}", e))
                         .await;
+
+                    // 清理 worktree（主 spawn 的清理代码因 panic 不会执行）
+                    if guard_worktree_path.is_some() {
+                        Self::cleanup_worktree(&guard_workspace, &guard_task_id).await;
+                    }
                 } else {
                     warn!(task_id = %guard_task_id, "Typed agent task was cancelled (not a panic)");
                 }

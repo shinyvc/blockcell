@@ -1,4 +1,4 @@
-use blockcell_core::{Config, InboundMessage, Paths, Result};
+use blockcell_core::{Config, Error, InboundMessage, Paths, Result};
 use chrono::Utc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -191,7 +191,8 @@ impl GhostMaintenanceService {
         };
 
         if let Err(e) = self.inbound_tx.send(msg).await {
-            error!(error = %e, "Ghost: failed to send routine message");
+            error!(error = %e, "Ghost: failed to send routine message, shutting down");
+            return Err(Error::Channel(format!("Ghost routine send failed: {}", e)));
         }
 
         info!("👻 GhostMaintenanceService: routine message dispatched");
@@ -237,6 +238,9 @@ impl GhostMaintenanceService {
 
         // Clone paths for config reloading
         let config_paths = self.paths.clone();
+
+        let mut consecutive_failures = 0u32;
+        const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
         loop {
             tokio::select! {
@@ -302,6 +306,13 @@ impl GhostMaintenanceService {
                         next_scheduled = schedule.upcoming(Utc).next();
                         if let Err(e) = self.run_routine().await {
                             warn!(error = %e.to_string(), "Ghost routine failed");
+                            consecutive_failures += 1;
+                            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                                error!("Ghost: too many consecutive failures, stopping maintenance loop");
+                                break;
+                            }
+                        } else {
+                            consecutive_failures = 0;
                         }
                     }
                 }

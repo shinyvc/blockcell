@@ -23,6 +23,36 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// RAII guard that removes a temporary file on drop.
+/// Prevents file leaks if the enclosing function panics or is cancelled.
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_ref().expect("TempFileGuard path is None")
+    }
+
+    /// Consume the guard without deleting the file (transfer ownership).
+    #[allow(dead_code)]
+    fn into_path(mut self) -> PathBuf {
+        self.path.take().unwrap()
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// 技能自进化管理器
 pub struct SkillEvolution {
     skills_dir: PathBuf,
@@ -855,15 +885,15 @@ impl SkillEvolution {
                     info!(evolution_id = %evolution_id, "🔨 [compile] Hybrid skill — running Python syntax check for local script asset");
                     let final_script =
                         self.resolve_final_script(&record.skill_name, &patch.diff)?;
-                    let temp_path =
-                        std::env::temp_dir().join(format!("{}_compile.py", record.skill_name));
-                    std::fs::write(&temp_path, &final_script)?;
+                    let temp_guard = TempFileGuard::new(
+                        std::env::temp_dir().join(format!("{}_compile.py", record.skill_name)),
+                    );
+                    std::fs::write(temp_guard.path(), &final_script)?;
 
                     let output = std::process::Command::new("python3")
-                        .args(["-m", "py_compile", temp_path.to_str().unwrap_or("")])
+                        .args(["-m", "py_compile", temp_guard.path().to_str().unwrap_or("")])
                         .output();
-
-                    let _ = std::fs::remove_file(&temp_path);
+                    // TempFileGuard's Drop handles cleanup even on panic/cancellation
 
                     match output {
                         Ok(out) if out.status.success() => (true, None),
@@ -2751,12 +2781,12 @@ or\n\
         skill_name: &str,
         script_content: &str,
     ) -> Result<(bool, Option<String>)> {
-        let temp_path = std::env::temp_dir().join(format!(
+        let temp_guard = TempFileGuard::new(std::env::temp_dir().join(format!(
             "{}_compile_{}.rhai",
             skill_name,
             RECORD_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&temp_path, script_content)?;
+        )));
+        std::fs::write(temp_guard.path(), script_content)?;
 
         info!(
             evolution_id = %evolution_id,
@@ -2773,9 +2803,8 @@ or\n\
         );
 
         info!(evolution_id = %evolution_id, "🔨 [compile] Compiling with Rhai engine...");
-        let result = self.compile_skill(&temp_path).await;
-
-        let _ = std::fs::remove_file(&temp_path);
+        let result = self.compile_skill(temp_guard.path()).await;
+        // TempFileGuard's Drop handles cleanup even on panic/cancellation
         result
     }
 

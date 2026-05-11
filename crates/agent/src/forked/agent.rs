@@ -734,8 +734,16 @@ fn resolve_forked_path(
     };
 
     if let Some(base) = working_dir {
-        let base = normalize_path_lexically(base);
-        let resolved = normalize_path_lexically(&resolved);
+        // 先尝试用 canonicalize 解析真实路径（防 symlink 逃逸）
+        // 如果路径不存在则回退到词法检查
+        let base = match std::fs::canonicalize(base) {
+            Ok(real) => real,
+            Err(_) => normalize_path_lexically(base),
+        };
+        let resolved = match std::fs::canonicalize(&resolved) {
+            Ok(real) => real,
+            Err(_) => normalize_path_lexically(&resolved),
+        };
         if !resolved.starts_with(&base) {
             return Err(ForkedAgentError::ToolError(format!(
                 "Path '{}' is outside isolated working directory '{}'",

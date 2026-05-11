@@ -62,12 +62,22 @@ impl SkillTracker {
         );
     }
 
-    /// 获取最近加载的技能（按时间排序，过滤超过 token 预算的技能）
-    pub fn get_recent_skills(&self, max_tokens_per_skill: usize) -> Vec<&SkillRecord> {
+    /// 获取最近加载的技能（按时间排序，过大技能标记为截断而非丢弃）
+    pub fn get_recent_skills(&self, max_tokens_per_skill: usize) -> Vec<SkillRecord> {
         let mut records: Vec<_> = self
             .records
             .values()
-            .filter(|r| r.estimated_tokens <= max_tokens_per_skill)
+            .map(|r| {
+                let mut record = r.clone();
+                if record.estimated_tokens > max_tokens_per_skill {
+                    record.summary = format!(
+                        "[Skill too large ({} tokens), truncated]",
+                        record.estimated_tokens
+                    );
+                    record.estimated_tokens = max_tokens_per_skill;
+                }
+                record
+            })
             .collect();
 
         // 按加载时间降序排序（最近的优先）

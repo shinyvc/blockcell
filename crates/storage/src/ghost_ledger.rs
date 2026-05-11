@@ -361,6 +361,8 @@ impl GhostLedger {
         }
 
         let now = now_rfc3339();
+        // Recover episodes stuck in "reviewing" for more than 10 minutes (e.g. after crash)
+        let stale_cutoff = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction().map_err(map_sqlite_error)?;
         let rows = {
@@ -370,13 +372,14 @@ impl GhostLedger {
                     SELECT id, boundary_kind, subject_key, status, summary, metadata_json, created_at, updated_at
                     FROM episodes
                     WHERE status IN ('pending_review', 'review_failed')
+                       OR (status = 'reviewing' AND updated_at < ?2)
                     ORDER BY created_at ASC, id ASC
                     LIMIT ?1
                     ",
                 )
                 .map_err(map_sqlite_error)?;
             let rows = stmt
-                .query_map(params![limit as i64], |row| {
+                .query_map(params![limit as i64, stale_cutoff], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -408,10 +411,13 @@ impl GhostLedger {
             tx.execute(
                 "
                 UPDATE episodes
-                SET status = 'reviewing', updated_at = ?2
-                WHERE id = ?1 AND status IN ('pending_review', 'review_failed')
+                SET status = 'reviewing', updated_at = ?3
+                WHERE id = ?1 AND (
+                    status IN ('pending_review', 'review_failed')
+                    OR (status = 'reviewing' AND updated_at < ?2)
+                )
                 ",
-                params![id, now],
+                params![id, stale_cutoff, now],
             )
             .map_err(map_sqlite_error)?;
             claimed.push(GhostEpisodeRecord {

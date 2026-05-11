@@ -58,7 +58,24 @@ pub async fn run_background_review_for_episode(
     };
     let metrics = crate::ghost_metrics::get_ghost_metrics(paths);
     metrics.record_review_started();
-    let snapshot: GhostEpisodeSnapshot = serde_json::from_value(episode.metadata.clone())?;
+    let snapshot: GhostEpisodeSnapshot = match serde_json::from_value(episode.metadata.clone()) {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(
+                episode_id = %episode_id,
+                error = %err,
+                "Failed to deserialize episode metadata for background review"
+            );
+            metrics.record_review_failed();
+            return record_failed_review_run(
+                ledger,
+                episode_id,
+                &format!("Metadata deserialization error: {}", err),
+                None,
+                None,
+            );
+        }
+    };
 
     let Some((provider_idx, provider)) = provider_pool.acquire() else {
         metrics.record_review_failed();
@@ -191,16 +208,32 @@ pub async fn run_pending_background_reviews(
     let episodes = ledger.claim_reviewable_episodes(limit)?;
     let mut outcomes = Vec::with_capacity(episodes.len());
     for episode in episodes {
-        outcomes.push(
-            run_background_review_for_episode(
-                paths,
-                Arc::clone(&provider_pool),
-                &episode.id,
-                config,
-                &ledger,
-            )
-            .await?,
-        );
+        match run_background_review_for_episode(
+            paths,
+            Arc::clone(&provider_pool),
+            &episode.id,
+            config,
+            &ledger,
+        )
+        .await
+        {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(err) => {
+                warn!(
+                    episode_id = %episode.id,
+                    error = %err,
+                    "Background review failed for episode, marking as review_failed and continuing"
+                );
+                // Mark the episode as review_failed so it can be retried
+                if let Err(e) = ledger.update_episode_status(&episode.id, "review_failed") {
+                    warn!(
+                        episode_id = %episode.id,
+                        error = %e,
+                        "Failed to mark episode as review_failed after review error"
+                    );
+                }
+            }
+        }
     }
     Ok(outcomes)
 }

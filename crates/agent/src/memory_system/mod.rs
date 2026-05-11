@@ -275,7 +275,7 @@ impl MemorySystem {
     /// 如果后台任务设置了标志，返回 true 并清除标志。
     fn check_and_clear_cursor_reload(&self) -> bool {
         self.cursor_reload_flag
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
+            .swap(false, std::sync::atomic::Ordering::Acquire)
     }
 
     /// 获取配置

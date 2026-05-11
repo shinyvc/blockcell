@@ -1869,6 +1869,13 @@ impl EvolutionService {
         &self.evolution
     }
 
+    /// Check if the evolution pipeline is actively running for a specific evolution_id.
+    /// Used to coordinate between EvolutionService.tick() and SkillEvolutionWorker
+    /// to prevent duplicate processing of the same evolution.
+    pub async fn is_evolution_pipeline_active(&self, evolution_id: &str) -> bool {
+        self.pipeline_locks.lock().await.contains(evolution_id)
+    }
+
     /// 获取进化记录目录路径
     fn records_dir(&self) -> PathBuf {
         self.evolution.records_dir()

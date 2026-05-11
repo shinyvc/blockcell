@@ -91,9 +91,13 @@ impl FileTracker {
     pub fn get_recent_files(
         &self,
         max_files: usize,
-        _max_tokens_per_file: usize,
+        max_tokens_per_file: usize,
     ) -> Vec<&FileRecord> {
-        let mut records: Vec<_> = self.records.values().collect();
+        let mut records: Vec<_> = self
+            .records
+            .values()
+            .filter(|r| r.estimated_tokens <= max_tokens_per_file)
+            .collect();
 
         // 按读取时间降序排序（最近的优先）
         records.sort_by(|a, b| b.read_at.cmp(&a.read_at));

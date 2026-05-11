@@ -74,6 +74,15 @@ impl Tool for SpawnTool {
             )
         })?;
 
+        // ===== 检查 spawn 权限（防御性检查，与 AgentTool 保持一致） =====
+        if !ctx.can_spawn_subagent() {
+            return Ok(json!({
+                "error": "Cannot spawn subagent",
+                "reason": "ForkChild 和 ONE_SHOT Agent 不能继续 spawn 子 Agent",
+                "hint": "请直接使用工具 (Read, Grep, Write, Edit)"
+            }));
+        }
+
         let skill_name = params
             .get("skill_name")
             .and_then(|v| v.as_str())

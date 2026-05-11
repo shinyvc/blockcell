@@ -679,7 +679,7 @@ fn sanitize_tool_use_id(tool_use_id: &str) -> String {
     // 移除或替换危险字符
     let sanitized: String = tool_use_id
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
 
     // 如果清理后为空，使用默认值
@@ -687,9 +687,10 @@ fn sanitize_tool_use_id(tool_use_id: &str) -> String {
         return format!("tool-{}", uuid::Uuid::new_v4().simple());
     }
 
-    // 限制长度
+    // 限制长度（按字符边界安全截断，避免 panic）
     let result = if sanitized.len() > 64 {
-        sanitized[..64].to_string()
+        let boundary = sanitized.floor_char_boundary(64);
+        sanitized[..boundary].to_string()
     } else {
         sanitized
     };
@@ -744,7 +745,7 @@ fn sanitize_session_key(session_key: &str) -> String {
     // 然后过滤掉任何剩余的危险字符（防御性编程）
     let sanitized: String = stem
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
 
     // 如果清理后为空，使用默认值
@@ -752,9 +753,10 @@ fn sanitize_session_key(session_key: &str) -> String {
         return format!("session-{}", uuid::Uuid::new_v4().simple());
     }
 
-    // 限制长度 (UUID 格式通常是 36 字符，允许稍长)
+    // 限制长度 (UUID 格式通常是 36 字符，允许稍长，按字符边界安全截断)
     if sanitized.len() > 64 {
-        sanitized[..64].to_string()
+        let boundary = sanitized.floor_char_boundary(64);
+        sanitized[..boundary].to_string()
     } else {
         sanitized
     }

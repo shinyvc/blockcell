@@ -1,5 +1,6 @@
 use blockcell_core::{Config, InboundMessage, Paths, Result};
 use std::collections::HashSet;
+use tracing::warn;
 
 use crate::token::estimate_tokens;
 
@@ -130,8 +131,19 @@ fn collect_file_memory_items(
         ("USER.md", paths.user_md()),
         ("MEMORY.md", paths.memory_md()),
     ] {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            continue;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "Failed to read memory file (permission error or other I/O error)"
+                );
+                // Continue with other files — permission error on one file
+                // should not block the other.
+                continue;
+            }
         };
         for chunk in memory_chunks(&content) {
             let score = recall_score(&chunk, query_tokens);

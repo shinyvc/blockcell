@@ -91,7 +91,7 @@ impl SkillEvolutionWorker {
 
         let workflow = match self
             .store
-            .claim_next(&self.worker_id, self.lease_duration_secs)
+            .claim_next(&self.worker_id, self.lease_duration_secs, Some("skill"))
         {
             Ok(Some(workflow)) => workflow,
             Ok(None) => {
@@ -261,6 +261,23 @@ impl SkillEvolutionWorker {
         let skill_name = workflow.capability_id.as_str();
         let evolution_id = workflow.description.as_str();
 
+        // Check if the evolution pipeline is already running via EvolutionService.tick().
+        // If so, wait for it to complete (with timeout) to avoid duplicate processing.
+        if self.service.is_evolution_pipeline_active(evolution_id).await {
+            info!(
+                evolution_id = %evolution_id,
+                "Skill evolution pipeline already in progress via tick(), waiting for completion"
+            );
+            let max_wait = std::time::Duration::from_secs(90);
+            let start = std::time::Instant::now();
+            while start.elapsed() < max_wait {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if !self.service.is_evolution_pipeline_active(evolution_id).await {
+                    break;
+                }
+            }
+        }
+
         self.service
             .process_pending_evolution(skill_name, evolution_id)
             .await?;
@@ -344,20 +361,28 @@ impl SkillEvolutionWorker {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut consecutive_failures = 0u32;
+            const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => break,
                     _ = interval.tick() => {
                         match store.renew_lease(&workflow_id, &worker_id, lease_duration_secs) {
-                            Ok(true) => {}
+                            Ok(true) => {
+                                consecutive_failures = 0;
+                            }
                             Ok(false) => {
                                 warn!(workflow_id = %workflow_id, worker_id = %worker_id, "Lost skill evolution lease during heartbeat");
                                 break;
                             }
                             Err(e) => {
-                                warn!(workflow_id = %workflow_id, worker_id = %worker_id, error = %e, "Failed to heartbeat skill evolution lease");
-                                break;
+                                consecutive_failures += 1;
+                                warn!(workflow_id = %workflow_id, worker_id = %worker_id, error = %e, consecutive_failures = consecutive_failures, max_retries = MAX_CONSECUTIVE_FAILURES, "Failed to heartbeat skill evolution lease (will retry)");
+                                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                                    warn!(workflow_id = %workflow_id, worker_id = %worker_id, "Too many consecutive heartbeat failures, giving up lease");
+                                    break;
+                                }
                             }
                         }
                     }
