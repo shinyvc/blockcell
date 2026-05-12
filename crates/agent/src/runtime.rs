@@ -6526,11 +6526,34 @@ impl AgentRuntime {
                                 .to_string(),
                         );
 
+                        // 确保 session memory 文件存在于磁盘上，
+                        // 否则 forked agent 的 file_edit 会因文件不存在而失败
+                        let template =
+                            crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE;
+                        match crate::session_memory::setup_session_memory_file(
+                            &memory_path,
+                            template,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                info!(
+                                    path = %memory_path.display(),
+                                    "[layer3] Session memory file ensured on disk"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    path = %memory_path.display(),
+                                    error = %e,
+                                    "[layer3] Failed to initialize session memory file"
+                                );
+                            }
+                        }
+
                         let current_memory = tokio::fs::read_to_string(&memory_path)
                             .await
-                            .unwrap_or_else(|_| {
-                                crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE.to_string()
-                            });
+                            .unwrap_or_else(|_| template.to_string());
 
                         let result = crate::session_memory::extract_session_memory(
                             provider_pool,
@@ -6539,7 +6562,7 @@ impl AgentRuntime {
                             history_clone,
                             &memory_path,
                             &current_memory,
-                            crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE,
+                            template,
                             max_section_length,
                         )
                         .await;

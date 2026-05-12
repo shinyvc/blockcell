@@ -22,8 +22,8 @@ pub mod recovery;
 mod template;
 
 pub use extractor::{
-    count_tool_calls_since, extract_session_memory, should_extract_memory, ExtractionError,
-    SessionMemoryConfig, SessionMemoryState,
+    count_tool_calls_since, extract_session_memory, setup_session_memory_file,
+    should_extract_memory, ExtractionError, SessionMemoryConfig, SessionMemoryState,
 };
 pub use recovery::{
     get_session_memory_content_for_compact, get_session_memory_dir, get_session_memory_path,

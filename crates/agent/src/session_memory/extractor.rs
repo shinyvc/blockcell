@@ -444,7 +444,6 @@ Use the file_edit tool to update the memory file."#,
 }
 
 /// 设置 Session Memory 文件
-#[allow(dead_code)]
 pub async fn setup_session_memory_file(
     memory_path: &Path,
     template: &str,
