@@ -850,7 +850,10 @@ impl EvolutionService {
                     );
                 }
                 Ok(SingleEvolutionResult::NotRunnable(status)) => {
-                    if matches!(*status.normalize(), EvolutionStatus::Failed | EvolutionStatus::RolledBack) {
+                    if matches!(
+                        *status.normalize(),
+                        EvolutionStatus::Failed | EvolutionStatus::RolledBack
+                    ) {
                         warn!(
                             skill = %skill_name,
                             evolution_id = %evolution_id,

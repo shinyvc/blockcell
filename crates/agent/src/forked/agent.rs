@@ -698,7 +698,10 @@ fn validate_path_safety(path: &str) -> Result<(), ForkedAgentError> {
     // 原始路径中的 ".." 在归一化后可能合法（如 "src/../lib" → "lib"），
     // 仅当归一化后的路径仍以 ".." 开头时才拒绝（表示逃逸到工作目录之外）。
     let normalized = normalize_path_lexically(Path::new(path));
-    if normalized.components().any(|c| c == std::path::Component::ParentDir) {
+    if normalized
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
         return Err(ForkedAgentError::ToolError(
             "Path traversal detected: path escapes working directory".to_string(),
         ));

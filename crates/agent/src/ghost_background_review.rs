@@ -6,8 +6,8 @@ use blockcell_providers::{CallResult, ProviderPool};
 use blockcell_storage::ghost_ledger::NewGhostReviewRun;
 use blockcell_storage::GhostLedger;
 use serde::Serialize;
-use tracing::{info, warn};
 use tokio::sync::oneshot;
+use tracing::{info, warn};
 
 use crate::memory_file_store::MemoryFileStore;
 use crate::skill_file_store::SkillFileStore;
@@ -159,7 +159,14 @@ pub async fn run_background_review_for_episode(
             );
             provider_pool.report(provider_idx, ProviderPool::classify_error(&err.to_string()));
             metrics.record_review_failed();
-            record_failed_review_run(ledger, episode_id, &err.to_string(), None, None, review_worker_id)
+            record_failed_review_run(
+                ledger,
+                episode_id,
+                &err.to_string(),
+                None,
+                None,
+                review_worker_id,
+            )
         }
     }
 }
@@ -223,11 +230,14 @@ pub async fn run_pending_background_reviews(
 
     let ledger = GhostLedger::open(&paths.ghost_ledger_db())?;
     let worker_id = format!("ghost-review-{}", uuid::Uuid::new_v4());
-    let episodes = ledger.claim_reviewable_episodes(limit, &worker_id, REVIEW_LEASE_DURATION_SECS)?;
+    let episodes =
+        ledger.claim_reviewable_episodes(limit, &worker_id, REVIEW_LEASE_DURATION_SECS)?;
     let mut outcomes = Vec::with_capacity(episodes.len());
     for episode in episodes {
         // review loop 开始前 heartbeat 延长 lease
-        if let Err(e) = ledger.heartbeat_review_lease(&episode.id, &worker_id, REVIEW_LEASE_DURATION_SECS) {
+        if let Err(e) =
+            ledger.heartbeat_review_lease(&episode.id, &worker_id, REVIEW_LEASE_DURATION_SECS)
+        {
             warn!(
                 episode_id = %episode.id,
                 error = %e,
@@ -243,9 +253,9 @@ pub async fn run_pending_background_reviews(
         let hb_episode_id = episode.id.clone();
         let hb_worker_id = worker_id.clone();
         let heartbeat_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(
-                std::time::Duration::from_secs(REVIEW_HEARTBEAT_INTERVAL_SECS)
-            );
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                REVIEW_HEARTBEAT_INTERVAL_SECS,
+            ));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut consecutive_failures = 0u32;
             const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -300,7 +310,11 @@ pub async fn run_pending_background_reviews(
                     "Background review failed for episode, marking as review_failed and continuing"
                 );
                 // Use owner-aware status update to avoid overwriting another worker's episode
-                match ledger.update_episode_status_if_review_owned(&episode.id, &worker_id, "review_failed") {
+                match ledger.update_episode_status_if_review_owned(
+                    &episode.id,
+                    &worker_id,
+                    "review_failed",
+                ) {
                     Ok(true) => {}
                     Ok(false) => {
                         warn!(episode_id = %episode.id, "Lost review lease before marking as review_failed, skipping");

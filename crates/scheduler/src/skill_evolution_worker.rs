@@ -345,28 +345,27 @@ impl SkillEvolutionWorker {
                 );
                 Ok(PipelineOutcome::StillRunning)
             }
-            Ok(SingleEvolutionResult::NotRunnable(status)) => {
-                match *status.normalize() {
-                    EvolutionStatus::Failed | EvolutionStatus::RolledBack => {
-                        warn!(
-                            evolution_id = %evolution_id,
-                            status = ?status,
-                            "Skill evolution reached terminal status, failing workflow"
-                        );
-                        Err(Error::Evolution(
-                            format!("skill evolution reached terminal status: {:?}", status),
-                        ))
-                    }
-                    _ => {
-                        info!(
-                            evolution_id = %evolution_id,
-                            status = ?status,
-                            "Skill evolution record not runnable (waitable status), deferring workflow"
-                        );
-                        Ok(PipelineOutcome::StillRunning)
-                    }
+            Ok(SingleEvolutionResult::NotRunnable(status)) => match *status.normalize() {
+                EvolutionStatus::Failed | EvolutionStatus::RolledBack => {
+                    warn!(
+                        evolution_id = %evolution_id,
+                        status = ?status,
+                        "Skill evolution reached terminal status, failing workflow"
+                    );
+                    Err(Error::Evolution(format!(
+                        "skill evolution reached terminal status: {:?}",
+                        status
+                    )))
                 }
-            }
+                _ => {
+                    info!(
+                        evolution_id = %evolution_id,
+                        status = ?status,
+                        "Skill evolution record not runnable (waitable status), deferring workflow"
+                    );
+                    Ok(PipelineOutcome::StillRunning)
+                }
+            },
             Err(e) => {
                 let record = self.service.evolution().load_record(evolution_id).ok();
                 let status = record.as_ref().map(|r| r.status.normalize());

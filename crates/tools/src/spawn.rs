@@ -103,7 +103,11 @@ impl Tool for SpawnTool {
                 .unwrap_or("");
             let mut task = format!("__SKILL_EXEC__:{}:{}", skill, user_query);
             // If 'task' is also provided, append as additional context so it isn't silently dropped
-            if let Some(extra) = params.get("task").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(extra) = params
+                .get("task")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 task = format!("{}\n[additional context]: {}", task, extra);
             }
             spawn_handle.spawn(&task, label, &ctx.channel, &ctx.chat_id, None)

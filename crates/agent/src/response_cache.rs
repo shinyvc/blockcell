@@ -749,7 +749,9 @@ fn sanitize_session_key(session_key: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
 
-    let has_non_ascii = stem.chars().any(|c| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
+    let has_non_ascii = stem
+        .chars()
+        .any(|c| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
 
     // 如果有非 ASCII 字符被过滤掉，追加原始 session_key 的 SHA256 短 hash
     // 以保证不同非 ASCII 会话不会映射到同一目录，且同一 session 多次清理结果一致
