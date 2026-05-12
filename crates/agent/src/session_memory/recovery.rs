@@ -45,6 +45,9 @@ pub async fn wait_for_session_memory_extraction(
 }
 
 /// 等待 Session Memory 提取完成（带可配置超时）
+///
+/// 使用文件 mtime > extraction_start_time 作为完成信号，
+/// 而非"文件非空"（因为模板文件在提取开始时就已创建且非空）。
 pub async fn wait_for_session_memory_extraction_with_timeout(
     memory_path: &Path,
     extraction_started_at: Option<std::time::Instant>,
@@ -56,6 +59,12 @@ pub async fn wait_for_session_memory_extraction_with_timeout(
         Some(t) => t,
         None => return Ok(()),
     };
+
+    // 将 Instant 转换为 SystemTime 用于 mtime 比较
+    // Instant 没有直接到 SystemTime 的转换，所以我们记录当前偏移量
+    let now_system = std::time::SystemTime::now();
+    let now_instant = std::time::Instant::now();
+    let extraction_start_system = now_system - (now_instant - start_time);
 
     // 计算剩余等待时间
     let elapsed = start_time.elapsed().as_millis() as u64;
@@ -72,17 +81,25 @@ pub async fn wait_for_session_memory_extraction_with_timeout(
         }
     }
 
-    // 等待文件更新或超时
+    // 等待文件 mtime > extraction_start_system 或超时
     let result = timeout(
         Duration::from_millis(remaining),
-        wait_for_file_stable(memory_path),
+        wait_for_mtime_after(memory_path, extraction_start_system),
     )
     .await;
 
     match result {
-        Ok(_) => {
+        Ok(Ok(())) => {
             tracing::info!("[session_memory] extraction completed successfully");
             Ok(())
+        }
+        Ok(Err(e)) => {
+            // 内部 IO 错误（如轮询超时未检测到 mtime 更新）
+            tracing::warn!(
+                error = %e,
+                "[session_memory] extraction wait failed internally, proceeding"
+            );
+            Err(e)
         }
         Err(_) => {
             tracing::warn!(
@@ -94,30 +111,32 @@ pub async fn wait_for_session_memory_extraction_with_timeout(
     }
 }
 
-/// 等待文件稳定（写入完成）
-async fn wait_for_file_stable(path: &Path) -> Result<(), std::io::Error> {
-    // 简化实现：轮询检查文件是否存在
-    let mut attempts = 0;
-    const MAX_ATTEMPTS: u32 = 50;
+/// 等待文件 mtime 大于 extraction_start_time（表示提取已写入新内容）
+///
+/// 使用 mtime 而非"文件非空"作为完成信号，因为模板文件在提取开始时
+/// 就已经创建且非空，"文件非空"会误判提取已完成。
+///
+/// 内部轮询不设独立总时长上限，由外层 `tokio::time::timeout()` 控制实际截止时间。
+/// 这样用户配置的 `wait_timeout_ms` 才能真正生效（如 30s/60s）。
+async fn wait_for_mtime_after(
+    path: &Path,
+    extraction_start_system: std::time::SystemTime,
+) -> Result<(), std::io::Error> {
     const POLL_INTERVAL_MS: u64 = 300;
 
-    while attempts < MAX_ATTEMPTS {
+    loop {
         if fs::try_exists(path).await? {
-            // 检查文件大小是否稳定
             let metadata = fs::metadata(path).await?;
-            if metadata.len() > 0 {
-                return Ok(());
+            if let Ok(modified) = metadata.modified() {
+                // 文件 mtime > 提取开始时间 → 提取已完成
+                if modified > extraction_start_system {
+                    return Ok(());
+                }
             }
         }
 
-        attempts += 1;
         tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "Session memory file not created within timeout",
-    ))
 }
 
 /// 获取 Session Memory 内容用于 Compact

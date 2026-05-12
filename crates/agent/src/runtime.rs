@@ -6562,23 +6562,53 @@ impl AgentRuntime {
                 crate::memory_system::PostSamplingAction::ExtractSessionMemory => {
                     info!("[post-sampling] Spawning Session Memory extraction task");
 
+                    // 先确保 session memory 文件存在于磁盘上，
+                    // 必须在 mark_extraction_started() 之前完成，
+                    // 否则模板写入的 mtime 会晚于 extraction_start_system，
+                    // 导致 compact 等待时误判提取已完成
+                    let memory_path = crate::session_memory::get_session_memory_path(
+                        memory_system.workspace_dir(),
+                        memory_system.session_id(),
+                    );
+                    let template =
+                        crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE;
+                    match crate::session_memory::setup_session_memory_file(
+                        &memory_path,
+                        template,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            info!(
+                                path = %memory_path.display(),
+                                "[layer3] Session memory file ensured on disk"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                path = %memory_path.display(),
+                                error = %e,
+                                "[layer3] Failed to initialize session memory file"
+                            );
+                        }
+                    }
+
                     // 标记提取开始（设置 extraction_started_at + has_pending_extraction）
+                    // 在模板写入之后，这样 mtime 基准不会被模板写入干扰
                     memory_system.mark_extraction_started();
 
                     // 克隆必要的数据用于异步任务
                     let provider_pool = Arc::clone(&self.provider_pool);
                     let history_clone = history.clone();
-                    let memory_path = crate::session_memory::get_session_memory_path(
-                        memory_system.workspace_dir(),
-                        memory_system.session_id(),
-                    );
                     let model = self.config.agents.defaults.model.clone();
                     let max_section_length = memory_system.config().layer3.max_section_length;
                     // 获取提取结果发送端（用于后台任务完成后通知主线程更新状态）
                     let result_sender = memory_system.session_memory_result_sender();
 
-                    // 获取最后一条消息的 ID 和索引（用于更新状态游标）
-                    let last_msg_id = history_clone.iter().rev().find(|m| m.role == "user").and_then(|m| m.id.clone());
+                    // 获取已提取历史的最后一条消息的 ID 和索引（用于更新状态游标）
+                    // 使用最后一条消息（而非最后一条 user），避免 count_tool_calls_since
+                    // 重复统计已被本次提取覆盖的 assistant tool calls
+                    let last_msg_id = history_clone.last().and_then(|m| m.id.clone());
                     let last_msg_index = history_clone.len().saturating_sub(1);
                     let current_token_count = crate::token::estimate_messages_tokens(&history_clone);
 
@@ -6588,31 +6618,6 @@ impl AgentRuntime {
                             "你是一个会话记忆提取助手。请从对话中提取关键信息并更新 Session Memory 文件。"
                                 .to_string(),
                         );
-
-                        // 确保 session memory 文件存在于磁盘上，
-                        // 否则 forked agent 的 file_edit 会因文件不存在而失败
-                        let template =
-                            crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE;
-                        match crate::session_memory::setup_session_memory_file(
-                            &memory_path,
-                            template,
-                        )
-                        .await
-                        {
-                            Ok(_) => {
-                                info!(
-                                    path = %memory_path.display(),
-                                    "[layer3] Session memory file ensured on disk"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    path = %memory_path.display(),
-                                    error = %e,
-                                    "[layer3] Failed to initialize session memory file"
-                                );
-                            }
-                        }
 
                         let current_memory = tokio::fs::read_to_string(&memory_path)
                             .await

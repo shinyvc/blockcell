@@ -141,8 +141,30 @@ pub enum GateCheckResult {
     LockGateFailed,
 }
 
-/// 三重门控检查
-pub fn check_gates(state: &DreamState, _config_dir: &Path) -> GateCheckResult {
+/// 整合器配置（从 DreamServiceConfig 传入，覆盖硬编码常量）
+#[derive(Debug, Clone)]
+pub struct ConsolidatorConfig {
+    /// 时间门限阈值（小时）
+    pub time_gate_threshold_hours: f64,
+    /// 会话门限阈值（会话数）
+    pub session_gate_threshold: usize,
+}
+
+impl Default for ConsolidatorConfig {
+    fn default() -> Self {
+        Self {
+            time_gate_threshold_hours: TIME_GATE_THRESHOLD_HOURS as f64,
+            session_gate_threshold: SESSION_GATE_THRESHOLD,
+        }
+    }
+}
+
+/// 三重门控检查（使用配置值）
+pub fn check_gates(
+    state: &DreamState,
+    _config_dir: &Path,
+    config: &ConsolidatorConfig,
+) -> GateCheckResult {
     // 1. 检查锁门控
     if state.is_consolidating {
         return GateCheckResult::LockGateFailed;
@@ -154,9 +176,9 @@ pub fn check_gates(state: &DreamState, _config_dir: &Path) -> GateCheckResult {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let hours_since_last = (now - last_time) / 3600;
+        let hours_since_last = (now.saturating_sub(last_time)) as f64 / 3600.0;
 
-        if hours_since_last < TIME_GATE_THRESHOLD_HOURS {
+        if hours_since_last < config.time_gate_threshold_hours {
             return GateCheckResult::TimeGateFailed;
         }
     } else {
@@ -167,7 +189,7 @@ pub fn check_gates(state: &DreamState, _config_dir: &Path) -> GateCheckResult {
     let new_sessions = state
         .current_session_count
         .saturating_sub(state.last_session_count);
-    if new_sessions < SESSION_GATE_THRESHOLD {
+    if new_sessions < config.session_gate_threshold {
         return GateCheckResult::SessionGateFailed;
     }
 
@@ -180,6 +202,8 @@ pub struct DreamConsolidator {
     config_dir: PathBuf,
     /// 当前状态
     state: DreamState,
+    /// 门控配置
+    gate_config: ConsolidatorConfig,
     /// Provider 池（用于 Forked Agent LLM 调用）
     provider_pool: Option<Arc<blockcell_providers::ProviderPool>>,
 }
@@ -191,8 +215,15 @@ impl DreamConsolidator {
         Ok(Self {
             config_dir: config_dir.to_path_buf(),
             state,
+            gate_config: ConsolidatorConfig::default(),
             provider_pool: None,
         })
+    }
+
+    /// 使用自定义门控配置
+    pub fn with_gate_config(mut self, config: ConsolidatorConfig) -> Self {
+        self.gate_config = config;
+        self
     }
 
     /// 设置 Provider 池
@@ -208,11 +239,13 @@ impl DreamConsolidator {
 
     /// 检查是否应该执行梦境
     pub fn should_dream(&self) -> GateCheckResult {
-        check_gates(&self.state, &self.config_dir)
+        check_gates(&self.state, &self.config_dir, &self.gate_config)
     }
 
     /// 执行梦境整合
-    pub async fn dream(&mut self) -> Result<(), DreamError> {
+    ///
+    /// timeout_secs: 单次整合的超时时间（秒），超时后仍会执行清理逻辑
+    pub async fn dream(&mut self, timeout_secs: u64) -> Result<(), DreamError> {
         // 获取锁
         self.acquire_lock().await?;
 
@@ -246,35 +279,48 @@ impl DreamConsolidator {
         let memory_dir = self.config_dir.join("memory");
         let pre_memory_state = self.scan_memory_dir(&memory_dir).await;
 
-        // 执行四阶段，收集统计
+        // 执行四阶段（带超时保护），收集统计
+        // 超时后不会 drop 整个 dream()，而是返回 Err(DreamError::Timeout)，
+        // 确保后续清理逻辑（is_consolidating=false、保存状态、释放锁）始终执行
         let mut stats = DreamStats::default();
-        let result = async {
-            self.orient().await?;
-            let signals = self.gather().await?;
-            self.consolidate(&signals).await?;
-            // 在 consolidate 后计算 memory 变化
-            let post_memory_state = self.scan_memory_dir(&memory_dir).await;
-            stats = self.compute_memory_diff(&pre_memory_state, &post_memory_state);
-            // prune 返回修剪统计
-            let prune_stats = self.prune().await?;
-            stats.sessions_pruned = prune_stats.sessions_pruned;
-            stats.sessions_processed = prune_stats.sessions_processed;
-            Ok::<(), DreamError>(())
-        }
-        .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            async {
+                self.orient().await?;
+                let signals = self.gather().await?;
+                self.consolidate(&signals).await?;
+                // 在 consolidate 后计算 memory 变化
+                let post_memory_state = self.scan_memory_dir(&memory_dir).await;
+                stats = self.compute_memory_diff(&pre_memory_state, &post_memory_state);
+                // prune 返回修剪统计
+                let prune_stats = self.prune().await?;
+                stats.sessions_pruned = prune_stats.sessions_pruned;
+                stats.sessions_processed = prune_stats.sessions_processed;
+                Ok::<(), DreamError>(())
+            },
+        )
+        .await
+        .map_err(|_| {
+            tracing::error!(
+                timeout_secs,
+                "[dream] Consolidation timed out, executing cleanup"
+            );
+            DreamError::Timeout(timeout_secs)
+        })
+        .and_then(|r| r);
 
-        // 无论成功或失败，都要更新状态并释放锁
+        // 清理：无论成功、失败或超时，都要释放锁和重置标记
         self.state.is_consolidating = false;
-        self.state.last_consolidation_time = Some(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        );
-        self.state.last_session_count = self.state.current_session_count;
 
-        // 只有成功时才增加计数
+        // 只有成功时才推进时间门和会话门，失败/超时保留原值以便重试
         if result.is_ok() {
+            self.state.last_consolidation_time = Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            );
+            self.state.last_session_count = self.state.current_session_count;
             self.state.consolidation_count += 1;
         }
 
@@ -1082,6 +1128,9 @@ pub enum DreamError {
 
     #[error("No provider pool configured - call with_provider_pool() before dream()")]
     NoProviderPool,
+
+    #[error("Consolidation timed out after {0}s")]
+    Timeout(u64),
 }
 
 #[cfg(test)]
@@ -1118,7 +1167,7 @@ mod tests {
             is_consolidating: false,
         };
 
-        let result = check_gates(&state, Path::new("/config"));
+        let result = check_gates(&state, Path::new("/config"), &ConsolidatorConfig::default());
         assert_eq!(result, GateCheckResult::TimeGateFailed);
     }
 
@@ -1132,7 +1181,7 @@ mod tests {
             is_consolidating: false,
         };
 
-        let result = check_gates(&state, Path::new("/config"));
+        let result = check_gates(&state, Path::new("/config"), &ConsolidatorConfig::default());
         assert_eq!(result, GateCheckResult::SessionGateFailed);
     }
 
@@ -1146,7 +1195,7 @@ mod tests {
             is_consolidating: true, // 正在整合
         };
 
-        let result = check_gates(&state, Path::new("/config"));
+        let result = check_gates(&state, Path::new("/config"), &ConsolidatorConfig::default());
         assert_eq!(result, GateCheckResult::LockGateFailed);
     }
 
@@ -1160,7 +1209,7 @@ mod tests {
             is_consolidating: false,
         };
 
-        let result = check_gates(&state, Path::new("/config"));
+        let result = check_gates(&state, Path::new("/config"), &ConsolidatorConfig::default());
         assert_eq!(result, GateCheckResult::Passed);
     }
 

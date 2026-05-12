@@ -8,27 +8,26 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 /// .dream_state.json 的数据结构（与 scheduler 中的 DreamState 保持一致）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// 注意：字段名和类型必须与 `scheduler::consolidator::DreamState` 完全匹配，
+/// 否则 scheduler 反序列化失败会回退 default，导致 `current_session_count` 丢失。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DreamStateData {
-    /// 当前会话计数
-    pub current_session_count: u64,
-    /// 上次整合时的会话计数
-    pub last_session_count: u64,
-    /// 上次整合时间（Unix 时间戳秒）
-    pub last_consolidation_at: Option<i64>,
+    /// 上次整合时间戳（Unix 秒，u64 — 与 scheduler 一致）
+    #[serde(default)]
+    pub last_consolidation_time: Option<u64>,
+    /// 上次整合时的会话数
+    #[serde(default)]
+    pub last_session_count: usize,
+    /// 当前会话数
+    #[serde(default)]
+    pub current_session_count: usize,
+    /// 整合次数
+    #[serde(default)]
+    pub consolidation_count: usize,
     /// 是否正在整合中
+    #[serde(default)]
     pub is_consolidating: bool,
-}
-
-impl Default for DreamStateData {
-    fn default() -> Self {
-        Self {
-            current_session_count: 0,
-            last_session_count: 0,
-            last_consolidation_at: None,
-            is_consolidating: false,
-        }
-    }
 }
 
 /// 获取 .dream_state.json 文件路径
@@ -49,7 +48,7 @@ async fn read_dream_state(base_dir: &Path) -> DreamStateData {
 async fn write_dream_state(base_dir: &Path, state: &DreamStateData) -> std::io::Result<()> {
     let path = dream_state_path(base_dir);
     let content = serde_json::to_string_pretty(state)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     tokio::fs::write(&path, content).await
 }
 

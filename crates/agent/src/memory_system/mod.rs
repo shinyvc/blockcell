@@ -238,6 +238,7 @@ impl MemorySystem {
         self.state.session_memory.initialized = true;
         self.state.session_memory.last_extracted_at = Some(std::time::Instant::now());
         self.state.session_memory.extraction_started_at = None;
+        self.state.has_pending_extraction = false;
     }
 
     /// 标记提取开始（设置 extraction_started_at）

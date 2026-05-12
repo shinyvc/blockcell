@@ -1550,6 +1550,9 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         let dream_config = DreamServiceConfig {
             enabled: config.memory.memory_system.layer6.enabled,
             check_interval_secs: config.memory.memory_system.layer6.check_interval_secs,
+            time_gate_threshold_hours: config.memory.memory_system.layer6.time_gate_threshold_hours as f64,
+            session_gate_threshold: config.memory.memory_system.layer6.session_gate_threshold,
+            timeout_secs: config.memory.memory_system.layer6.timeout_secs,
             provider_pool: Some(Arc::clone(pool)),
         };
         let dream_service = DreamService::new(dream_config, paths.clone());
