@@ -74,11 +74,9 @@ pub struct MemorySystem {
     /// 游标重新加载标志（用于后台任务通知主线程）
     cursor_reload_flag: Arc<std::sync::atomic::AtomicBool>,
     /// Session Memory 提取结果通道（后台任务完成后通知主线程更新状态）
-    session_memory_result_tx:
-        tokio::sync::watch::Sender<SessionMemoryExtractionResult>,
+    session_memory_result_tx: tokio::sync::watch::Sender<SessionMemoryExtractionResult>,
     /// Session Memory 提取结果接收端
-    session_memory_result_rx:
-        tokio::sync::watch::Receiver<SessionMemoryExtractionResult>,
+    session_memory_result_rx: tokio::sync::watch::Receiver<SessionMemoryExtractionResult>,
 }
 
 impl MemorySystem {

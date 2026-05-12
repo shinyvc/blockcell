@@ -283,22 +283,19 @@ impl DreamConsolidator {
         // 超时后不会 drop 整个 dream()，而是返回 Err(DreamError::Timeout)，
         // 确保后续清理逻辑（is_consolidating=false、保存状态、释放锁）始终执行
         let mut stats = DreamStats::default();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            async {
-                self.orient().await?;
-                let signals = self.gather().await?;
-                self.consolidate(&signals).await?;
-                // 在 consolidate 后计算 memory 变化
-                let post_memory_state = self.scan_memory_dir(&memory_dir).await;
-                stats = self.compute_memory_diff(&pre_memory_state, &post_memory_state);
-                // prune 返回修剪统计
-                let prune_stats = self.prune().await?;
-                stats.sessions_pruned = prune_stats.sessions_pruned;
-                stats.sessions_processed = prune_stats.sessions_processed;
-                Ok::<(), DreamError>(())
-            },
-        )
+        let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+            self.orient().await?;
+            let signals = self.gather().await?;
+            self.consolidate(&signals).await?;
+            // 在 consolidate 后计算 memory 变化
+            let post_memory_state = self.scan_memory_dir(&memory_dir).await;
+            stats = self.compute_memory_diff(&pre_memory_state, &post_memory_state);
+            // prune 返回修剪统计
+            let prune_stats = self.prune().await?;
+            stats.sessions_pruned = prune_stats.sessions_pruned;
+            stats.sessions_processed = prune_stats.sessions_processed;
+            Ok::<(), DreamError>(())
+        })
         .await
         .map_err(|_| {
             tracing::error!(

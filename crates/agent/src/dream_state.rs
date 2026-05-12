@@ -3,8 +3,8 @@
 //! 由于 agent 和 scheduler 存在循环依赖，agent 无法直接引用 DreamConsolidator。
 //! 此模块提供轻量级的 .dream_state.json 读写操作，用于在会话初始化时递增会话计数。
 
-use std::path::Path;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use tracing::{info, warn};
 
 /// .dream_state.json 的数据结构（与 scheduler 中的 DreamState 保持一致）
@@ -47,8 +47,7 @@ async fn read_dream_state(base_dir: &Path) -> DreamStateData {
 /// 写入 .dream_state.json
 async fn write_dream_state(base_dir: &Path, state: &DreamStateData) -> std::io::Result<()> {
     let path = dream_state_path(base_dir);
-    let content = serde_json::to_string_pretty(state)
-        .map_err(std::io::Error::other)?;
+    let content = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
     tokio::fs::write(&path, content).await
 }
 

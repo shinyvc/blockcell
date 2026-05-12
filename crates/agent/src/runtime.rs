@@ -2537,11 +2537,7 @@ impl AgentRuntime {
         );
 
         // Layer 7: Forked Agent
-        crate::memory_event!(
-            layer7,
-            config,
-            memory_system.config().layer7.max_turns
-        );
+        crate::memory_event!(layer7, config, memory_system.config().layer7.max_turns);
 
         self.memory_system = Some(memory_system);
 
@@ -3104,7 +3100,9 @@ impl AgentRuntime {
     /// This loads the four memory files (user.md, project.md, feedback.md, reference.md)
     /// from the memory directory and makes them available for system prompt injection.
     pub async fn init_memory_injector(&mut self) -> std::io::Result<()> {
-        use crate::auto_memory::{ensure_memory_dir, get_memory_dir, InjectionConfig, MemoryInjector};
+        use crate::auto_memory::{
+            ensure_memory_dir, get_memory_dir, InjectionConfig, MemoryInjector,
+        };
 
         // Ensure the memory directory and template files exist on disk
         // before loading. On a fresh install the directory is absent,
@@ -4075,14 +4073,15 @@ impl AgentRuntime {
         // ========== 7. 收集恢复信息 ==========
         // 先等待后台 Session Memory 提取完成，避免读取过时内容
         if let Some(memory_system) = self.memory_system.as_ref() {
-            let extraction_started_at = memory_system
-                .session_memory_state()
-                .extraction_started_at;
+            let extraction_started_at = memory_system.session_memory_state().extraction_started_at;
             if extraction_started_at.is_some() {
                 let wait_timeout_ms = memory_system.config().layer3.extraction_wait_timeout_ms;
-                let stale_threshold_ms = memory_system.config().layer3.extraction_stale_threshold_ms;
-                let session_memory_path =
-                    get_session_memory_path(memory_system.workspace_dir(), memory_system.session_id());
+                let stale_threshold_ms =
+                    memory_system.config().layer3.extraction_stale_threshold_ms;
+                let session_memory_path = get_session_memory_path(
+                    memory_system.workspace_dir(),
+                    memory_system.session_id(),
+                );
                 match crate::session_memory::recovery::wait_for_session_memory_extraction_with_timeout(
                     &session_memory_path,
                     extraction_started_at,
@@ -6570,13 +6569,9 @@ impl AgentRuntime {
                         memory_system.workspace_dir(),
                         memory_system.session_id(),
                     );
-                    let template =
-                        crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE;
-                    match crate::session_memory::setup_session_memory_file(
-                        &memory_path,
-                        template,
-                    )
-                    .await
+                    let template = crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE;
+                    match crate::session_memory::setup_session_memory_file(&memory_path, template)
+                        .await
                     {
                         Ok(_) => {
                             info!(
@@ -6610,7 +6605,8 @@ impl AgentRuntime {
                     // 重复统计已被本次提取覆盖的 assistant tool calls
                     let last_msg_id = history_clone.last().and_then(|m| m.id.clone());
                     let last_msg_index = history_clone.len().saturating_sub(1);
-                    let current_token_count = crate::token::estimate_messages_tokens(&history_clone);
+                    let current_token_count =
+                        crate::token::estimate_messages_tokens(&history_clone);
 
                     // 非阻塞执行
                     let handle = tokio::spawn(async move {
