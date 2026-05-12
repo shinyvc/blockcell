@@ -3091,7 +3091,20 @@ impl AgentRuntime {
     /// This loads the four memory files (user.md, project.md, feedback.md, reference.md)
     /// from the memory directory and makes them available for system prompt injection.
     pub async fn init_memory_injector(&mut self) -> std::io::Result<()> {
-        use crate::auto_memory::{get_memory_dir, InjectionConfig, MemoryInjector};
+        use crate::auto_memory::{ensure_memory_dir, get_memory_dir, InjectionConfig, MemoryInjector};
+
+        // Ensure the memory directory and template files exist on disk
+        // before loading. On a fresh install the directory is absent,
+        // which would cause the permission gate (is_auto_mem_path) to
+        // deny writes and the forked agent to fail silently.
+        match ensure_memory_dir(&self.paths.base).await {
+            Ok(()) => {
+                info!(path = %self.paths.base.display(), "[layer5] Memory directory ensured on disk");
+            }
+            Err(e) => {
+                warn!(path = %self.paths.base.display(), error = %e, "[layer5] Failed to ensure memory directory");
+            }
+        }
 
         // Use the config base directory (e.g., ~/.blockcell/memory/)
         let memory_dir = get_memory_dir(&self.paths.base);

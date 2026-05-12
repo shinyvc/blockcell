@@ -187,7 +187,6 @@ pub fn get_memory_file_path(config_dir: &Path, memory_type: MemoryType) -> PathB
 }
 
 /// 确保记忆目录存在
-#[allow(dead_code)]
 pub async fn ensure_memory_dir(config_dir: &Path) -> std::io::Result<()> {
     let memory_dir = config_dir.join("memory");
     tokio::fs::create_dir_all(&memory_dir).await?;
