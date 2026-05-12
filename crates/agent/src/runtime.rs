@@ -12674,7 +12674,7 @@ description: local demo
 
         let mut claimed = runtime
             .test_ghost_ledger()
-            .claim_reviewable_episodes(1)
+            .claim_reviewable_episodes(1, "test-worker", 600)
             .expect("claim pre-compress episode");
         let episode = claimed.pop().expect("pre-compress episode");
         assert_eq!(episode.boundary_kind, "pre_compress");
@@ -12709,7 +12709,7 @@ description: local demo
 
         let mut claimed = runtime
             .test_ghost_ledger()
-            .claim_reviewable_episodes(4)
+            .claim_reviewable_episodes(4, "test-worker", 600)
             .expect("claim session-end episodes");
         let episode = claimed
             .drain(..)

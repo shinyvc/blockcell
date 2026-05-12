@@ -98,32 +98,34 @@ pub async fn run_background_review_for_episode(
         Ok(loop_outcome) if loop_outcome.stopped && all_tool_actions_succeeded(&loop_outcome) => {
             provider_pool.report(provider_idx, CallResult::Success);
             let learning_feedback = summarize_learning_feedback(&loop_outcome.actions);
-            let run_id = ledger.insert_review_run(NewGhostReviewRun {
-                episode_id: episode_id.to_string(),
-                reviewer: GHOST_BACKGROUND_REVIEWER.to_string(),
-                status: "completed".to_string(),
-                result: serde_json::json!({
-                    "mode": "restricted_tool_loop",
-                    "maxRounds": REVIEW_TOOL_LOOP_MAX_ROUNDS,
-                    "roundsUsed": loop_outcome.rounds_used,
-                    "stopReason": loop_outcome.stop_reason,
-                    "actionCount": loop_outcome.actions.len(),
-                    "learningFeedback": learning_feedback,
-                    "actions": loop_outcome.actions,
+            let run_id = ledger.insert_review_run_if_review_owned(
+                NewGhostReviewRun {
+                    episode_id: episode_id.to_string(),
+                    reviewer: GHOST_BACKGROUND_REVIEWER.to_string(),
+                    status: "completed".to_string(),
+                    result: serde_json::json!({
+                        "mode": "restricted_tool_loop",
+                        "maxRounds": REVIEW_TOOL_LOOP_MAX_ROUNDS,
+                        "roundsUsed": loop_outcome.rounds_used,
+                        "stopReason": loop_outcome.stop_reason,
+                        "actionCount": loop_outcome.actions.len(),
+                        "learningFeedback": learning_feedback,
+                        "actions": loop_outcome.actions,
+                    }),
+                },
+                review_worker_id,
+                "reviewed",
+            )?;
+            match run_id {
+                Some(id) => Ok(GhostBackgroundReviewOutcome {
+                    run_id: id,
+                    status: "completed".to_string(),
                 }),
-            })?;
-            if let Some(wid) = review_worker_id {
-                if !ledger.update_episode_status_if_review_owned(episode_id, wid, "reviewed")? {
-                    warn!(episode_id = %episode_id, "Lost review lease before marking as reviewed");
-                    return Err(Error::Storage("Lost review lease".into()));
+                None => {
+                    warn!(episode_id = %episode_id, "Lost review lease before inserting completed review_run");
+                    Err(Error::Storage("Lost review lease".into()))
                 }
-            } else {
-                ledger.update_episode_status(episode_id, "reviewed")?;
             }
-            Ok(GhostBackgroundReviewOutcome {
-                run_id,
-                status: "completed".to_string(),
-            })
         }
         Ok(loop_outcome) => {
             provider_pool.report(provider_idx, CallResult::Success);
@@ -645,27 +647,30 @@ fn record_failed_review_run(
     details: Option<serde_json::Value>,
     review_worker_id: Option<&str>,
 ) -> Result<GhostBackgroundReviewOutcome> {
-    let run_id = ledger.insert_review_run(NewGhostReviewRun {
-        episode_id: episode_id.to_string(),
-        reviewer: GHOST_BACKGROUND_REVIEWER.to_string(),
-        status: "failed".to_string(),
-        result: serde_json::json!({
-            "error": error_message,
-            "raw": raw,
-            "details": details,
+    let run_id = ledger.insert_review_run_if_review_owned(
+        NewGhostReviewRun {
+            episode_id: episode_id.to_string(),
+            reviewer: GHOST_BACKGROUND_REVIEWER.to_string(),
+            status: "failed".to_string(),
+            result: serde_json::json!({
+                "error": error_message,
+                "raw": raw,
+                "details": details,
+            }),
+        },
+        review_worker_id,
+        "review_failed",
+    )?;
+    match run_id {
+        Some(id) => Ok(GhostBackgroundReviewOutcome {
+            run_id: id,
+            status: "failed".to_string(),
         }),
-    })?;
-    if let Some(wid) = review_worker_id {
-        if !ledger.update_episode_status_if_review_owned(episode_id, wid, "review_failed")? {
-            warn!(episode_id = %episode_id, "Lost review lease before marking as review_failed");
+        None => {
+            warn!(episode_id = %episode_id, "Lost review lease before inserting failed review_run");
+            Err(Error::Storage("Lost review lease".into()))
         }
-    } else {
-        ledger.update_episode_status(episode_id, "review_failed")?;
     }
-    Ok(GhostBackgroundReviewOutcome {
-        run_id,
-        status: "failed".to_string(),
-    })
 }
 
 #[cfg(test)]
@@ -1042,6 +1047,7 @@ mod tests {
             &episode_id,
             &Config::default(),
             &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+            None,
         )
         .await
         .expect("run background review");
@@ -1097,6 +1103,7 @@ mod tests {
             &episode_id,
             &Config::default(),
             &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+            None,
         )
         .await
         .expect("run background review");
@@ -1130,6 +1137,7 @@ mod tests {
             &episode_id,
             &Config::default(),
             &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+            None,
         )
         .await
         .expect("run background review");
@@ -1168,6 +1176,7 @@ mod tests {
             &episode_id,
             &Config::default(),
             &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+            None,
         )
         .await
         .expect("record failed review");
@@ -1201,6 +1210,7 @@ mod tests {
             &episode_id,
             &Config::default(),
             &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+            None,
         )
         .await
         .expect("record failed review");
@@ -1242,6 +1252,7 @@ mod tests {
             &episode_id,
             &Config::default(),
             &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+            None,
         )
         .await
         .expect("record failed review");
@@ -1275,6 +1286,7 @@ mod tests {
             &episode_id,
             &Config::default(),
             &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+            None,
         )
         .await
         .expect("record failed review");
@@ -1313,6 +1325,7 @@ mod tests {
             &episode_id,
             &Config::default(),
             &GhostLedger::open(&paths.ghost_ledger_db()).expect("open ledger"),
+            None,
         )
         .await
         .expect("run background review");

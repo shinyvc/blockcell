@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use blockcell_core::{Error, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -546,6 +546,106 @@ impl GhostLedger {
         .map_err(map_sqlite_error)?;
 
         Ok(run_id)
+    }
+
+    /// Insert a review_run and update episode status in one transaction,
+    /// but only if the caller still owns the review lease.
+    ///
+    /// Uses `Immediate` transaction + UPDATE-first pattern to prevent TOCTOU:
+    /// 1. UPDATE episodes WHERE id=? AND review_owner=? (locks the row)
+    /// 2. If affected rows == 0, lease was lost → return None
+    /// 3. INSERT review_run
+    /// 4. COMMIT
+    ///
+    /// Returns `Ok(Some(run_id))` on success, `Ok(None)` if the owner check
+    /// fails (lease lost), and `Err` on storage errors.
+    /// When `review_worker_id` is `None`, skips the owner check (unconditional insert).
+    pub fn insert_review_run_if_review_owned(
+        &self,
+        run: NewGhostReviewRun,
+        review_worker_id: Option<&str>,
+        episode_status: &str,
+    ) -> Result<Option<String>> {
+        let run_id = Uuid::new_v4().to_string();
+        let now = now_rfc3339();
+        let result_json = encode_json(&run.result)?;
+        let mut conn = self.lock_conn()?;
+
+        // If no worker_id, skip owner check — unconditional insert + update.
+        if review_worker_id.is_none() {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(map_sqlite_error)?;
+
+            tx.execute(
+                "
+                INSERT INTO review_runs (
+                    id, episode_id, reviewer, status, result_json, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ",
+                params![
+                    run_id,
+                    run.episode_id,
+                    run.reviewer,
+                    run.status,
+                    result_json,
+                    now,
+                    now,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+
+            tx.execute(
+                "UPDATE episodes SET status = ?2, updated_at = ?3 WHERE id = ?1",
+                params![run.episode_id, episode_status, now],
+            )
+            .map_err(map_sqlite_error)?;
+
+            tx.commit().map_err(map_sqlite_error)?;
+            return Ok(Some(run_id));
+        }
+
+        let wid = review_worker_id.unwrap();
+
+        // UPDATE-first pattern: lock the row and verify ownership atomically.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+
+        let affected = tx
+            .execute(
+                "UPDATE episodes SET status = ?2, updated_at = ?3 WHERE id = ?1 AND review_owner = ?4",
+                params![run.episode_id, episode_status, now, wid],
+            )
+            .map_err(map_sqlite_error)?;
+
+        if affected == 0 {
+            // Lease lost — commit empty transaction and bail.
+            tx.commit().map_err(map_sqlite_error)?;
+            return Ok(None);
+        }
+
+        // Owner confirmed: insert review_run.
+        tx.execute(
+            "
+            INSERT INTO review_runs (
+                id, episode_id, reviewer, status, result_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            params![
+                run_id,
+                run.episode_id,
+                run.reviewer,
+                run.status,
+                result_json,
+                now,
+                now,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+
+        tx.commit().map_err(map_sqlite_error)?;
+        Ok(Some(run_id))
     }
 
     pub fn get_review_run(&self, run_id: &str) -> Result<Option<GhostReviewRunRecord>> {

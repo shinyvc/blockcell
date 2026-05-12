@@ -713,7 +713,9 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
         match component {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                normalized.pop();
+                if !normalized.pop() {
+                    normalized.push(std::path::Component::ParentDir.as_os_str());
+                }
             }
             other => normalized.push(other.as_os_str()),
         }
@@ -3187,6 +3189,44 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_path_preserves_leading_parent_dir() {
+        // "../secret" → pop() on empty fails → push ".." back → "../secret"
+        let result = normalize_path_lexically(Path::new("../secret"));
+        assert_eq!(result, PathBuf::from("../secret"));
+    }
+
+    #[test]
+    fn test_normalize_path_preserves_unresolvable_parent_dir() {
+        // "a/../../secret" → "a" then ".." pops "a" → "" then ".." fails → "../secret"
+        let result = normalize_path_lexically(Path::new("a/../../secret"));
+        assert_eq!(result, PathBuf::from("../secret"));
+    }
+
+    #[test]
+    fn test_normalize_path_resolves_inner_parent_dir() {
+        // "src/../lib" → "src" then ".." pops "src" → "lib"
+        let result = normalize_path_lexically(Path::new("src/../lib"));
+        assert_eq!(result, PathBuf::from("lib"));
+    }
+
+    #[test]
+    fn test_normalize_path_no_parent_dir() {
+        let result = normalize_path_lexically(Path::new("foo/bar"));
+        assert_eq!(result, PathBuf::from("foo/bar"));
+    }
+
+    #[test]
+    fn test_validate_path_safety_rejects_leading_parent() {
+        assert!(validate_path_safety("../secret").is_err());
+        assert!(validate_path_safety("a/../../secret").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_safety_allows_resolvable_parent() {
+        assert!(validate_path_safety("src/../lib").is_ok());
+    }
 
     #[test]
     fn test_usage_metrics() {
