@@ -319,6 +319,8 @@ impl Default for EvolutionServiceConfig {
 ///
 /// 这是自升级系统的入口。外部通过以下方式交互：
 /// - `report_error()`: 技能执行失败时调用，内部自动判断是否触发进化
+type DeployCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// - `run_pending_evolutions()`: 执行待处理的进化流程（生成→审计→dry run→测试→发布）
 /// - `tick()`: 定期调用，驱动灰度发布的阶段推进和自动回滚
 /// - `set_llm_provider()`: 设置 LLM provider，使 tick() 能自动驱动完整 pipeline
@@ -335,7 +337,7 @@ pub struct EvolutionService {
     llm_provider: Option<Arc<dyn LLMProvider>>,
     /// Callback invoked after a successful skill deployment.
     /// Used to invalidate caches (e.g. SkillDocCache) in the runtime.
-    deploy_callback: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    deploy_callback: Option<DeployCallback>,
 }
 
 impl EvolutionService {
@@ -1373,7 +1375,7 @@ impl EvolutionService {
                 }
             }
 
-            return result;
+            result
         } else {
             // 无 LLM provider — 仅标记为 Generating，返回 WaitingForProvider
             info!(
@@ -1386,7 +1388,7 @@ impl EvolutionService {
             updated_record.status = EvolutionStatus::Generating;
             updated_record.updated_at = chrono::Utc::now().timestamp();
             self.evolution.save_record_public(&updated_record)?;
-            return Ok(SingleEvolutionResult::WaitingForProvider);
+            Ok(SingleEvolutionResult::WaitingForProvider)
         }
     }
 

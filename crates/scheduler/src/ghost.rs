@@ -92,7 +92,7 @@ impl GhostMaintenanceService {
     /// - 5 fields (min hour dom month dow): prepend "0" seconds field.
     /// - 6 fields (sec min hour dom month dow): use as-is.
     /// - 7 fields (sec min hour dom month dow year): use as-is.
-    /// Any other field count falls back to [`DEFAULT_CRON_SCHEDULE`].
+    ///   Any other field count falls back to [`DEFAULT_CRON_SCHEDULE`].
     fn normalize_cron_schedule(expr: &str) -> String {
         let trimmed = expr.trim();
         let fields: Vec<&str> = trimmed.split_whitespace().collect();
