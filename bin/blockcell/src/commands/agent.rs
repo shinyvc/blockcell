@@ -851,8 +851,8 @@ pub async fn run(
 
         // Layer 6: 启动 Dream Service（跨会话知识整合）
         let dream_config = DreamServiceConfig {
-            enabled: true,
-            check_interval_secs: 10 * 60, // 10 分钟检查一次
+            enabled: config.memory.memory_system.layer6.enabled,
+            check_interval_secs: config.memory.memory_system.layer6.check_interval_secs,
             provider_pool: Some(Arc::clone(&provider_pool)),
         };
         let dream_service = DreamService::new(dream_config, paths.clone());

@@ -1548,8 +1548,8 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
 
     if let Some(ref pool) = dream_provider_pool {
         let dream_config = DreamServiceConfig {
-            enabled: true,
-            check_interval_secs: 10 * 60, // 10 分钟检查一次
+            enabled: config.memory.memory_system.layer6.enabled,
+            check_interval_secs: config.memory.memory_system.layer6.check_interval_secs,
             provider_pool: Some(Arc::clone(pool)),
         };
         let dream_service = DreamService::new(dream_config, paths.clone());

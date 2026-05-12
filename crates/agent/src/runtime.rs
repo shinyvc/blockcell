@@ -2463,6 +2463,11 @@ impl AgentRuntime {
         // Use paths.base as both workspace and config directory
         let base_dir = self.paths.base.clone();
 
+        // 增加梦境会话门控计数（Layer 6）
+        // 每次新会话初始化时递增，使 Dream 整合的三重门控机制能正确判断
+        // 注意：由于 agent 和 scheduler 存在循环依赖，此处直接操作 .dream_state.json
+        crate::dream_state::increment_dream_session_count(&base_dir).await;
+
         let mut memory_system = MemorySystem::new(config, base_dir.clone(), base_dir, session_id);
 
         // Perform async initialization: load cursor state + mark session active
@@ -2524,11 +2529,19 @@ impl AgentRuntime {
             memory_system.config().layer5.max_memory_file_tokens
         );
 
-        // Layer 6: Auto Dream (interval is typically 24 hours)
-        crate::memory_event!(layer6, config, 24);
+        // Layer 6: Auto Dream
+        crate::memory_event!(
+            layer6,
+            config,
+            memory_system.config().layer6.time_gate_threshold_hours
+        );
 
-        // Layer 7: Forked Agent (max_turns default is typically 10)
-        crate::memory_event!(layer7, config, 10);
+        // Layer 7: Forked Agent
+        crate::memory_event!(
+            layer7,
+            config,
+            memory_system.config().layer7.max_turns
+        );
 
         self.memory_system = Some(memory_system);
 
@@ -4060,6 +4073,33 @@ impl AgentRuntime {
         };
 
         // ========== 7. 收集恢复信息 ==========
+        // 先等待后台 Session Memory 提取完成，避免读取过时内容
+        if let Some(memory_system) = self.memory_system.as_ref() {
+            let extraction_started_at = memory_system
+                .session_memory_state()
+                .extraction_started_at;
+            if extraction_started_at.is_some() {
+                let wait_timeout_ms = memory_system.config().layer3.extraction_wait_timeout_ms;
+                let stale_threshold_ms = memory_system.config().layer3.extraction_stale_threshold_ms;
+                let session_memory_path =
+                    get_session_memory_path(memory_system.workspace_dir(), memory_system.session_id());
+                match crate::session_memory::recovery::wait_for_session_memory_extraction_with_timeout(
+                    &session_memory_path,
+                    extraction_started_at,
+                    wait_timeout_ms,
+                    stale_threshold_ms,
+                )
+                .await
+                {
+                    Ok(_) => info!("[layer4] Session Memory 提取已完成，继续压缩"),
+                    Err(e) => warn!(
+                        error = %e,
+                        "[layer4] 等待 Session Memory 提取超时，使用当前内容继续压缩"
+                    ),
+                }
+            }
+        }
+
         let recovery_message = if let Some(memory_system) = self.memory_system.as_ref() {
             let session_memory_path =
                 get_session_memory_path(memory_system.workspace_dir(), memory_system.session_id());
@@ -6522,6 +6562,9 @@ impl AgentRuntime {
                 crate::memory_system::PostSamplingAction::ExtractSessionMemory => {
                     info!("[post-sampling] Spawning Session Memory extraction task");
 
+                    // 标记提取开始（设置 extraction_started_at + has_pending_extraction）
+                    memory_system.mark_extraction_started();
+
                     // 克隆必要的数据用于异步任务
                     let provider_pool = Arc::clone(&self.provider_pool);
                     let history_clone = history.clone();
@@ -6531,6 +6574,13 @@ impl AgentRuntime {
                     );
                     let model = self.config.agents.defaults.model.clone();
                     let max_section_length = memory_system.config().layer3.max_section_length;
+                    // 获取提取结果发送端（用于后台任务完成后通知主线程更新状态）
+                    let result_sender = memory_system.session_memory_result_sender();
+
+                    // 获取最后一条消息的 ID 和索引（用于更新状态游标）
+                    let last_msg_id = history_clone.iter().rev().find(|m| m.role == "user").and_then(|m| m.id.clone());
+                    let last_msg_index = history_clone.len().saturating_sub(1);
+                    let current_token_count = crate::token::estimate_messages_tokens(&history_clone);
 
                     // 非阻塞执行
                     let handle = tokio::spawn(async move {
@@ -6580,12 +6630,26 @@ impl AgentRuntime {
                         )
                         .await;
 
-                        match result {
-                            Ok(_) => info!("[layer3] Session Memory extraction completed"),
-                            Err(e) => {
-                                warn!(error = %e, "[layer3] Session Memory extraction failed")
+                        // 通过 watch channel 发送提取结果给主线程
+                        let extraction_result = match result {
+                            Ok(_) => {
+                                info!("[layer3] Session Memory extraction completed");
+                                crate::memory_system::SessionMemoryExtractionResult {
+                                    last_message_id: last_msg_id,
+                                    last_message_index: last_msg_index,
+                                    token_count: current_token_count,
+                                    success: true,
+                                }
                             }
-                        }
+                            Err(e) => {
+                                warn!(error = %e, "[layer3] Session Memory extraction failed");
+                                crate::memory_system::SessionMemoryExtractionResult {
+                                    success: false,
+                                    ..Default::default()
+                                }
+                            }
+                        };
+                        let _ = result_sender.send(extraction_result);
                     });
 
                     // 保存任务句柄

@@ -9,6 +9,7 @@ pub mod checkpoint;
 pub mod compact;
 pub mod context;
 pub(crate) mod error;
+pub mod dream_state;
 pub mod forked;
 pub mod ghost_background_review;
 pub mod ghost_learning;

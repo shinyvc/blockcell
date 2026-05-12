@@ -19,6 +19,19 @@ pub type BackgroundTaskHandle = JoinHandle<()>;
 // Re-export MemorySystemConfig from core crate
 pub use blockcell_core::config::MemorySystemConfig;
 
+/// Session Memory 提取结果（后台任务完成后传递给主线程）
+#[derive(Debug, Default, Clone)]
+pub struct SessionMemoryExtractionResult {
+    /// 最后一条消息 ID
+    pub last_message_id: Option<String>,
+    /// 最后一条消息索引
+    pub last_message_index: usize,
+    /// 当前 Token 数
+    pub token_count: usize,
+    /// 提取是否成功
+    pub success: bool,
+}
+
 /// 记忆系统状态
 #[derive(Debug, Default)]
 pub struct MemorySystemState {
@@ -60,6 +73,12 @@ pub struct MemorySystem {
     cursor_manager: ExtractionCursorManager,
     /// 游标重新加载标志（用于后台任务通知主线程）
     cursor_reload_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Session Memory 提取结果通道（后台任务完成后通知主线程更新状态）
+    session_memory_result_tx:
+        tokio::sync::watch::Sender<SessionMemoryExtractionResult>,
+    /// Session Memory 提取结果接收端
+    session_memory_result_rx:
+        tokio::sync::watch::Receiver<SessionMemoryExtractionResult>,
 }
 
 impl MemorySystem {
@@ -75,6 +94,8 @@ impl MemorySystem {
         let tracker_summary_chars = config.layer4.tracker_summary_chars;
         let session_memory_config: SessionMemoryConfig = config.layer3.clone().into();
         let max_replacement_entries = config.layer1.max_replacement_entries;
+        let (session_memory_result_tx, session_memory_result_rx) =
+            tokio::sync::watch::channel(SessionMemoryExtractionResult::default());
 
         Self {
             config,
@@ -96,6 +117,8 @@ impl MemorySystem {
             session_id,
             cursor_manager,
             cursor_reload_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_memory_result_tx,
+            session_memory_result_rx,
         }
     }
 
@@ -213,6 +236,20 @@ impl MemorySystem {
         self.state.session_memory.last_memory_message_index = Some(message_index);
         self.state.session_memory.tokens_at_last_extraction = token_count;
         self.state.session_memory.initialized = true;
+        self.state.session_memory.last_extracted_at = Some(std::time::Instant::now());
+        self.state.session_memory.extraction_started_at = None;
+    }
+
+    /// 标记提取开始（设置 extraction_started_at）
+    pub fn mark_extraction_started(&mut self) {
+        self.state.session_memory.extraction_started_at = Some(std::time::Instant::now());
+        self.state.has_pending_extraction = true;
+    }
+
+    /// 标记提取失败（清除 extraction_started_at，保留其他状态）
+    pub fn mark_extraction_failed(&mut self) {
+        self.state.session_memory.extraction_started_at = None;
+        self.state.has_pending_extraction = false;
     }
 
     /// 获取内容替换状态
@@ -276,6 +313,49 @@ impl MemorySystem {
     fn check_and_clear_cursor_reload(&self) -> bool {
         self.cursor_reload_flag
             .swap(false, std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 获取 Session Memory 提取结果发送端（用于后台任务传递提取结果）
+    pub fn session_memory_result_sender(
+        &self,
+    ) -> tokio::sync::watch::Sender<SessionMemoryExtractionResult> {
+        self.session_memory_result_tx.clone()
+    }
+
+    /// 检查并应用后台 Session Memory 提取结果
+    ///
+    /// 如果后台提取任务已完成并发送了结果，更新 SessionMemoryState。
+    /// 应在主循环的 evaluate_memory_hooks 中调用。
+    pub fn apply_session_memory_result(&mut self) -> bool {
+        // 使用 has_changed() 检查是否有新结果
+        if self.session_memory_result_rx.has_changed().ok() != Some(true) {
+            return false;
+        }
+
+        let result = self.session_memory_result_rx.borrow_and_update();
+        let success = result.success;
+        let last_message_id = result.last_message_id.clone();
+        let last_message_index = result.last_message_index;
+        let token_count = result.token_count;
+        drop(result); // 释放 borrow 后再调用 &mut self 方法
+
+        if success {
+            tracing::info!(
+                message_id = ?last_message_id,
+                message_index = last_message_index,
+                token_count = token_count,
+                "[memory_system] 已应用后台 Session Memory 提取结果"
+            );
+            self.update_session_memory_state_with_id(
+                last_message_id,
+                last_message_index,
+                token_count,
+            );
+        } else {
+            self.mark_extraction_failed();
+            tracing::warn!("[memory_system] 后台 Session Memory 提取失败，已清除提取标记");
+        }
+        true
     }
 
     /// 获取配置
@@ -568,6 +648,9 @@ pub async fn evaluate_memory_hooks(
             tracing::warn!(error = %e, "[evaluate_memory_hooks] Failed to reload cursor state");
         }
     }
+
+    // 检查并应用后台 Session Memory 提取结果
+    memory_system.apply_session_memory_result();
 
     // 1. 检查 Compact (最高优先级)
     if memory_system.should_compact(current_tokens) {
