@@ -445,11 +445,6 @@ impl MemorySystem {
         )
     }
 
-    /// 保存游标状态
-    pub async fn save_cursors(&self) -> std::io::Result<()> {
-        self.cursor_manager.save().await
-    }
-
     /// 添加后台任务句柄
     pub fn add_background_task(&mut self, handle: BackgroundTaskHandle) {
         self.state.background_tasks.push(handle);

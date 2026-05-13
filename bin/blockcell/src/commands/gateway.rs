@@ -897,12 +897,19 @@ async fn spawn_agent_runtime(
         create_skill_evolution_llm_provider(&agent_config, &provider_pool, agent_id);
     let skill_evo_workflow_db = agent_paths.workspace().join("skill_evolution_workflow.db");
     let skill_evo_workflow_store = EvolutionWorkflowStore::open(&skill_evo_workflow_db)?;
-    let skill_evo_worker = SkillEvolutionWorker::new(
+    let mut skill_evo_worker = SkillEvolutionWorker::new(
         skill_evo_workflow_store,
         agent_paths.skills_dir(),
         EvolutionServiceConfig::default(),
         skill_evo_llm_provider,
     );
+    // 为 SkillEvolutionWorker 设置部署回调，确保 scheduler worker 的进化部署路径也能触发 ghost learning boundary
+    if let Some(callback) =
+        blockcell_agent::create_evolution_deploy_callback(&agent_config, &agent_paths)
+    {
+        skill_evo_worker.set_deploy_callback(callback);
+        info!("[evolution-deploy-callback] 已连接到 SkillEvolutionWorker EvolutionService");
+    }
     let skill_evo_worker_arc = Arc::new(skill_evo_worker);
     runtime.set_skill_evolution_worker(
         skill_evo_worker_arc.clone() as Arc<dyn blockcell_agent::EvolutionNotifier>
@@ -948,6 +955,7 @@ async fn spawn_agent_runtime(
         warn!(error = %e, "Failed to initialize memory injector");
     }
     runtime.init_runtime_handle();
+    runtime.wire_evolution_deploy_callback();
 
     let event_emitter = runtime.event_emitter_handle();
 

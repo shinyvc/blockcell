@@ -44,11 +44,14 @@ async fn read_dream_state(base_dir: &Path) -> DreamStateData {
     }
 }
 
-/// 写入 .dream_state.json
+/// 原子写入 .dream_state.json，使用 backup-based 策略保证原子性。
+///
+/// Windows 上 `rename` 在目标文件已存在时会失败，因此使用
+/// backup-based 策略：old -> backup, tmp -> target, 失败时恢复 backup。
 async fn write_dream_state(base_dir: &Path, state: &DreamStateData) -> std::io::Result<()> {
     let path = dream_state_path(base_dir);
     let content = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
-    tokio::fs::write(&path, content).await
+    crate::fs_util::atomic_write(&path, content.as_bytes())
 }
 
 /// 在会话初始化时递增会话计数并持久化

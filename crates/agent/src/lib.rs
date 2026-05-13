@@ -11,6 +11,7 @@ pub mod context;
 pub mod dream_state;
 pub(crate) mod error;
 pub mod forked;
+pub(crate) mod fs_util;
 pub mod ghost_background_review;
 pub mod ghost_learning;
 pub mod ghost_memory_provider;
@@ -106,7 +107,7 @@ pub use memory_system::{
     MemorySystemState, PostSamplingAction,
 };
 pub use response_cache::{ResponseCache, ResponseCacheConfig};
-pub use runtime::{AgentRuntime, ConfirmRequest};
+pub use runtime::{create_evolution_deploy_callback, AgentRuntime, ConfirmRequest};
 // Re-export RuntimeHandle trait from tools crate for convenience
 pub use blockcell_tools::RuntimeHandle;
 pub use checkpoint::{CheckpointManager, TaskCheckpoint};

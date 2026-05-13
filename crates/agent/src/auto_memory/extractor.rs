@@ -296,17 +296,19 @@ impl AutoMemoryExtractor {
                     }
                 }
 
-                // 鏇存柊娓告爣
-                let mut cursor = self.cursor_manager.get_cursor(memory_type);
-                cursor.update_with_content(
-                    last_message_uuid,
-                    message_count,
-                    &message_content_signature,
-                );
-                self.cursor_manager.update_cursor(cursor);
+                // 更新游标
+                let cursor = {
+                    let mut c = self.cursor_manager.get_cursor(memory_type);
+                    c.update_with_content(
+                        last_message_uuid,
+                        message_count,
+                        &message_content_signature,
+                    );
+                    c
+                };
 
-                // 保存游标状态
-                let cursor_save_failed = match self.cursor_manager.save().await {
+                // 合并磁盘上的最新状态并保存游标（防止并发覆盖）
+                let cursor_save_failed = match self.cursor_manager.merge_and_save(cursor).await {
                     Err(e) => {
                         tracing::error!(error = %e, "[auto_memory] failed to save cursor");
                         true
@@ -360,11 +362,6 @@ impl AutoMemoryExtractor {
                 }
             }
         }
-    }
-
-    /// 保存游标状态
-    pub async fn save_cursors(&self) -> std::io::Result<()> {
-        self.cursor_manager.save().await
     }
 }
 

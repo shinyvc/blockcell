@@ -14,6 +14,7 @@ use crate::skill_file_store::SkillFileStore;
 use blockcell_tools::memory::MemoryManageTool;
 use blockcell_tools::session_search::SessionSearchTool;
 use blockcell_tools::skills::SkillViewTool;
+use blockcell_tools::GhostMemoryLifecycleOps;
 use blockcell_tools::{SessionSearchOps, ToolContext, ToolRegistry};
 
 use crate::ghost_learning::GhostEpisodeSnapshot;
@@ -94,7 +95,25 @@ pub async fn run_background_review_for_episode(
         );
     };
 
-    match run_restricted_review_tool_loop(paths, provider.as_ref(), &snapshot, config).await {
+    let ghost_memory_lifecycle: Option<Arc<dyn GhostMemoryLifecycleOps + Send + Sync>> = {
+        let manager = Arc::new(
+            crate::ghost_memory_provider::GhostMemoryProviderManager::with_local_file(
+                paths.clone(),
+            ),
+        );
+        manager.initialize_all("ghost_background_review", "reviewer");
+        Some(manager as Arc<dyn GhostMemoryLifecycleOps + Send + Sync>)
+    };
+
+    match run_restricted_review_tool_loop(
+        paths,
+        provider.as_ref(),
+        &snapshot,
+        config,
+        ghost_memory_lifecycle,
+    )
+    .await
+    {
         Ok(loop_outcome) if loop_outcome.stopped && all_tool_actions_succeeded(&loop_outcome) => {
             provider_pool.report(provider_idx, CallResult::Success);
             let learning_feedback = summarize_learning_feedback(&loop_outcome.actions);
@@ -368,6 +387,7 @@ async fn run_restricted_review_tool_loop(
     provider: &dyn blockcell_providers::Provider,
     snapshot: &GhostEpisodeSnapshot,
     config: &Config,
+    ghost_memory_lifecycle: Option<Arc<dyn GhostMemoryLifecycleOps + Send + Sync>>,
 ) -> Result<GhostReviewToolLoopOutcome> {
     let registry = restricted_review_tool_registry();
     let tools = registry.get_filtered_schemas(REVIEW_ALLOWED_TOOLS);
@@ -418,6 +438,7 @@ async fn run_restricted_review_tool_loop(
                         config,
                         &memory_file_store,
                         &skill_file_store,
+                        ghost_memory_lifecycle.clone(),
                     )?,
                     call.arguments.clone(),
                 )
@@ -523,6 +544,7 @@ fn review_tool_context_with_stores(
     config: &Config,
     memory_file_store: &blockcell_tools::MemoryFileStoreHandle,
     skill_file_store: &blockcell_tools::SkillFileStoreHandle,
+    ghost_memory_lifecycle: Option<Arc<dyn GhostMemoryLifecycleOps + Send + Sync>>,
 ) -> Result<ToolContext> {
     Ok(ToolContext {
         workspace: paths.workspace(),
@@ -538,7 +560,7 @@ fn review_tool_context_with_stores(
         task_manager: None,
         memory_store: None,
         memory_file_store: Some(Arc::clone(memory_file_store)),
-        ghost_memory_lifecycle: None,
+        ghost_memory_lifecycle,
         skill_file_store: Some(Arc::clone(skill_file_store)),
         session_search: Some(Arc::new(EpisodeSessionSearch::new(snapshot)?)),
         outbound_tx: None,

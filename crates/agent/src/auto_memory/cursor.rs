@@ -13,14 +13,151 @@
 //! 使用 `Instant` (monotonic clock) 替代 `SystemTime` 进行时间差计算，
 //! 避免系统时钟调整（NTP 同步、手动修改、时区变化等）导致的问题。
 
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::fs;
 use uuid::Uuid;
 
 use super::memory_type::MemoryType;
+
+/// 进程内游标文件锁，防止同一进程内并发 merge_and_save 丢更新。
+///
+/// 每个 cursor 文件路径对应一个 Arc<Mutex<()>>，确保 read-merge-write 在进程内串行化。
+/// 使用 Arc 以便 clone 后释放外层 HashMap 锁，避免生命周期冲突。
+/// 跨进程并发由唯一临时文件名 + 原子 rename 自然处理。
+static CURSOR_FILE_LOCKS: Lazy<std::sync::Mutex<HashMap<PathBuf, Arc<std::sync::Mutex<()>>>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// 跨进程文件锁（RAII）
+///
+/// 使用 `OpenOptions::new().create_new(true)` 原子创建锁文件，
+/// 确保同一时刻只有一个进程能持有锁。
+///
+/// - `create_new` 在所有平台上都是原子的：文件不存在时创建，已存在时返回错误
+/// - 锁文件内容为持有锁的 PID，便于诊断残留锁
+/// - Drop 时删除锁文件，释放锁
+/// - 如果锁文件已存在，短暂等待后重试
+struct CrossProcessLock {
+    lock_path: PathBuf,
+}
+
+impl CrossProcessLock {
+    /// 最大重试次数
+    const MAX_RETRIES: usize = 30;
+    /// 重试间隔（毫秒）
+    const RETRY_INTERVAL_MS: u64 = 200;
+
+    /// 获取跨进程锁
+    ///
+    /// 尝试创建锁文件，若已存在则等待并重试。
+    /// 只有当锁文件中记录的 PID 已不存在时，才清理残留锁。
+    /// 活进程持有的锁不会被强制删除，避免中断合法的 read-merge-write。
+    fn acquire(lock_path: &Path) -> std::io::Result<Self> {
+        for attempt in 0..Self::MAX_RETRIES {
+            match Self::try_create_lock(lock_path) {
+                Ok(()) => return Ok(Self { lock_path: lock_path.to_path_buf() }),
+                Err(_) => {
+                    // 锁文件已存在，检查持有进程是否已退出
+                    if Self::is_holder_dead(lock_path) {
+                        tracing::debug!(
+                            attempt,
+                            path = %lock_path.display(),
+                            "[cursor] 锁文件持有进程已退出，清理残留锁"
+                        );
+                        let _ = std::fs::remove_file(lock_path);
+                        // 立即重试，不等待
+                        continue;
+                    }
+                    // 活进程持锁，等待后重试
+                    if attempt < Self::MAX_RETRIES - 1 {
+                        std::thread::sleep(std::time::Duration::from_millis(Self::RETRY_INTERVAL_MS));
+                    }
+                }
+            }
+        }
+
+        // 重试耗尽且锁持有进程仍存活，返回错误而非强制删除
+        tracing::warn!(
+            path = %lock_path.display(),
+            "[cursor] 跨进程锁获取超时，锁持有进程仍存活"
+        );
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!("跨进程锁获取超时: 另一个进程仍在持有锁 ({})", lock_path.display()),
+        ))
+    }
+
+    /// 尝试原子创建锁文件
+    fn try_create_lock(lock_path: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)?;
+        // 写入 PID 便于诊断
+        write!(file, "{}", std::process::id())?;
+        Ok(())
+    }
+
+    /// 检查锁文件持有进程是否已退出
+    ///
+    /// 仅通过 PID 存活检测判断：PID 不存在 → 持有进程已退出，锁可安全清理。
+    /// 不使用时间判断，因为活进程持锁时间长短不能说明锁是残留的。
+    fn is_holder_dead(lock_path: &Path) -> bool {
+        if let Ok(content) = std::fs::read_to_string(lock_path) {
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                return !is_pid_alive(pid);
+            }
+        }
+        // 无法读取 PID，保守地认为进程仍存活
+        false
+    }
+}
+
+impl Drop for CrossProcessLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+/// 检查指定 PID 的进程是否仍存活
+fn is_pid_alive(pid: u32) -> bool {
+    use std::process::Command;
+
+    #[cfg(unix)]
+    {
+        // kill -0 <pid> 不发送信号，仅检查进程是否存在
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    {
+        // 使用 tasklist 检查进程是否存在
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .map(|o| {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                stdout.contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        // 未知平台，假设进程仍存活（保守策略）
+        let _ = (pid, Command::new(""));
+        true
+    }
+}
 
 /// 时间冷却阈值（秒）
 ///
@@ -337,37 +474,53 @@ impl ExtractionCursorManager {
         Ok(())
     }
 
-    /// 保存游标状态
+    /// 保存游标状态（通过跨进程锁保护）
     ///
-    /// 使用原子写入模式：先写入临时文件，然后重命名，避免崩溃导致数据丢失。
-    ///
-    /// ## 并发安全
-    /// 使用包含进程 ID 的唯一临时文件名，避免多进程并发写入时临时文件冲突。
+    /// 使用与 merge_and_save() 相同的进程内 Mutex + 跨进程锁文件保护，
+    /// 先读取磁盘最新状态再写入，避免覆盖其他进程已写入的 cursor。
     pub async fn save(&self) -> std::io::Result<()> {
-        let content = serde_json::to_string_pretty(&self)?;
+        // 获取该 cursor 文件路径对应的进程内锁
+        let file_lock = {
+            let mut locks = CURSOR_FILE_LOCKS
+                .lock()
+                .expect("[cursor] CURSOR_FILE_LOCKS 不应被 poison");
+            locks
+                .entry(self.cursor_file_path.clone())
+                .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+                .clone()
+        };
 
-        // 确保父目录存在
-        if let Some(parent) = self.cursor_file_path.parent() {
-            fs::create_dir_all(parent).await?;
+        let _guard = file_lock
+            .lock()
+            .expect("[cursor] cursor 文件锁不应被 poison");
+
+        // 跨进程锁文件路径
+        let lock_path = self.cursor_file_path.with_extension("lock");
+
+        // 尝试获取跨进程锁
+        let _lock_guard = CrossProcessLock::acquire(&lock_path)?;
+
+        // 读取磁盘上的最新状态（其他进程可能已写入）
+        let mut cursors = self.cursors.clone();
+        if let Ok(content) = std::fs::read_to_string(&self.cursor_file_path) {
+            if let Ok(disk_manager) = serde_json::from_str::<ExtractionCursorManager>(&content) {
+                // 合并：磁盘上的条目优先，但保留内存中独有的条目
+                for (key, value) in disk_manager.cursors {
+                    cursors.entry(key).or_insert(value);
+                }
+            }
         }
 
-        // 创建唯一的临时文件路径（包含进程 ID 和时间戳）
-        // 这避免了多进程并发写入时的临时文件冲突
-        let pid = std::process::id();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let temp_path = self
-            .cursor_file_path
-            .with_extension(format!("tmp.{}.{}", pid, timestamp));
+        // 序列化合并后的状态
+        let content = serde_json::to_string_pretty(&ExtractionCursorManager {
+            cursors,
+            cursor_file_path: self.cursor_file_path.clone(),
+        })?;
 
-        // 写入临时文件
-        fs::write(&temp_path, &content).await?;
-
-        // 原子重命名（在大多数平台上是原子的）
-        // 即使多个进程同时保存，rename 也是原子的，最终只有一个会成功
-        fs::rename(&temp_path, &self.cursor_file_path).await?;
+        if let Some(parent) = self.cursor_file_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        crate::fs_util::atomic_write(&self.cursor_file_path, content.as_bytes())?;
 
         Ok(())
     }
@@ -384,6 +537,58 @@ impl ExtractionCursorManager {
     pub fn update_cursor(&mut self, cursor: ExtractionCursor) {
         self.cursors
             .insert(cursor.memory_type.name().to_string(), cursor);
+    }
+
+    /// Merge a single cursor update with the latest on-disk state, then save.
+    ///
+    /// 使用进程内 Mutex + 跨进程锁文件保护 read-merge-write 周期：
+    /// - 进程内 Mutex 串行化同进程的并发调用
+    /// - 跨进程锁文件使用 `create_new` 原子创建，确保同一时刻只有一个进程
+    ///   能进入 read-merge-write 周期
+    /// - 锁文件路径: `<cursor_file>.lock`，内容为持有锁的 PID
+    /// - 最多重试 30 次，每次间隔 200ms（总计约 6 秒）
+    /// - 仅当锁持有进程已退出时才清理残留锁，活进程锁不会被强制删除
+    pub async fn merge_and_save(&mut self, cursor: ExtractionCursor) -> std::io::Result<()> {
+        // 获取该 cursor 文件路径对应的进程内锁
+        let file_lock = {
+            let mut locks = CURSOR_FILE_LOCKS
+                .lock()
+                .expect("[cursor] CURSOR_FILE_LOCKS 不应被 poison");
+            locks
+                .entry(self.cursor_file_path.clone())
+                .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+                .clone()
+        };
+
+        let _guard = file_lock
+            .lock()
+            .expect("[cursor] cursor 文件锁不应被 poison");
+
+        // 跨进程锁文件路径
+        let lock_path = self.cursor_file_path.with_extension("lock");
+
+        // 尝试获取跨进程锁
+        let _lock_guard = CrossProcessLock::acquire(&lock_path)?;
+
+        // 读取磁盘上的最新状态并合并
+        if let Ok(content) = std::fs::read_to_string(&self.cursor_file_path) {
+            if let Ok(disk_manager) = serde_json::from_str::<ExtractionCursorManager>(&content) {
+                self.cursors = disk_manager.cursors;
+            }
+        }
+
+        // 应用当前更新
+        self.cursors
+            .insert(cursor.memory_type.name().to_string(), cursor);
+
+        // 写入
+        let content = serde_json::to_string_pretty(&self)?;
+        if let Some(parent) = self.cursor_file_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        crate::fs_util::atomic_write(&self.cursor_file_path, content.as_bytes())?;
+
+        Ok(())
     }
 
     /// 获取所有游标

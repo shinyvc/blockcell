@@ -61,6 +61,14 @@ impl SkillEvolutionWorker {
         }
     }
 
+    /// 设置技能部署成功后的回调（例如记录 EvolutionSuccess ghost learning boundary）。
+    ///
+    /// 必须在 `run_loop` 之前调用，因为 `EvolutionService` 的 deploy_callback
+    /// 在 `process_pending_evolution` 返回 Completed 时触发。
+    pub fn set_deploy_callback(&mut self, callback: Arc<dyn Fn(&str) + Send + Sync>) {
+        self.service.set_deploy_callback(callback);
+    }
+
     pub fn notify(&self) {
         self.wakeup.notify_one();
     }

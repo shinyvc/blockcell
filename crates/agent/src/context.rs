@@ -252,6 +252,16 @@ impl ContextBuilder {
         }
     }
 
+    /// Wire a deploy callback into the EvolutionService so that successful
+    /// skill deployments can trigger Ghost learning boundaries.
+    pub fn set_evolution_deploy_callback(&mut self, callback: Arc<dyn Fn(&str) + Send + Sync>) {
+        if let Some(ref mut manager) = self.skill_manager {
+            if let Some(evo) = manager.evolution_service_mut() {
+                evo.set_deploy_callback(callback);
+            }
+        }
+    }
+
     /// Re-scan skill directories and pick up newly created skills.
     /// Returns the names of newly discovered skills.
     pub fn reload_skills(&mut self) -> Vec<String> {
