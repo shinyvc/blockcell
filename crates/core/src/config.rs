@@ -2070,6 +2070,84 @@ impl Default for Layer5Config {
     }
 }
 
+// === Layer 6: Dream 整合配置 ===
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Layer6Config {
+    /// 是否启用 Dream 整合
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 检查间隔（秒）
+    #[serde(default = "default_l6_check_interval")]
+    pub check_interval_secs: u64,
+    /// 时间门控阈值（小时）
+    #[serde(default = "default_l6_time_gate_hours")]
+    pub time_gate_threshold_hours: u64,
+    /// 会话门控阈值
+    #[serde(default = "default_l6_session_gate")]
+    pub session_gate_threshold: usize,
+    /// Dream 执行超时（秒）
+    #[serde(default = "default_l6_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_l6_check_interval() -> u64 {
+    600 // 10 分钟
+}
+fn default_l6_time_gate_hours() -> u64 {
+    24
+}
+fn default_l6_session_gate() -> usize {
+    5
+}
+fn default_l6_timeout_secs() -> u64 {
+    300 // 5 分钟
+}
+
+impl Default for Layer6Config {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_interval_secs: 600,
+            time_gate_threshold_hours: 24,
+            session_gate_threshold: 5,
+            timeout_secs: 300,
+        }
+    }
+}
+
+// === Layer 7: Forked Agent 配置 ===
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Layer7Config {
+    /// 是否启用 Forked Agent
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 最大轮次
+    #[serde(default = "default_l7_max_turns")]
+    pub max_turns: usize,
+    /// 执行超时（秒）
+    #[serde(default = "default_l7_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_l7_max_turns() -> usize {
+    10
+}
+fn default_l7_timeout_secs() -> u64 {
+    120 // 2 分钟
+}
+
+impl Default for Layer7Config {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_turns: 10,
+            timeout_secs: 120,
+        }
+    }
+}
+
 // === 7 层记忆系统配置 ===
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2090,6 +2168,10 @@ pub struct MemorySystemConfig {
     pub layer4: Layer4Config,
     #[serde(default)]
     pub layer5: Layer5Config,
+    #[serde(default)]
+    pub layer6: Layer6Config,
+    #[serde(default)]
+    pub layer7: Layer7Config,
 }
 
 fn default_token_budget() -> usize {
@@ -2107,6 +2189,8 @@ impl Default for MemorySystemConfig {
             layer3: Layer3Config::default(),
             layer4: Layer4Config::default(),
             layer5: Layer5Config::default(),
+            layer6: Layer6Config::default(),
+            layer7: Layer7Config::default(),
         }
     }
 }

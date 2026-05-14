@@ -2,7 +2,8 @@
 //! 鍚庡彴鎻愬彇鍥涚绫诲瀷璁板繂鐨勬牳蹇冮€昏緫銆?
 use super::cursor::{ExtractionCursor, ExtractionCursorManager};
 use super::{
-    get_memory_file_path, MemoryType, EXTRACTION_COOLDOWN_MESSAGES, MAX_MEMORY_FILE_TOKENS,
+    ensure_memory_dir, get_memory_file_path, MemoryType, EXTRACTION_COOLDOWN_MESSAGES,
+    MAX_MEMORY_FILE_TOKENS,
 };
 use crate::forked::{
     create_auto_mem_can_use_tool, run_forked_agent, CacheSafeParams, ForkedAgentParams,
@@ -221,6 +222,15 @@ impl AutoMemoryExtractor {
             fork_context_messages: messages.clone(),
             ..Default::default()
         };
+
+        // 防御性确保记忆目录存在，避免权限门控因目录不存在而拒绝写入
+        if let Err(e) = ensure_memory_dir(&self.config_dir).await {
+            tracing::warn!(
+                path = %self.config_dir.display(),
+                error = %e,
+                "[auto_memory] 确保记忆目录存在失败"
+            );
+        }
 
         // 使用 Builder 模式构建 ForkedAgentParams（强制设置 provider_pool）
         let params = ForkedAgentParams::builder()

@@ -30,6 +30,6 @@ pub use manager::{
 pub use openclaw_parser::read_skill_description;
 pub use service::{
     is_builtin_tool, CapabilityErrorReport, ErrorReport, EvolutionService, EvolutionServiceConfig,
-    SkillRecordSummary,
+    SingleEvolutionResult, SkillRecordSummary,
 };
 pub use versioning::{SkillVersion, VersionHistory, VersionManager, VersionSource};

@@ -152,9 +152,12 @@ impl ResponseCache {
         if !has_tool_results {
             return None;
         }
-        if !self.is_cacheable(content) {
-            return None;
-        }
+
+        // Acquire lock once and check cacheability inside the lock to avoid
+        // TOCTOU between is_cacheable() and the cache insertion below.
+        // Previously, is_cacheable() acquired its own lock, then the insertion
+        // acquired a second lock — this was a double-lock pattern that could
+        // observe inconsistent config between the two calls.
         let items = Self::extract_list_items(content);
         if items.len() < 5 {
             return None;
@@ -187,6 +190,12 @@ impl ResponseCache {
         };
 
         let mut inner = self.get_lock();
+        // Check cacheability inside the lock (min_chars from config)
+        let min_chars = inner.config.cacheable_min_chars;
+        if content.chars().count() <= min_chars {
+            return None;
+        }
+
         let max_per_session = inner.config.cache_max_per_session;
         let session_cache = inner.data.entry(session_key.to_string()).or_default();
 
@@ -232,12 +241,6 @@ impl ResponseCache {
     // ──────────────────────────────────────────────
     // Internal helpers
     // ──────────────────────────────────────────────
-
-    /// Content is cacheable when it is long enough and contains a list.
-    fn is_cacheable(&self, content: &str) -> bool {
-        let min_chars = self.get_lock().config.cacheable_min_chars;
-        content.chars().count() > min_chars
-    }
 
     /// Extract list items from a numbered or bulleted list.
     /// Handles: `1. item`, `- item`, `* item`, `• item`
@@ -300,8 +303,8 @@ impl ResponseCache {
         session_key.hash(&mut hasher);
         ts.hash(&mut hasher);
         let h = hasher.finish();
-        // 8 lowercase hex chars
-        format!("{:08x}", h & 0xFFFF_FFFF)
+        // 16 lowercase hex chars (full u64)
+        format!("{:016x}", h)
     }
 }
 
@@ -530,12 +533,14 @@ impl ContentReplacementState {
     }
 
     /// 如果超过限制，删除最老的条目
+    /// 使用 drain 而非 remove(0) 避免 O(n) 复制开销
     fn prune_if_needed(&mut self) {
         while self.insertion_order.len() > self.max_replacement_entries {
             if let Some(oldest_id) = self.insertion_order.first().cloned() {
                 self.seen_ids.remove(&oldest_id);
                 self.replacements.remove(&oldest_id);
-                self.insertion_order.remove(0);
+                // drain(0..1) removes the first element in O(1) amortized
+                self.insertion_order.drain(0..1);
             } else {
                 break;
             }
@@ -579,6 +584,8 @@ impl ContentReplacementState {
 
         // 从 records 恢复 replacements
         for record in records {
+            // 将 record 的 tool_use_id 加入 seen_ids，维持 "一旦决定，永不更改" 不变量
+            state.seen_ids.insert(record.tool_use_id.clone());
             state
                 .replacements
                 .insert(record.tool_use_id.clone(), record.replacement.clone());
@@ -591,6 +598,8 @@ impl ContentReplacementState {
         // 从继承的 replacements 填充空缺
         if let Some(inherited) = inherited_replacements {
             for (id, replacement) in inherited {
+                // 将继承的 ID 也加入 seen_ids
+                state.seen_ids.insert(id.clone());
                 if !state.replacements.contains_key(id) {
                     state.replacements.insert(id.clone(), replacement.clone());
                     if !state.insertion_order.contains(id) {
@@ -599,6 +608,9 @@ impl ContentReplacementState {
                 }
             }
         }
+
+        // 强制执行 max_replacement_entries 限制
+        state.prune_if_needed();
 
         state
     }
@@ -667,7 +679,7 @@ fn sanitize_tool_use_id(tool_use_id: &str) -> String {
     // 移除或替换危险字符
     let sanitized: String = tool_use_id
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
 
     // 如果清理后为空，使用默认值
@@ -675,9 +687,10 @@ fn sanitize_tool_use_id(tool_use_id: &str) -> String {
         return format!("tool-{}", uuid::Uuid::new_v4().simple());
     }
 
-    // 限制长度
+    // 限制长度（按字符边界安全截断，避免 panic）
     let result = if sanitized.len() > 64 {
-        sanitized[..64].to_string()
+        let boundary = sanitized.floor_char_boundary(64);
+        sanitized[..boundary].to_string()
     } else {
         sanitized
     };
@@ -724,28 +737,75 @@ fn sanitize_tool_use_id(tool_use_id: &str) -> String {
 /// 清理策略：
 /// 1. 使用 session_file_stem 替换特殊字符为下划线
 /// 2. 只保留字母、数字、连字符和下划线
-/// 3. 限制长度
+/// 3. 对非 ASCII 部分追加稳定短 hash 防止不同会话映射到同一目录
+/// 4. 限制长度（先为 hash 后缀预留空间，再截断 prefix，避免 hash 被截掉）
 fn sanitize_session_key(session_key: &str) -> String {
     // 首先使用 session_file_stem 替换特殊字符（保持语义一致性）
     let stem = blockcell_core::session_file_stem(session_key);
 
-    // 然后过滤掉任何剩余的危险字符（防御性编程）
-    let sanitized: String = stem
+    // 分离 ASCII-safe 部分和非 ASCII 部分
+    let ascii_safe: String = stem
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
 
-    // 如果清理后为空，使用默认值
-    if sanitized.is_empty() {
-        return format!("session-{}", uuid::Uuid::new_v4().simple());
+    let has_non_ascii = stem
+        .chars()
+        .any(|c| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
+
+    // 如果有非 ASCII 字符被过滤掉，追加原始 session_key 的 SHA256 短 hash
+    // 以保证不同非 ASCII 会话不会映射到同一目录，且同一 session 多次清理结果一致
+    let result = if has_non_ascii {
+        // 使用原始 session_key（而非 stem）计算 hash，保证稳定性
+        let hash = sha256_short_hash(session_key);
+        // 关键修复：先为 hash 后缀预留空间，再截断 prefix
+        // 格式为 "{prefix}-{hash}"，hash 固定 12 字符，分隔符 1 字符
+        let suffix_len = 1 + hash.len(); // "-" + hash = 13
+        let max_total = 64usize;
+        let prefix_max = max_total.saturating_sub(suffix_len);
+        let prefix = truncate_ascii_boundary(&ascii_safe, prefix_max);
+        // 如果 prefix 截断后为空或只有分隔符，使用稳定 hash 作为前缀
+        if prefix.trim_matches('-').is_empty() {
+            format!("session-{}", hash)
+        } else {
+            format!("{}-{}", prefix.trim_end_matches('-'), hash)
+        }
+    } else {
+        ascii_safe
+    };
+
+    // 如果清理后为空（极端情况：纯非 ASCII + 无 ASCII-safe 部分），使用稳定 hash
+    if result.is_empty() || result.trim_matches('-').is_empty() {
+        return format!("session-{}", sha256_short_hash(session_key));
     }
 
-    // 限制长度 (UUID 格式通常是 36 字符，允许稍长)
-    if sanitized.len() > 64 {
-        sanitized[..64].to_string()
+    // 非 ASCII 情况已在上面保证不超过 64 字符，这里只处理纯 ASCII 的情况
+    if result.len() > 64 {
+        let boundary = result.floor_char_boundary(64);
+        result[..boundary].to_string()
     } else {
-        sanitized
+        result
     }
+}
+
+/// 按字符边界安全截断 ASCII 字符串到指定字节长度
+fn truncate_ascii_boundary(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        return s.to_string();
+    }
+    let boundary = s.floor_char_boundary(max_len);
+    s[..boundary].to_string()
+}
+
+/// 计算 SHA256 的短 hash（前 12 字符），用于稳定区分非 ASCII 会话
+fn sha256_short_hash(input: &str) -> String {
+    use std::fmt::Write;
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(input.as_bytes());
+    let mut hex = String::with_capacity(12);
+    for byte in &digest[..6] {
+        write!(hex, "{:02x}", byte).unwrap();
+    }
+    hex
 }
 
 /// 构建内存 fallback 替换消息（当磁盘持久化失败时）

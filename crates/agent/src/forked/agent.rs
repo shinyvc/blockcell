@@ -694,10 +694,16 @@ fn validate_path_safety(path: &str) -> Result<(), ForkedAgentError> {
         ));
     }
 
-    // 检查路径遍历
-    if path.contains("..") {
+    // 检查路径遍历：先词法归一化，再检查是否逃逸到父目录。
+    // 原始路径中的 ".." 在归一化后可能合法（如 "src/../lib" → "lib"），
+    // 仅当归一化后的路径仍以 ".." 开头时才拒绝（表示逃逸到工作目录之外）。
+    let normalized = normalize_path_lexically(Path::new(path));
+    if normalized
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
         return Err(ForkedAgentError::ToolError(
-            "Path traversal detected: '..' not allowed".to_string(),
+            "Path traversal detected: path escapes working directory".to_string(),
         ));
     }
 
@@ -710,7 +716,9 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
         match component {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                normalized.pop();
+                if !normalized.pop() {
+                    normalized.push(std::path::Component::ParentDir.as_os_str());
+                }
             }
             other => normalized.push(other.as_os_str()),
         }
@@ -734,8 +742,57 @@ fn resolve_forked_path(
     };
 
     if let Some(base) = working_dir {
-        let base = normalize_path_lexically(base);
-        let resolved = normalize_path_lexically(&resolved);
+        let base = match std::fs::canonicalize(base) {
+            Ok(real) => real,
+            Err(_) => normalize_path_lexically(base),
+        };
+
+        // Resolve the nearest existing ancestor to get the real path,
+        // then append the remaining non-existent suffix. This prevents
+        // symlink escape when the target path doesn't fully exist yet
+        // (e.g. workdir/link_to_outside/new_file where new_file doesn't exist).
+        let resolved = match std::fs::canonicalize(&resolved) {
+            Ok(real) => real,
+            Err(_) => {
+                // Walk up to find the nearest existing ancestor, canonicalize it,
+                // then append the remaining components.
+                let mut existing_ancestor = resolved.clone();
+                let mut suffix = PathBuf::new();
+                loop {
+                    if existing_ancestor.as_os_str().is_empty() {
+                        // Reached root without finding existing path —
+                        // fall back to lexical check (no symlinks possible above root)
+                        break normalize_path_lexically(&resolved);
+                    }
+                    if existing_ancestor.exists() {
+                        match std::fs::canonicalize(&existing_ancestor) {
+                            Ok(real_ancestor) => {
+                                break real_ancestor.join(suffix);
+                            }
+                            Err(_) => {
+                                // canonicalize failed even though path exists
+                                // (e.g. permission error) — reject for safety
+                                return Err(ForkedAgentError::ToolError(format!(
+                                    "Cannot resolve real path of '{}': permission denied or broken symlink",
+                                    existing_ancestor.display()
+                                )));
+                            }
+                        }
+                    }
+                    // Move up one component
+                    if let Some(parent) = existing_ancestor.parent() {
+                        if let Some(file_name) = existing_ancestor.file_name() {
+                            suffix = PathBuf::from(file_name).join(suffix);
+                        }
+                        existing_ancestor = parent.to_path_buf();
+                    } else {
+                        // Reached filesystem root
+                        break normalize_path_lexically(&resolved);
+                    }
+                }
+            }
+        };
+
         if !resolved.starts_with(&base) {
             return Err(ForkedAgentError::ToolError(format!(
                 "Path '{}' is outside isolated working directory '{}'",
@@ -3135,6 +3192,44 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_path_preserves_leading_parent_dir() {
+        // "../secret" → pop() on empty fails → push ".." back → "../secret"
+        let result = normalize_path_lexically(Path::new("../secret"));
+        assert_eq!(result, PathBuf::from("../secret"));
+    }
+
+    #[test]
+    fn test_normalize_path_preserves_unresolvable_parent_dir() {
+        // "a/../../secret" → "a" then ".." pops "a" → "" then ".." fails → "../secret"
+        let result = normalize_path_lexically(Path::new("a/../../secret"));
+        assert_eq!(result, PathBuf::from("../secret"));
+    }
+
+    #[test]
+    fn test_normalize_path_resolves_inner_parent_dir() {
+        // "src/../lib" → "src" then ".." pops "src" → "lib"
+        let result = normalize_path_lexically(Path::new("src/../lib"));
+        assert_eq!(result, PathBuf::from("lib"));
+    }
+
+    #[test]
+    fn test_normalize_path_no_parent_dir() {
+        let result = normalize_path_lexically(Path::new("foo/bar"));
+        assert_eq!(result, PathBuf::from("foo/bar"));
+    }
+
+    #[test]
+    fn test_validate_path_safety_rejects_leading_parent() {
+        assert!(validate_path_safety("../secret").is_err());
+        assert!(validate_path_safety("a/../../secret").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_safety_allows_resolvable_parent() {
+        assert!(validate_path_safety("src/../lib").is_ok());
+    }
 
     #[test]
     fn test_usage_metrics() {

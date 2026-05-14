@@ -7,7 +7,9 @@
 use blockcell_agent::EvolutionNotifier;
 use blockcell_core::{Error, Result};
 use blockcell_skills::evolution::EvolutionStatus;
-use blockcell_skills::{EvolutionService, EvolutionServiceConfig, LLMProvider};
+use blockcell_skills::{
+    EvolutionService, EvolutionServiceConfig, LLMProvider, SingleEvolutionResult,
+};
 use blockcell_storage::evolution_workflow::WorkflowRecord;
 use blockcell_storage::EvolutionWorkflowStore;
 use std::path::PathBuf;
@@ -19,6 +21,14 @@ use tracing::{debug, error, info, warn};
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
 const DEFAULT_LEASE_DURATION_SECS: i64 = 300;
 const SKILL_PIPELINE_STEP: &str = "SkillEvolutionPipeline";
+
+/// Outcome of `run_skill_workflow`.
+enum PipelineOutcome {
+    /// Pipeline finished; record reached Observing or Completed.
+    Done(String),
+    /// Pipeline still running after wait — not a failure, just not done yet.
+    StillRunning,
+}
 
 pub struct SkillEvolutionWorker {
     store: EvolutionWorkflowStore,
@@ -89,10 +99,12 @@ impl SkillEvolutionWorker {
             warn!(error = %e, "Failed to sync pending skill evolution records");
         }
 
-        let workflow = match self
-            .store
-            .claim_next(&self.worker_id, self.lease_duration_secs)
-        {
+        let workflow = match self.store.claim_next(
+            &self.worker_id,
+            self.lease_duration_secs,
+            Some("skill"),
+            None,
+        ) {
             Ok(Some(workflow)) => workflow,
             Ok(None) => {
                 if let Err(e) = self.service.tick_observations().await {
@@ -177,16 +189,49 @@ impl SkillEvolutionWorker {
         }
 
         match result {
-            Ok(output_json) => {
+            Ok(PipelineOutcome::Done(output_json)) => {
                 if !self.complete_step(&workflow, &step_id, Some(&output_json)) {
                     return;
                 }
+                // Use "Observing" instead of "Promoted" — the skill is in
+                // observation window and may still be rolled back if error
+                // rate exceeds threshold. "Promoted" would prevent rollback.
                 let _ = self.store.update_workflow_status_if_owned(
                     &workflow.id,
                     &self.worker_id,
-                    "Promoted",
+                    "Observing",
                     None,
                 );
+            }
+            Ok(PipelineOutcome::StillRunning) => {
+                // Pipeline 仍在运行 — 不是失败也不是完成。
+                // 不立即 notify_one()，避免忙轮询。
+                // 使用 defer_workflow_if_owned 设置 RetryScheduled + backoff lease_until，
+                // claim_next 只在 lease_until < now 时领取，所以 60 秒内不会重新领取。
+                // 不增加 attempt，避免重试计数膨胀。
+                info!(
+                    workflow_id = %workflow.id,
+                    "Skill evolution pipeline still running, deferring with backoff"
+                );
+                if !self.complete_step(&workflow, &step_id, Some("{\"status\":\"StillRunning\"}")) {
+                    return;
+                }
+                match self.store.defer_workflow_if_owned(
+                    &workflow.id,
+                    &self.worker_id,
+                    60, // 60 秒 backoff
+                    Some("StillRunning — pipeline in progress, deferring"),
+                ) {
+                    Ok(true) => {
+                        // 不调用 notify_one() — 让 poll interval 自然触发下次检查
+                    }
+                    Ok(false) => {
+                        warn!(workflow_id = %workflow.id, "Lost lease before deferring StillRunning workflow");
+                    }
+                    Err(e) => {
+                        warn!(workflow_id = %workflow.id, error = %e, "Failed to defer StillRunning workflow");
+                    }
+                }
             }
             Err(e) => {
                 let message = e.to_string();
@@ -254,30 +299,95 @@ impl SkillEvolutionWorker {
         )
     }
 
-    async fn run_skill_workflow(&self, workflow: &WorkflowRecord) -> Result<String> {
+    async fn run_skill_workflow(&self, workflow: &WorkflowRecord) -> Result<PipelineOutcome> {
         let skill_name = workflow.capability_id.as_str();
         let evolution_id = workflow.description.as_str();
 
-        self.service
+        // Atomically run the pipeline — process_pending_evolution now returns
+        // SingleEvolutionResult which distinguishes Completed/Failed/AlreadyRunning
+        // without the TOCTOU race that existed when we checked
+        // is_evolution_pipeline_active() before calling it.
+        let result = self
+            .service
             .process_pending_evolution(skill_name, evolution_id)
-            .await?;
+            .await;
 
-        let record = self.service.evolution().load_record(evolution_id)?;
-        let status = record.status.normalize();
-        match status {
-            EvolutionStatus::Observing | EvolutionStatus::Completed => Ok(serde_json::json!({
-                "skill_name": skill_name,
-                "evolution_id": evolution_id,
-                "status": format!("{:?}", record.status),
-            })
-            .to_string()),
-            EvolutionStatus::Failed | EvolutionStatus::RolledBack => Err(Error::Evolution(
-                format!("skill evolution ended in {:?}", record.status),
+        match result {
+            Ok(SingleEvolutionResult::Completed) => {
+                let record = self.service.evolution().load_record(evolution_id)?;
+                Ok(PipelineOutcome::Done(
+                    serde_json::json!({
+                        "skill_name": skill_name,
+                        "evolution_id": evolution_id,
+                        "status": format!("{:?}", record.status),
+                    })
+                    .to_string(),
+                ))
+            }
+            Ok(SingleEvolutionResult::Failed) => Err(Error::Evolution(
+                "skill evolution failed (all retries exhausted)".into(),
             )),
-            other => Err(Error::Evolution(format!(
-                "skill evolution did not reach observing state: {:?}",
-                other
-            ))),
+            Ok(SingleEvolutionResult::AlreadyRunning) => {
+                // Pipeline 已由其他 worker/tick 驱动 — 不是失败也不是完成。
+                // 释放 lease，下次 tick 重新检查。
+                info!(
+                    evolution_id = %evolution_id,
+                    "Skill evolution pipeline already running via another caller, deferring"
+                );
+                Ok(PipelineOutcome::StillRunning)
+            }
+            Ok(SingleEvolutionResult::WaitingForProvider) => {
+                // 无 LLM provider，record 仅标记为 Generating。
+                // workflow 不应进入 Observing，走 defer/release 路径。
+                info!(
+                    evolution_id = %evolution_id,
+                    "Skill evolution waiting for LLM provider, deferring workflow"
+                );
+                Ok(PipelineOutcome::StillRunning)
+            }
+            Ok(SingleEvolutionResult::NotRunnable(status)) => match *status.normalize() {
+                EvolutionStatus::Failed | EvolutionStatus::RolledBack => {
+                    warn!(
+                        evolution_id = %evolution_id,
+                        status = ?status,
+                        "Skill evolution reached terminal status, failing workflow"
+                    );
+                    Err(Error::Evolution(format!(
+                        "skill evolution reached terminal status: {:?}",
+                        status
+                    )))
+                }
+                _ => {
+                    info!(
+                        evolution_id = %evolution_id,
+                        status = ?status,
+                        "Skill evolution record not runnable (waitable status), deferring workflow"
+                    );
+                    Ok(PipelineOutcome::StillRunning)
+                }
+            },
+            Err(e) => {
+                let record = self.service.evolution().load_record(evolution_id).ok();
+                let status = record.as_ref().map(|r| r.status.normalize());
+                match status {
+                    Some(s)
+                        if matches!(
+                            *s,
+                            EvolutionStatus::Observing | EvolutionStatus::Completed
+                        ) =>
+                    {
+                        Ok(PipelineOutcome::Done(
+                            serde_json::json!({
+                                "skill_name": skill_name,
+                                "evolution_id": evolution_id,
+                                "status": format!("{:?}", s),
+                            })
+                            .to_string(),
+                        ))
+                    }
+                    _ => Err(e),
+                }
+            }
         }
     }
 
@@ -341,20 +451,28 @@ impl SkillEvolutionWorker {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut consecutive_failures = 0u32;
+            const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => break,
                     _ = interval.tick() => {
                         match store.renew_lease(&workflow_id, &worker_id, lease_duration_secs) {
-                            Ok(true) => {}
+                            Ok(true) => {
+                                consecutive_failures = 0;
+                            }
                             Ok(false) => {
                                 warn!(workflow_id = %workflow_id, worker_id = %worker_id, "Lost skill evolution lease during heartbeat");
                                 break;
                             }
                             Err(e) => {
-                                warn!(workflow_id = %workflow_id, worker_id = %worker_id, error = %e, "Failed to heartbeat skill evolution lease");
-                                break;
+                                consecutive_failures += 1;
+                                warn!(workflow_id = %workflow_id, worker_id = %worker_id, error = %e, consecutive_failures = consecutive_failures, max_retries = MAX_CONSECUTIVE_FAILURES, "Failed to heartbeat skill evolution lease (will retry)");
+                                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                                    warn!(workflow_id = %workflow_id, worker_id = %worker_id, "Too many consecutive heartbeat failures, giving up lease");
+                                    break;
+                                }
                             }
                         }
                     }

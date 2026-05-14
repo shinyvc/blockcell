@@ -8,6 +8,7 @@ pub mod capability_adapter;
 pub mod checkpoint;
 pub mod compact;
 pub mod context;
+pub mod dream_state;
 pub(crate) mod error;
 pub mod forked;
 pub mod ghost_background_review;

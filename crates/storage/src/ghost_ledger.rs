@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use blockcell_core::{Error, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -94,6 +94,7 @@ impl GhostLedger {
             "
             PRAGMA journal_mode=WAL;
             PRAGMA foreign_keys=ON;
+            PRAGMA busy_timeout=5000;
             ",
         )
         .map_err(map_sqlite_error)?;
@@ -103,6 +104,7 @@ impl GhostLedger {
             db_path: db_path.to_path_buf(),
         };
         ledger.init_schema()?;
+        ledger.migrate_schema()?;
         Ok(ledger)
     }
 
@@ -354,12 +356,55 @@ impl GhostLedger {
         Ok(())
     }
 
-    pub fn claim_reviewable_episodes(&self, limit: usize) -> Result<Vec<GhostEpisodeRecord>> {
+    /// Update episode status only if the caller still owns the review lease.
+    /// Returns false if ownership check fails (lease lost or stolen by another worker).
+    pub fn update_episode_status_if_review_owned(
+        &self,
+        episode_id: &str,
+        worker_id: &str,
+        status: &str,
+    ) -> Result<bool> {
+        let now = now_rfc3339();
+        let conn = self.lock_conn()?;
+        let affected = conn
+            .execute(
+                "
+                UPDATE episodes
+                SET status = ?2, updated_at = ?3
+                WHERE id = ?1 AND review_owner = ?4
+                ",
+                params![episode_id, status, now, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(affected == 1)
+    }
+
+    /// Claim reviewable episodes with lease semantics.
+    ///
+    /// 为每个 claim 的 episode 设置 review_owner 和 review_lease_until，
+    /// 防止长耗时 review 被另一个 worker 当成 stale 重复 claim。
+    ///
+    /// Claim 条件：
+    /// - status IN ('pending_review', 'review_failed')
+    /// - status = 'reviewing' 且 review_lease_until < now（lease 过期）
+    ///
+    /// 注意：不再使用 updated_at < 10分钟 作为 stale 判断，
+    /// 因为合法但耗时的 review 可能超过 10 分钟。
+    /// 现在通过 review_lease_until 判断：只要 lease 未过期，
+    /// 其他 worker 就不会 claim 这个 episode。
+    pub fn claim_reviewable_episodes(
+        &self,
+        limit: usize,
+        worker_id: &str,
+        lease_duration_secs: i64,
+    ) -> Result<Vec<GhostEpisodeRecord>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
 
         let now = now_rfc3339();
+        let lease_until =
+            (Utc::now() + chrono::Duration::seconds(lease_duration_secs)).to_rfc3339();
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction().map_err(map_sqlite_error)?;
         let rows = {
@@ -369,13 +414,14 @@ impl GhostLedger {
                     SELECT id, boundary_kind, subject_key, status, summary, metadata_json, created_at, updated_at
                     FROM episodes
                     WHERE status IN ('pending_review', 'review_failed')
+                       OR (status = 'reviewing' AND (review_lease_until IS NULL OR review_lease_until < ?2))
                     ORDER BY created_at ASC, id ASC
                     LIMIT ?1
                     ",
                 )
                 .map_err(map_sqlite_error)?;
             let rows = stmt
-                .query_map(params![limit as i64], |row| {
+                .query_map(params![limit as i64, now], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -404,29 +450,75 @@ impl GhostLedger {
             _updated_at,
         ) in rows
         {
-            tx.execute(
+            // 原子化 claim：设置 status='reviewing' + review_owner + review_lease_until
+            let affected = tx.execute(
                 "
                 UPDATE episodes
-                SET status = 'reviewing', updated_at = ?2
-                WHERE id = ?1 AND status IN ('pending_review', 'review_failed')
+                SET status = 'reviewing', updated_at = ?3,
+                    review_owner = ?4, review_lease_until = ?5
+                WHERE id = ?1 AND (
+                    status IN ('pending_review', 'review_failed')
+                    OR (status = 'reviewing' AND (review_lease_until IS NULL OR review_lease_until < ?2))
+                )
                 ",
-                params![id, now],
-            )
-            .map_err(map_sqlite_error)?;
-            claimed.push(GhostEpisodeRecord {
-                id,
-                boundary_kind,
-                subject_key,
-                status: "reviewing".to_string(), // 返回事务提交后的实际状态
-                summary,
-                metadata: decode_json(&metadata_json)?,
-                created_at,
-                updated_at: now.clone(), // 更新为当前时间
-            });
+                params![id, now, now, worker_id, lease_until],
+            ).map_err(map_sqlite_error)?;
+            // 只有真正赢得 UPDATE 竞争的才放入返回列表
+            if affected == 1 {
+                claimed.push(GhostEpisodeRecord {
+                    id,
+                    boundary_kind,
+                    subject_key,
+                    status: "reviewing".to_string(),
+                    summary,
+                    metadata: decode_json(&metadata_json)?,
+                    created_at,
+                    updated_at: now.clone(),
+                });
+            }
         }
 
         tx.commit().map_err(map_sqlite_error)?;
         Ok(claimed)
+    }
+
+    /// 延长 review lease，防止长耗时 review 被当成 stale 重新 claim。
+    ///
+    /// review loop 执行期间应定期调用此方法 heartbeat 延长 lease。
+    pub fn heartbeat_review_lease(
+        &self,
+        episode_id: &str,
+        worker_id: &str,
+        lease_duration_secs: i64,
+    ) -> Result<bool> {
+        let now = now_rfc3339();
+        let lease_until =
+            (Utc::now() + chrono::Duration::seconds(lease_duration_secs)).to_rfc3339();
+        let conn = self.lock_conn()?;
+        let affected = conn
+            .execute(
+                "UPDATE episodes
+                 SET updated_at = ?1, review_lease_until = ?2
+                 WHERE id = ?3 AND review_owner = ?4",
+                params![now, lease_until, episode_id, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(affected == 1)
+    }
+
+    /// 释放 review lease（review 完成或失败后调用）。
+    pub fn release_review_lease(&self, episode_id: &str, worker_id: &str) -> Result<bool> {
+        let now = now_rfc3339();
+        let conn = self.lock_conn()?;
+        let affected = conn
+            .execute(
+                "UPDATE episodes
+                 SET review_owner = NULL, review_lease_until = NULL, updated_at = ?1
+                 WHERE id = ?2 AND review_owner = ?3",
+                params![now, episode_id, worker_id],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(affected == 1)
     }
 
     pub fn insert_review_run(&self, run: NewGhostReviewRun) -> Result<String> {
@@ -454,6 +546,106 @@ impl GhostLedger {
         .map_err(map_sqlite_error)?;
 
         Ok(run_id)
+    }
+
+    /// Insert a review_run and update episode status in one transaction,
+    /// but only if the caller still owns the review lease.
+    ///
+    /// Uses `Immediate` transaction + UPDATE-first pattern to prevent TOCTOU:
+    /// 1. UPDATE episodes WHERE id=? AND review_owner=? (locks the row)
+    /// 2. If affected rows == 0, lease was lost → return None
+    /// 3. INSERT review_run
+    /// 4. COMMIT
+    ///
+    /// Returns `Ok(Some(run_id))` on success, `Ok(None)` if the owner check
+    /// fails (lease lost), and `Err` on storage errors.
+    /// When `review_worker_id` is `None`, skips the owner check (unconditional insert).
+    pub fn insert_review_run_if_review_owned(
+        &self,
+        run: NewGhostReviewRun,
+        review_worker_id: Option<&str>,
+        episode_status: &str,
+    ) -> Result<Option<String>> {
+        let run_id = Uuid::new_v4().to_string();
+        let now = now_rfc3339();
+        let result_json = encode_json(&run.result)?;
+        let mut conn = self.lock_conn()?;
+
+        // If no worker_id, skip owner check — unconditional insert + update.
+        if review_worker_id.is_none() {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(map_sqlite_error)?;
+
+            tx.execute(
+                "
+                INSERT INTO review_runs (
+                    id, episode_id, reviewer, status, result_json, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ",
+                params![
+                    run_id,
+                    run.episode_id,
+                    run.reviewer,
+                    run.status,
+                    result_json,
+                    now,
+                    now,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+
+            tx.execute(
+                "UPDATE episodes SET status = ?2, updated_at = ?3 WHERE id = ?1",
+                params![run.episode_id, episode_status, now],
+            )
+            .map_err(map_sqlite_error)?;
+
+            tx.commit().map_err(map_sqlite_error)?;
+            return Ok(Some(run_id));
+        }
+
+        let wid = review_worker_id.unwrap();
+
+        // UPDATE-first pattern: lock the row and verify ownership atomically.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+
+        let affected = tx
+            .execute(
+                "UPDATE episodes SET status = ?2, updated_at = ?3 WHERE id = ?1 AND review_owner = ?4",
+                params![run.episode_id, episode_status, now, wid],
+            )
+            .map_err(map_sqlite_error)?;
+
+        if affected == 0 {
+            // Lease lost — commit empty transaction and bail.
+            tx.commit().map_err(map_sqlite_error)?;
+            return Ok(None);
+        }
+
+        // Owner confirmed: insert review_run.
+        tx.execute(
+            "
+            INSERT INTO review_runs (
+                id, episode_id, reviewer, status, result_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            params![
+                run_id,
+                run.episode_id,
+                run.reviewer,
+                run.status,
+                result_json,
+                now,
+                now,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+
+        tx.commit().map_err(map_sqlite_error)?;
+        Ok(Some(run_id))
     }
 
     pub fn get_review_run(&self, run_id: &str) -> Result<Option<GhostReviewRunRecord>> {
@@ -655,7 +847,9 @@ impl GhostLedger {
                 summary TEXT NOT NULL,
                 metadata_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                review_owner TEXT,
+                review_lease_until TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_ghost_episodes_status ON episodes(status);
@@ -714,10 +908,41 @@ impl GhostLedger {
         Ok(())
     }
 
+    /// 为已有数据库添加新列（review lease 语义）
+    fn migrate_schema(&self) -> Result<()> {
+        let conn = self.lock_conn()?;
+        // 添加 review_owner 和 review_lease_until 列（如果不存在）
+        // SQLite ALTER TABLE ADD COLUMN 在列已存在时会报错，需要逐个尝试
+        for col_sql in [
+            "ALTER TABLE episodes ADD COLUMN review_owner TEXT",
+            "ALTER TABLE episodes ADD COLUMN review_lease_until TEXT",
+        ] {
+            match conn.execute_batch(col_sql) {
+                Ok(()) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("duplicate column name") {
+                        tracing::debug!("ghost ledger migration: column already exists, skipping");
+                    } else {
+                        return Err(map_sqlite_error(e));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.inner
-            .lock()
-            .map_err(|e| Error::Storage(format!("Ghost ledger database lock error: {}", e)))
+        match self.inner.lock() {
+            Ok(guard) => Ok(guard),
+            Err(poisoned) => {
+                // Recover from mutex poisoning: the Connection is still valid,
+                // we just need to regain access. into_inner() gives us the
+                // Connection regardless of poison state.
+                tracing::warn!("ghost ledger mutex was poisoned, recovering");
+                Ok(poisoned.into_inner())
+            }
+        }
     }
 
     fn latest_episode_field(&self, field: &str) -> Result<Option<String>> {
@@ -907,7 +1132,9 @@ mod tests {
             .update_episode_status(&failed_id, "review_failed")
             .unwrap();
 
-        let claimed = ledger.claim_reviewable_episodes(10).unwrap();
+        let claimed = ledger
+            .claim_reviewable_episodes(10, "test-worker", 600)
+            .unwrap();
         let claimed_ids = claimed
             .iter()
             .map(|episode| episode.id.as_str())

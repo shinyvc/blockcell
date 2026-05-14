@@ -9,6 +9,29 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+/// Result of a single evolution pipeline run.
+///
+/// Replaces the previous `bool` return from `run_single_evolution` to
+/// eliminate the TOCTOU race between `is_evolution_pipeline_active()` and
+/// `process_pending_evolution()`.  The lock decision is now atomic — callers
+/// `process_pending_evolution()` 的原子化返回结果。
+///
+/// 区分 Completed / Failed / AlreadyRunning / WaitingForProvider / NotRunnable，
+/// 消除调用方需要先检查 `is_evolution_pipeline_active()` 的 TOCTOU 竞态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SingleEvolutionResult {
+    /// Pipeline 完成成功；技能已进入观察窗口或已完成。
+    Completed,
+    /// Pipeline 失败（所有重试耗尽）。
+    Failed,
+    /// 另一个调用方已持有该 evolution_id 的 pipeline 锁。
+    AlreadyRunning,
+    /// 无 LLM provider，record 仅标记为 Generating，等待 provider 配置后再推进。
+    WaitingForProvider,
+    /// 当前 record 状态不适合 pipeline worker 推进（非 runnable 状态）。
+    NotRunnable(EvolutionStatus),
+}
+
 /// Built-in tool names that should NOT trigger skill evolution.
 /// These are internal system tools — their failures are transient errors,
 /// not missing skills that can be "learned".
@@ -296,6 +319,8 @@ impl Default for EvolutionServiceConfig {
 ///
 /// 这是自升级系统的入口。外部通过以下方式交互：
 /// - `report_error()`: 技能执行失败时调用，内部自动判断是否触发进化
+type DeployCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// - `run_pending_evolutions()`: 执行待处理的进化流程（生成→审计→dry run→测试→发布）
 /// - `tick()`: 定期调用，驱动灰度发布的阶段推进和自动回滚
 /// - `set_llm_provider()`: 设置 LLM provider，使 tick() 能自动驱动完整 pipeline
@@ -312,7 +337,7 @@ pub struct EvolutionService {
     llm_provider: Option<Arc<dyn LLMProvider>>,
     /// Callback invoked after a successful skill deployment.
     /// Used to invalidate caches (e.g. SkillDocCache) in the runtime.
-    deploy_callback: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    deploy_callback: Option<DeployCallback>,
 }
 
 impl EvolutionService {
@@ -796,7 +821,7 @@ impl EvolutionService {
 
         for (skill_name, evolution_id) in pending {
             match self.run_single_evolution(&evolution_id, llm_provider).await {
-                Ok(true) => {
+                Ok(SingleEvolutionResult::Completed) => {
                     info!(
                         skill = %skill_name,
                         evolution_id = %evolution_id,
@@ -804,13 +829,48 @@ impl EvolutionService {
                     );
                     completed.push(evolution_id);
                 }
-                Ok(false) => {
+                Ok(SingleEvolutionResult::Failed) => {
                     warn!(
                         skill = %skill_name,
                         evolution_id = %evolution_id,
                         "Evolution pipeline failed at some stage"
                     );
                     self.cleanup_evolution(&skill_name, &evolution_id).await;
+                }
+                Ok(SingleEvolutionResult::AlreadyRunning) => {
+                    info!(
+                        skill = %skill_name,
+                        evolution_id = %evolution_id,
+                        "Evolution pipeline already running, skipping"
+                    );
+                }
+                Ok(SingleEvolutionResult::WaitingForProvider) => {
+                    info!(
+                        skill = %skill_name,
+                        evolution_id = %evolution_id,
+                        "Evolution waiting for LLM provider"
+                    );
+                }
+                Ok(SingleEvolutionResult::NotRunnable(status)) => {
+                    if matches!(
+                        *status.normalize(),
+                        EvolutionStatus::Failed | EvolutionStatus::RolledBack
+                    ) {
+                        warn!(
+                            skill = %skill_name,
+                            evolution_id = %evolution_id,
+                            status = ?status,
+                            "Evolution reached terminal non-runnable status, cleaning up"
+                        );
+                        self.cleanup_evolution(&skill_name, &evolution_id).await;
+                    } else {
+                        info!(
+                            skill = %skill_name,
+                            evolution_id = %evolution_id,
+                            status = ?status,
+                            "Evolution not runnable, skipping"
+                        );
+                    }
                 }
                 Err(e) => {
                     error!(
@@ -832,17 +892,20 @@ impl EvolutionService {
     /// 流程：1. 生成补丁 → 2. 审计 → 3. 编译检查 → 4. 部署+观察
     ///
     /// 如果审计/编译失败，会将失败反馈给 LLM 重新生成，最多重试 max_retries 次。
+    ///
+    /// 返回 `SingleEvolutionResult` 而非 `bool`，消除 `is_evolution_pipeline_active()`
+    /// 与 `process_pending_evolution()` 之间的 TOCTOU 竞态。
     async fn run_single_evolution(
         &self,
         evolution_id: &str,
         llm_provider: &dyn LLMProvider,
-    ) -> Result<bool> {
+    ) -> Result<SingleEvolutionResult> {
         // P2-6: 获取 pipeline 锁，防止同一 evolution 并发执行
         {
             let mut locks = self.pipeline_locks.lock().await;
             if locks.contains(evolution_id) {
                 info!(evolution_id = %evolution_id, "🧠 [pipeline] Already running, skipping");
-                return Ok(true); // 已在执行中，不重复
+                return Ok(SingleEvolutionResult::AlreadyRunning);
             }
             locks.insert(evolution_id.to_string());
         }
@@ -865,7 +928,7 @@ impl EvolutionService {
         &self,
         evolution_id: &str,
         llm_provider: &dyn LLMProvider,
-    ) -> Result<bool> {
+    ) -> Result<SingleEvolutionResult> {
         let max_retries = self.config.max_retries;
         let record = self.evolution.load_record(evolution_id)?;
         info!(
@@ -909,7 +972,7 @@ impl EvolutionService {
                     "🧠 [pipeline] ❌ Exhausted all {} retries, giving up",
                     max_retries
                 );
-                return Ok(false);
+                return Ok(SingleEvolutionResult::Failed);
             }
 
             if attempt > 1 {
@@ -1117,7 +1180,7 @@ impl EvolutionService {
             "🧠 [pipeline] ═══ Pipeline completed successfully (after {} attempt(s)) ═══",
             record.attempt
         );
-        Ok(true)
+        Ok(SingleEvolutionResult::Completed)
     }
 
     /// 定时调度器 tick
@@ -1196,19 +1259,33 @@ impl EvolutionService {
         Ok(())
     }
 
-    /// Process a pending evolution.
+    /// 处理一个待进化的技能。
     ///
-    /// If an LLM provider is configured, runs the full pipeline (generate→audit→compile→deploy+observe).
-    /// Otherwise, just marks the record as "Generating" so list_skills can show it.
+    /// 如果 LLM provider 已配置，运行完整 pipeline（generate→audit→compile→deploy+observe）。
+    /// 否则仅标记为 Generating，等待 provider 配置后再推进。
+    ///
+    /// 返回 `SingleEvolutionResult` 以原子化区分各种结果状态，
+    /// 消除调用方需要先检查 `is_evolution_pipeline_active()` 的 TOCTOU 竞态。
     pub async fn process_pending_evolution(
         &self,
         skill_name: &str,
         evolution_id: &str,
-    ) -> Result<()> {
+    ) -> Result<SingleEvolutionResult> {
         let record = self.evolution.load_record(evolution_id)?;
 
+        // 非 runnable 状态：区分真正完成 vs 未完成但暂不可推进
         if !Self::is_pipeline_runnable_status(&record.status) {
-            return Ok(());
+            let normalized = record.status.normalize();
+            if matches!(
+                *normalized,
+                EvolutionStatus::Observing | EvolutionStatus::Completed
+            ) {
+                // 真正完成 — 只有 Observing/Completed 才返回 Completed
+                return Ok(SingleEvolutionResult::Completed);
+            }
+            // 其他非 runnable 状态（如 Failed/RolledBack/Generating 等），
+            // 不应被当作 Completed，返回 NotRunnable 让 worker 走 defer 路径
+            return Ok(SingleEvolutionResult::NotRunnable(record.status.clone()));
         }
 
         let mut record = record;
@@ -1234,31 +1311,30 @@ impl EvolutionService {
             );
         }
 
-        // If we have an LLM provider, run the full pipeline
+        // 如果 LLM provider 已配置，运行完整 pipeline
         if let Some(ref llm_provider) = self.llm_provider {
             info!(
                 skill = %skill_name,
                 evolution_id = %evolution_id,
                 "🧠 [自进化] LLM provider 可用，开始执行完整进化 pipeline"
             );
-            match self
+            let result = self
                 .run_single_evolution(evolution_id, llm_provider.as_ref())
-                .await
-            {
-                Ok(true) => {
+                .await;
+
+            match &result {
+                Ok(SingleEvolutionResult::Completed) => {
                     info!(
                         skill = %skill_name,
                         evolution_id = %evolution_id,
                         "🧠 [自进化] 技能 `{}` 进化 pipeline 完成，观察窗口已启动",
                         skill_name
                     );
-                    // Observation stats already initialized in run_single_evolution
-                    // Invoke deploy callback to invalidate caches (e.g. SkillDocCache)
                     if let Some(ref cb) = self.deploy_callback {
                         cb(skill_name);
                     }
                 }
-                Ok(false) => {
+                Ok(SingleEvolutionResult::Failed) => {
                     warn!(
                         skill = %skill_name,
                         evolution_id = %evolution_id,
@@ -1266,6 +1342,26 @@ impl EvolutionService {
                         skill_name
                     );
                     self.cleanup_evolution(skill_name, evolution_id).await;
+                }
+                Ok(SingleEvolutionResult::AlreadyRunning) => {
+                    info!(
+                        skill = %skill_name,
+                        evolution_id = %evolution_id,
+                        "🧠 [自进化] 技能 `{}` 进化 pipeline 已在运行中（由其他 worker/tick 驱动），跳过",
+                        skill_name
+                    );
+                }
+                Ok(SingleEvolutionResult::WaitingForProvider) => {
+                    // 不会到达此分支 — 有 provider 时不会返回 WaitingForProvider
+                }
+                Ok(SingleEvolutionResult::NotRunnable(status)) => {
+                    info!(
+                        skill = %skill_name,
+                        evolution_id = %evolution_id,
+                        status = ?status,
+                        "🧠 [自进化] 技能 `{}` 当前状态 {:?} 不适合 pipeline 推进，跳过",
+                        skill_name, status
+                    );
                 }
                 Err(e) => {
                     error!(
@@ -1278,21 +1374,22 @@ impl EvolutionService {
                     self.cleanup_evolution(skill_name, evolution_id).await;
                 }
             }
+
+            result
         } else {
-            // No LLM provider — just mark as Generating so list_skills can show it
+            // 无 LLM provider — 仅标记为 Generating，返回 WaitingForProvider
             info!(
                 skill = %skill_name,
                 evolution_id = %evolution_id,
-                "🧠 [自进化] 无 LLM provider，技能 `{}` 标记为学习中 (Generating)，等待手动执行",
+                "🧠 [自进化] 无 LLM provider，技能 `{}` 标记为学习中 (Generating)，等待 provider 配置",
                 skill_name
             );
             let mut updated_record = record;
             updated_record.status = EvolutionStatus::Generating;
             updated_record.updated_at = chrono::Utc::now().timestamp();
             self.evolution.save_record_public(&updated_record)?;
+            Ok(SingleEvolutionResult::WaitingForProvider)
         }
-
-        Ok(())
     }
 
     /// P1: 观察窗口 tick — 检查错误率和观察时间
@@ -1867,6 +1964,13 @@ impl EvolutionService {
     /// 获取内部 SkillEvolution 引用（用于高级操作）
     pub fn evolution(&self) -> &SkillEvolution {
         &self.evolution
+    }
+
+    /// Check if the evolution pipeline is actively running for a specific evolution_id.
+    /// Used to coordinate between EvolutionService.tick() and SkillEvolutionWorker
+    /// to prevent duplicate processing of the same evolution.
+    pub async fn is_evolution_pipeline_active(&self, evolution_id: &str) -> bool {
+        self.pipeline_locks.lock().await.contains(evolution_id)
     }
 
     /// 获取进化记录目录路径

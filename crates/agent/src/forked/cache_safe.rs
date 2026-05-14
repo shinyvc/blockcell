@@ -161,12 +161,15 @@ impl CacheSafeParams {
             return false;
         }
         // 工具定义必须匹配
-        // 优先比较完整工具定义，其次比较哈希
+        // 两边都有完整定义，直接比较
         if !self.tools.is_empty() && !other.tools.is_empty() {
-            // 两边都有完整定义，直接比较
             return self.tools == other.tools;
         }
-        // 至少一边没有完整定义，比较哈希
+        // 一边有工具定义，另一边没有 → 不兼容（缓存键不同）
+        if self.tools.is_empty() != other.tools.is_empty() {
+            return false;
+        }
+        // 两边都为空，基于哈希比较
         match (self.tools_hash, other.tools_hash) {
             (Some(h1), Some(h2)) if h1 != h2 => return false,
             _ => {}

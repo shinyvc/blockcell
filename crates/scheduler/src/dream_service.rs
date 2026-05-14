@@ -7,7 +7,7 @@
 //! - 检查三重门控：时间、会话数、锁
 //! - 所有门控通过时执行 Dream
 
-use crate::consolidator::{DreamConsolidator, GateCheckResult};
+use crate::consolidator::{ConsolidatorConfig, DreamConsolidator, GateCheckResult};
 use blockcell_core::Paths;
 use blockcell_providers::ProviderPool;
 use std::sync::Arc;
@@ -26,6 +26,12 @@ pub struct DreamServiceConfig {
     pub enabled: bool,
     /// 检查间隔（秒）
     pub check_interval_secs: u64,
+    /// 时间门限阈值（小时）
+    pub time_gate_threshold_hours: f64,
+    /// 会话门限阈值（会话数）
+    pub session_gate_threshold: usize,
+    /// 整合超时时间（秒）
+    pub timeout_secs: u64,
     /// Provider 池（用于 Forked Agent LLM 调用）
     pub provider_pool: Option<Arc<ProviderPool>>,
 }
@@ -35,6 +41,9 @@ impl std::fmt::Debug for DreamServiceConfig {
         f.debug_struct("DreamServiceConfig")
             .field("enabled", &self.enabled)
             .field("check_interval_secs", &self.check_interval_secs)
+            .field("time_gate_threshold_hours", &self.time_gate_threshold_hours)
+            .field("session_gate_threshold", &self.session_gate_threshold)
+            .field("timeout_secs", &self.timeout_secs)
             .field("provider_pool", &self.provider_pool.is_some())
             .finish()
     }
@@ -45,6 +54,9 @@ impl Default for DreamServiceConfig {
         Self {
             enabled: true,
             check_interval_secs: DEFAULT_CHECK_INTERVAL_SECS,
+            time_gate_threshold_hours: 24.0,
+            session_gate_threshold: 5,
+            timeout_secs: 300,
             provider_pool: None,
         }
     }
@@ -113,9 +125,13 @@ impl DreamService {
         // 使用 paths.base 作为配置目录
         let config_dir = self.paths.base.clone();
 
-        // 创建 DreamConsolidator
+        // 创建 DreamConsolidator（传入门控配置）
+        let gate_config = ConsolidatorConfig {
+            time_gate_threshold_hours: self.config.time_gate_threshold_hours,
+            session_gate_threshold: self.config.session_gate_threshold,
+        };
         let consolidator = match DreamConsolidator::new(&config_dir).await {
-            Ok(c) => c,
+            Ok(c) => c.with_gate_config(gate_config),
             Err(e) => {
                 tracing::error!(error = %e, "[dream] Failed to create DreamConsolidator");
                 return;
@@ -139,9 +155,10 @@ impl DreamService {
                 };
 
                 // 设置 provider_pool 并执行
+                // 超时保护已移入 dream() 内部，确保超时后仍执行清理逻辑
                 let mut consolidator = consolidator.with_provider_pool(provider_pool);
 
-                match consolidator.dream().await {
+                match consolidator.dream(self.config.timeout_secs).await {
                     Ok(()) => {
                         tracing::info!("[dream] Consolidation completed successfully");
                     }
@@ -175,8 +192,9 @@ impl DreamService {
 
         let mut consolidator = consolidator.with_provider_pool(provider_pool);
 
+        // 手动触发使用默认 300 秒超时
         consolidator
-            .dream()
+            .dream(300)
             .await
             .map_err(|e| format!("Dream failed: {}", e))
     }

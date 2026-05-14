@@ -8,7 +8,7 @@ pub mod job;
 pub mod skill_evolution_worker;
 
 pub use consolidator::{
-    check_gates, DreamConsolidator, DreamError, DreamState, GateCheckResult,
+    check_gates, ConsolidatorConfig, DreamConsolidator, DreamError, DreamState, GateCheckResult,
     SESSION_GATE_THRESHOLD, TIME_GATE_THRESHOLD_HOURS,
 };
 pub use cron_service::CronService;

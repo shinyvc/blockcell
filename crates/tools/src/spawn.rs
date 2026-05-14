@@ -74,6 +74,15 @@ impl Tool for SpawnTool {
             )
         })?;
 
+        // ===== 检查 spawn 权限（防御性检查，与 AgentTool 保持一致） =====
+        if !ctx.can_spawn_subagent() {
+            return Ok(json!({
+                "error": "Cannot spawn subagent",
+                "reason": "ForkChild 和 ONE_SHOT Agent 不能继续 spawn 子 Agent",
+                "hint": "请直接使用工具 (Read, Grep, Write, Edit)"
+            }));
+        }
+
         let skill_name = params
             .get("skill_name")
             .and_then(|v| v.as_str())
@@ -92,7 +101,15 @@ impl Tool for SpawnTool {
                 .or_else(|| skill_params.get("query"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let task = format!("__SKILL_EXEC__:{}:{}", skill, user_query);
+            let mut task = format!("__SKILL_EXEC__:{}:{}", skill, user_query);
+            // If 'task' is also provided, append as additional context so it isn't silently dropped
+            if let Some(extra) = params
+                .get("task")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                task = format!("{}\n[additional context]: {}", task, extra);
+            }
             spawn_handle.spawn(&task, label, &ctx.channel, &ctx.chat_id, None)
         } else {
             let task = params["task"].as_str().unwrap_or("");
@@ -191,7 +208,10 @@ mod tests {
             channel_contacts_file: None,
             response_cache: None,
             runtime_handle: None,
-            agent_identity: None,
+            agent_identity: Some(blockcell_core::AgentIdentity::lead(
+                "test-agent".to_string(),
+                "lead".to_string(),
+            )),
             skill_mutex: None,
             agent_type_registry: None,
             evolution_workflow_store: None,
@@ -213,5 +233,64 @@ mod tests {
             captured_task.lock().expect("capture lock").as_deref(),
             Some("__SKILL_EXEC__:weather:北京天气")
         );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_rejected_for_fork_child() {
+        let captured_task = Arc::new(Mutex::new(None));
+        let tool = SpawnTool;
+        let ctx = ToolContext {
+            workspace: PathBuf::from("/tmp/workspace"),
+            builtin_skills_dir: None,
+            active_skill_dir: None,
+            session_key: "cli:test".to_string(),
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: None,
+            chat_id: "chat-1".to_string(),
+            config: Config::default(),
+            permissions: blockcell_core::types::PermissionSet::new(),
+            task_manager: None,
+            memory_store: None,
+            memory_file_store: None,
+            ghost_memory_lifecycle: None,
+            skill_file_store: None,
+            session_search: None,
+            outbound_tx: None,
+            spawn_handle: Some(Arc::new(CaptureSpawnHandle {
+                captured_task: Arc::clone(&captured_task),
+            })),
+            capability_registry: None,
+            core_evolution: None,
+            event_emitter: None,
+            channel_contacts_file: None,
+            response_cache: None,
+            runtime_handle: None,
+            agent_identity: Some(blockcell_core::AgentIdentity::fork_child(
+                "fork-1".to_string(),
+                "parent-session".to_string(),
+            )),
+            skill_mutex: None,
+            agent_type_registry: None,
+            evolution_workflow_store: None,
+        };
+
+        let result = tool
+            .execute(
+                ctx,
+                json!({
+                    "skill_name": "weather",
+                    "params": {
+                        "user_query": "北京天气"
+                    }
+                }),
+            )
+            .await
+            .expect("spawn execute should return Ok");
+
+        // ForkChild should be rejected — result is a JSON error, not a spawn
+        assert!(result.get("error").is_some());
+        assert_eq!(result["error"].as_str(), Some("Cannot spawn subagent"));
+        assert!(captured_task.lock().expect("capture lock").is_none());
     }
 }

@@ -23,6 +23,36 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// RAII guard that removes a temporary file on drop.
+/// Prevents file leaks if the enclosing function panics or is cancelled.
+struct TempFileGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_ref().expect("TempFileGuard path is None")
+    }
+
+    /// Consume the guard without deleting the file (transfer ownership).
+    #[allow(dead_code)]
+    fn into_path(mut self) -> PathBuf {
+        self.path.take().unwrap()
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// 技能自进化管理器
 pub struct SkillEvolution {
     skills_dir: PathBuf,
@@ -290,7 +320,7 @@ fn default_attempt() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EvolutionStatus {
     Triggered,
     Generating,
@@ -855,15 +885,15 @@ impl SkillEvolution {
                     info!(evolution_id = %evolution_id, "🔨 [compile] Hybrid skill — running Python syntax check for local script asset");
                     let final_script =
                         self.resolve_final_script(&record.skill_name, &patch.diff)?;
-                    let temp_path =
-                        std::env::temp_dir().join(format!("{}_compile.py", record.skill_name));
-                    std::fs::write(&temp_path, &final_script)?;
+                    let temp_guard = TempFileGuard::new(
+                        std::env::temp_dir().join(format!("{}_compile.py", record.skill_name)),
+                    );
+                    std::fs::write(temp_guard.path(), &final_script)?;
 
                     let output = std::process::Command::new("python3")
-                        .args(["-m", "py_compile", temp_path.to_str().unwrap_or("")])
+                        .args(["-m", "py_compile", temp_guard.path().to_str().unwrap_or("")])
                         .output();
-
-                    let _ = std::fs::remove_file(&temp_path);
+                    // TempFileGuard's Drop handles cleanup even on panic/cancellation
 
                     match output {
                         Ok(out) if out.status.success() => (true, None),
@@ -872,8 +902,13 @@ impl SkillEvolution {
                             (false, Some(format!("Python syntax error:\n{}", stderr)))
                         }
                         Err(e) => {
-                            warn!(evolution_id = %evolution_id, "🔨 [compile] python3 not found, skipping syntax check: {}", e);
-                            (true, None)
+                            warn!(evolution_id = %evolution_id, "🔨 [compile] python3 not found, cannot verify Python syntax: {}", e);
+                            // Fail safe: cannot verify syntax without python3,
+                            // rather than silently passing potentially broken code
+                            (
+                                false,
+                                Some(format!("python3 not available for syntax check: {}", e)),
+                            )
                         }
                     }
                 }
@@ -1608,14 +1643,17 @@ impl SkillEvolution {
         }
 
         if let Some(error) = &context.error_stack {
-            prompt.push_str(&format!("## Error\n```\n{}\n```\n\n", error));
+            prompt.push_str(&format!(
+                "## Error\n```\n{}\n```\n\n",
+                Self::sanitize_for_code_fence(error)
+            ));
         }
 
         // Existing source code
         if let Some(snippet) = &context.source_snippet {
             prompt.push_str(&format!(
                 "## Current SKILL.rhai Source\n```rhai\n{}\n```\n\n",
-                snippet
+                Self::sanitize_for_code_fence(snippet)
             ));
         }
 
@@ -1687,14 +1725,17 @@ impl SkillEvolution {
                 context.skill_name
             ));
             if let Some(error) = &context.error_stack {
-                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", error));
+                prompt.push_str(&format!(
+                    "## Issue\n```\n{}\n```\n\n",
+                    Self::sanitize_for_code_fence(error)
+                ));
             }
         }
 
         if let Some(snippet) = &context.source_snippet {
             prompt.push_str(&format!(
                 "## Current SKILL.md Content\n```markdown\n{}\n```\n\n",
-                snippet
+                Self::sanitize_for_code_fence(snippet)
             ));
         }
 
@@ -1706,14 +1747,20 @@ impl SkillEvolution {
                 if let Ok(md) = std::fs::read_to_string(&staged_md) {
                     if !md.trim().is_empty() {
                         prompt.push_str("## Current Staged SKILL.md (reference)\n");
-                        prompt.push_str(&format!("```markdown\n{}\n```\n\n", md));
+                        prompt.push_str(&format!(
+                            "```markdown\n{}\n```\n\n",
+                            Self::sanitize_for_code_fence(&md)
+                        ));
                     }
                 }
                 let staged_meta = staged_skill_dir.join("meta.yaml");
                 if let Ok(meta) = std::fs::read_to_string(&staged_meta) {
                     if !meta.trim().is_empty() {
                         prompt.push_str("## Current Staged meta.yaml (reference)\n");
-                        prompt.push_str(&format!("```yaml\n{}\n```\n\n", meta));
+                        prompt.push_str(&format!(
+                            "```yaml\n{}\n```\n\n",
+                            Self::sanitize_for_code_fence(&meta)
+                        ));
                     }
                 }
             }
@@ -1843,7 +1890,7 @@ impl SkillEvolution {
         prompt.push_str("## Previous Code (has issues)\n");
         prompt.push_str(&format!(
             "```rhai\n{}\n```\n\n",
-            current_feedback.previous_code
+            Self::sanitize_for_code_fence(&current_feedback.previous_code)
         ));
 
         // Current feedback
@@ -1924,7 +1971,7 @@ impl SkillEvolution {
         prompt.push_str("## Previous Content (has issues)\n");
         prompt.push_str(&format!(
             "```markdown\n{}\n```\n\n",
-            current_feedback.previous_code
+            Self::sanitize_for_code_fence(&current_feedback.previous_code)
         ));
 
         prompt.push_str(&format!("## Issues Found ({})\n", current_feedback.stage));
@@ -2018,7 +2065,10 @@ impl SkillEvolution {
                 context.skill_name
             ));
             if let Some(error) = &context.error_stack {
-                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", error));
+                prompt.push_str(&format!(
+                    "## Issue\n```\n{}\n```\n\n",
+                    Self::sanitize_for_code_fence(error)
+                ));
             }
         }
 
@@ -2041,7 +2091,8 @@ impl SkillEvolution {
                 .unwrap_or("text");
             prompt.push_str(&format!(
                 "## Current Script Content\n```{}\n{}\n```\n\n",
-                fence, snippet
+                fence,
+                Self::sanitize_for_code_fence(snippet)
             ));
         }
 
@@ -2090,7 +2141,10 @@ impl SkillEvolution {
         }
 
         prompt.push_str("## Previous Content (has issues)\n");
-        prompt.push_str(&format!("```\n{}\n```\n\n", current_feedback.previous_code));
+        prompt.push_str(&format!(
+            "```\n{}\n```\n\n",
+            Self::sanitize_for_code_fence(&current_feedback.previous_code)
+        ));
         prompt.push_str(&format!(
             "## Issues Found ({})\n{}\n\n",
             current_feedback.stage, current_feedback.feedback
@@ -2155,6 +2209,13 @@ impl SkillEvolution {
         extract_with_marker(response, "```yaml").or_else(|| extract_with_marker(response, "```yml"))
     }
 
+    /// Sanitize content for embedding inside a markdown code fence.
+    /// Replaces triple-backtick sequences to prevent code fence escape
+    /// (prompt injection via generated script content).
+    fn sanitize_for_code_fence(content: &str) -> String {
+        content.replace("```", "\u{200B}``\u{200B}`")
+    }
+
     fn build_audit_prompt(
         &self,
         context: &EvolutionContext,
@@ -2168,7 +2229,10 @@ impl SkillEvolution {
             context.skill_name
         ));
 
-        prompt.push_str(&format!("Code:\n```rhai\n{}\n```\n\n", script_content));
+        prompt.push_str(&format!(
+            "Code:\n```rhai\n{}\n```\n\n",
+            Self::sanitize_for_code_fence(script_content)
+        ));
 
         prompt.push_str("\
 Check for the following Rhai-specific issues:\n\
@@ -2198,7 +2262,10 @@ or\n\
             context.skill_name
         ));
 
-        prompt.push_str(&format!("Content:\n```markdown\n{}\n```\n\n", md_content));
+        prompt.push_str(&format!(
+            "Content:\n```markdown\n{}\n```\n\n",
+            Self::sanitize_for_code_fence(md_content)
+        ));
 
         prompt.push_str("\
 Check for the following issues:\n\
@@ -2251,14 +2318,17 @@ or\n\
                 context.skill_name
             ));
             if let Some(error) = &context.error_stack {
-                prompt.push_str(&format!("## Issue\n```\n{}\n```\n\n", error));
+                prompt.push_str(&format!(
+                    "## Issue\n```\n{}\n```\n\n",
+                    Self::sanitize_for_code_fence(error)
+                ));
             }
         }
 
         if let Some(snippet) = &context.source_snippet {
             prompt.push_str(&format!(
                 "## Current SKILL.py Content\n```python\n{}\n```\n\n",
-                snippet
+                Self::sanitize_for_code_fence(snippet)
             ));
         }
 
@@ -2289,7 +2359,10 @@ or\n\
             context.skill_name
         ));
 
-        prompt.push_str(&format!("Code:\n```python\n{}\n```\n\n", script_content));
+        prompt.push_str(&format!(
+            "Code:\n```python\n{}\n```\n\n",
+            Self::sanitize_for_code_fence(script_content)
+        ));
 
         prompt.push_str("\
 Check for the following issues:\n\
@@ -2319,7 +2392,10 @@ or\n\
             context.skill_name
         ));
 
-        prompt.push_str(&format!("Code:\n```\n{}\n```\n\n", script_content));
+        prompt.push_str(&format!(
+            "Code:\n```\n{}\n```\n\n",
+            Self::sanitize_for_code_fence(script_content)
+        ));
 
         prompt.push_str(
             "Check for the following issues:\n\
@@ -2475,7 +2551,7 @@ or\n\
         prompt.push_str("## Previous Content (has issues)\n");
         prompt.push_str(&format!(
             "```python\n{}\n```\n\n",
-            current_feedback.previous_code
+            Self::sanitize_for_code_fence(&current_feedback.previous_code)
         ));
 
         prompt.push_str(&format!("## Issues Found ({})\n", current_feedback.stage));
@@ -2705,12 +2781,12 @@ or\n\
         skill_name: &str,
         script_content: &str,
     ) -> Result<(bool, Option<String>)> {
-        let temp_path = std::env::temp_dir().join(format!(
+        let temp_guard = TempFileGuard::new(std::env::temp_dir().join(format!(
             "{}_compile_{}.rhai",
             skill_name,
             RECORD_TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&temp_path, script_content)?;
+        )));
+        std::fs::write(temp_guard.path(), script_content)?;
 
         info!(
             evolution_id = %evolution_id,
@@ -2727,9 +2803,8 @@ or\n\
         );
 
         info!(evolution_id = %evolution_id, "🔨 [compile] Compiling with Rhai engine...");
-        let result = self.compile_skill(&temp_path).await;
-
-        let _ = std::fs::remove_file(&temp_path);
+        let result = self.compile_skill(temp_guard.path()).await;
+        // TempFileGuard's Drop handles cleanup even on panic/cancellation
         result
     }
 

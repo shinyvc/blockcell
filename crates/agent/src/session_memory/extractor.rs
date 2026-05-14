@@ -74,6 +74,8 @@ pub struct SessionMemoryState {
     pub last_summarized_message_index: Option<usize>,
     /// 提取开始时间戳
     pub extraction_started_at: Option<std::time::Instant>,
+    /// 上次提取完成时间戳
+    pub last_extracted_at: Option<std::time::Instant>,
     /// 上次提取时的 Token 数
     pub tokens_at_last_extraction: usize,
     /// 是否已初始化
@@ -105,6 +107,11 @@ pub enum ExtractionError {
 /// 2. Tool Calls 阈值可选满足
 /// 3. 安全条件：最后一条消息无 tool_calls
 pub fn should_extract_memory(messages: &[ChatMessage], state: &SessionMemoryState) -> bool {
+    // 0. 防重入守卫：如果提取正在进行中，不触发新的提取
+    if state.extraction_started_at.is_some() {
+        return false;
+    }
+
     let current_token_count = estimate_message_tokens(messages);
 
     // 1. 初始化检查
@@ -444,7 +451,6 @@ Use the file_edit tool to update the memory file."#,
 }
 
 /// 设置 Session Memory 文件
-#[allow(dead_code)]
 pub async fn setup_session_memory_file(
     memory_path: &Path,
     template: &str,

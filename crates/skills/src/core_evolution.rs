@@ -1129,8 +1129,11 @@ impl CoreEvolution {
                         return Err(Error::Evolution(format!("Python syntax error: {}", stderr)));
                     }
                     Err(e) => {
-                        // python3 不可用，跳过语法检查
-                        warn!("python3 不可用，跳过语法检查: {}", e);
+                        // python3 不可用，拒绝通过语法检查
+                        warn!("python3 不可用，拒绝通过语法检查: {}", e);
+                        return Err(Error::Evolution(
+                            "python3 不可用: 无法验证 Python 语法，拒绝部署".to_string(),
+                        ));
                     }
                     _ => {}
                 }
@@ -1229,15 +1232,23 @@ impl CoreEvolution {
         // Check 3: For scripts, try a dry-run with empty input
         match record.provider_kind {
             ProviderKind::Process | ProviderKind::BuiltIn => {
-                // Use cmd on Windows, bash on Unix
+                // On Windows, bash is typically unavailable, so we skip the
+                // dry-run validation for shell scripts (same as compile_artifact
+                // skips bash -n syntax check on Windows). The script will be
+                // validated at runtime by Git Bash or WSL.
                 #[cfg(target_os = "windows")]
-                let output = tokio::process::Command::new("cmd")
-                    .arg("/C")
-                    .arg(artifact_path)
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn();
+                {
+                    debug!(
+                        path = %artifact_path,
+                        "🧬 [核心进化] Windows 环境，跳过 shell 脚本 dry-run 验证"
+                    );
+                    checks.push(ValidationCheck {
+                        name: "dry_run".to_string(),
+                        passed: true,
+                        message: "Shell script dry-run skipped on Windows (bash unavailable)"
+                            .to_string(),
+                    });
+                }
 
                 #[cfg(not(target_os = "windows"))]
                 let output = tokio::process::Command::new("bash")
@@ -1247,6 +1258,7 @@ impl CoreEvolution {
                     .stderr(std::process::Stdio::piped())
                     .spawn();
 
+                #[cfg(not(target_os = "windows"))]
                 match output {
                     Ok(mut child) => {
                         // Send empty JSON input

@@ -35,6 +35,18 @@ pub struct EvolutionWorker {
     wakeup: Notify,
 }
 
+/// Result of determining the next evolution step.
+///
+/// Distinguishes three cases so the caller can decide correctly:
+/// - `Step(EvolutionStep)` — there is a next step to run
+/// - `NoStep` — all steps are already complete (legitimate terminal)
+/// - `QueryFailed` — DB query failed; do NOT assume completion
+enum NextStepResult {
+    Step(EvolutionStep),
+    NoStep,
+    QueryFailed,
+}
+
 impl EvolutionWorker {
     pub fn new(store: EvolutionWorkflowStore, engine: Arc<Mutex<CoreEvolution>>) -> Self {
         let worker_id = uuid::Uuid::new_v4().to_string();
@@ -87,10 +99,12 @@ impl EvolutionWorker {
         }
 
         // 2. Claim next workflow
-        let workflow = match self
-            .store
-            .claim_next(&self.worker_id, self.lease_duration_secs)
-        {
+        let workflow = match self.store.claim_next(
+            &self.worker_id,
+            self.lease_duration_secs,
+            None,
+            Some("skill"),
+        ) {
             Ok(Some(w)) => w,
             Ok(None) => {
                 debug!(worker_id = %self.worker_id, "No workflow to claim");
@@ -148,7 +162,7 @@ impl EvolutionWorker {
         let mut wake_after_release = false;
 
         match next_step {
-            Some(step) => {
+            NextStepResult::Step(step) => {
                 // Insert step record
                 let step_id = match self.store.insert_step(&workflow.id, step.name(), None) {
                     Ok(id) => id,
@@ -314,11 +328,9 @@ impl EvolutionWorker {
                     }
                 }
             }
-            None => {
-                // No next step — workflow should already be in terminal state.
-                // This can happen if all steps were already completed.
-                debug!(workflow_id = %workflow.id, "No pending step found, workflow may be complete");
-                // Ensure status is Promoted if not already terminal
+            NextStepResult::NoStep => {
+                // 所有步骤已完成，标记为 Promoted
+                debug!(workflow_id = %workflow.id, "所有步骤已完成，标记为 Promoted");
                 let _ = self.store.update_workflow_status_if_owned(
                     &workflow.id,
                     &self.worker_id,
@@ -326,9 +338,17 @@ impl EvolutionWorker {
                     None,
                 );
             }
+            NextStepResult::QueryFailed => {
+                // DB查询失败，保留租约直接返回，等待租约过期后由recover_expired_leases恢复
+                // 注意：不能释放租约，否则status保持Claimed但lease为空，
+                // claim_next只查Requested/RetryScheduled，recover_expired_leases要求
+                // lease_until IS NOT NULL，两边都不匹配会导致workflow永久卡住
+                warn!(workflow_id = %workflow.id, "DB查询失败，保留租约等待过期恢复");
+                return;
+            }
         }
 
-        // 9. Release lease
+        // 9. Release lease (QueryFailed分支已提前return，不会执行到这里)
         match self.store.release_lease(&workflow.id, &self.worker_id) {
             Ok(true) => {}
             Ok(false) => {
@@ -348,7 +368,8 @@ impl EvolutionWorker {
     ///
     /// Looks at the last completed step in the store and returns the next one.
     /// If no steps have been completed, returns the first step (BuildPrompt).
-    fn determine_next_step(&self, workflow: &WorkflowRecord) -> Option<EvolutionStep> {
+    /// Returns `NextStepResult` to distinguish legitimate completion from DB errors.
+    fn determine_next_step(&self, workflow: &WorkflowRecord) -> NextStepResult {
         match self.store.get_last_completed_step(&workflow.id) {
             Ok(Some(last_step)) => {
                 debug!(
@@ -356,19 +377,25 @@ impl EvolutionWorker {
                     last_step = %last_step.step_name,
                     "Found last completed step"
                 );
-                EvolutionStep::next_after(&last_step.step_name)
+                match EvolutionStep::next_after(&last_step.step_name) {
+                    Some(step) => NextStepResult::Step(step),
+                    None => NextStepResult::NoStep,
+                }
             }
             Ok(None) => {
                 // No completed steps — start from the beginning
-                Some(EvolutionStep::first())
+                NextStepResult::Step(EvolutionStep::first())
             }
             Err(e) => {
                 warn!(
                     workflow_id = %workflow.id,
                     error = %e,
-                    "Failed to query last completed step, starting from beginning"
+                    "Failed to query last completed step — skipping to avoid re-running completed steps"
                 );
-                Some(EvolutionStep::first())
+                // Return QueryFailed instead of None.
+                // The caller must NOT mark the workflow as Promoted on DB failure.
+                // The workflow will be retried on the next tick after the DB issue resolves.
+                NextStepResult::QueryFailed
             }
         }
     }
@@ -421,6 +448,8 @@ impl EvolutionWorker {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut consecutive_failures = 0u32;
+            const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
             loop {
                 tokio::select! {
@@ -430,6 +459,7 @@ impl EvolutionWorker {
                     _ = interval.tick() => {
                         match store.renew_lease(&workflow_id, &worker_id, lease_duration_secs) {
                             Ok(true) => {
+                                consecutive_failures = 0;
                                 debug!(workflow_id = %workflow_id, worker_id = %worker_id, "Renewed evolution workflow lease");
                             }
                             Ok(false) => {
@@ -437,8 +467,12 @@ impl EvolutionWorker {
                                 break;
                             }
                             Err(e) => {
-                                warn!(workflow_id = %workflow_id, worker_id = %worker_id, error = %e, "Failed to heartbeat evolution workflow lease");
-                                break;
+                                consecutive_failures += 1;
+                                warn!(workflow_id = %workflow_id, worker_id = %worker_id, error = %e, consecutive_failures = consecutive_failures, max_retries = MAX_CONSECUTIVE_FAILURES, "Failed to heartbeat evolution workflow lease (will retry)");
+                                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                                    warn!(workflow_id = %workflow_id, worker_id = %worker_id, "Too many consecutive heartbeat failures, giving up lease");
+                                    break;
+                                }
                             }
                         }
                     }

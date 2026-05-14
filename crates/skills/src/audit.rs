@@ -346,7 +346,10 @@ import os
 os.system("rm -rf /")
 "#;
         let result = static_audit(&SkillType::Python, code);
-        assert!(!result.passed, "dangerous patterns should cause audit to fail");
+        assert!(
+            !result.passed,
+            "dangerous patterns should cause audit to fail"
+        );
         assert!(result
             .violations
             .iter()

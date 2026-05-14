@@ -2463,6 +2463,11 @@ impl AgentRuntime {
         // Use paths.base as both workspace and config directory
         let base_dir = self.paths.base.clone();
 
+        // 增加梦境会话门控计数（Layer 6）
+        // 每次新会话初始化时递增，使 Dream 整合的三重门控机制能正确判断
+        // 注意：由于 agent 和 scheduler 存在循环依赖，此处直接操作 .dream_state.json
+        crate::dream_state::increment_dream_session_count(&base_dir).await;
+
         let mut memory_system = MemorySystem::new(config, base_dir.clone(), base_dir, session_id);
 
         // Perform async initialization: load cursor state + mark session active
@@ -2524,11 +2529,15 @@ impl AgentRuntime {
             memory_system.config().layer5.max_memory_file_tokens
         );
 
-        // Layer 6: Auto Dream (interval is typically 24 hours)
-        crate::memory_event!(layer6, config, 24);
+        // Layer 6: Auto Dream
+        crate::memory_event!(
+            layer6,
+            config,
+            memory_system.config().layer6.time_gate_threshold_hours
+        );
 
-        // Layer 7: Forked Agent (max_turns default is typically 10)
-        crate::memory_event!(layer7, config, 10);
+        // Layer 7: Forked Agent
+        crate::memory_event!(layer7, config, memory_system.config().layer7.max_turns);
 
         self.memory_system = Some(memory_system);
 
@@ -3091,7 +3100,22 @@ impl AgentRuntime {
     /// This loads the four memory files (user.md, project.md, feedback.md, reference.md)
     /// from the memory directory and makes them available for system prompt injection.
     pub async fn init_memory_injector(&mut self) -> std::io::Result<()> {
-        use crate::auto_memory::{get_memory_dir, InjectionConfig, MemoryInjector};
+        use crate::auto_memory::{
+            ensure_memory_dir, get_memory_dir, InjectionConfig, MemoryInjector,
+        };
+
+        // Ensure the memory directory and template files exist on disk
+        // before loading. On a fresh install the directory is absent,
+        // which would cause the permission gate (is_auto_mem_path) to
+        // deny writes and the forked agent to fail silently.
+        match ensure_memory_dir(&self.paths.base).await {
+            Ok(()) => {
+                info!(path = %self.paths.base.display(), "[layer5] Memory directory ensured on disk");
+            }
+            Err(e) => {
+                warn!(path = %self.paths.base.display(), error = %e, "[layer5] Failed to ensure memory directory");
+            }
+        }
 
         // Use the config base directory (e.g., ~/.blockcell/memory/)
         let memory_dir = get_memory_dir(&self.paths.base);
@@ -4047,6 +4071,34 @@ impl AgentRuntime {
         };
 
         // ========== 7. 收集恢复信息 ==========
+        // 先等待后台 Session Memory 提取完成，避免读取过时内容
+        if let Some(memory_system) = self.memory_system.as_ref() {
+            let extraction_started_at = memory_system.session_memory_state().extraction_started_at;
+            if extraction_started_at.is_some() {
+                let wait_timeout_ms = memory_system.config().layer3.extraction_wait_timeout_ms;
+                let stale_threshold_ms =
+                    memory_system.config().layer3.extraction_stale_threshold_ms;
+                let session_memory_path = get_session_memory_path(
+                    memory_system.workspace_dir(),
+                    memory_system.session_id(),
+                );
+                match crate::session_memory::recovery::wait_for_session_memory_extraction_with_timeout(
+                    &session_memory_path,
+                    extraction_started_at,
+                    wait_timeout_ms,
+                    stale_threshold_ms,
+                )
+                .await
+                {
+                    Ok(_) => info!("[layer4] Session Memory 提取已完成，继续压缩"),
+                    Err(e) => warn!(
+                        error = %e,
+                        "[layer4] 等待 Session Memory 提取超时，使用当前内容继续压缩"
+                    ),
+                }
+            }
+        }
+
         let recovery_message = if let Some(memory_system) = self.memory_system.as_ref() {
             let session_memory_path =
                 get_session_memory_path(memory_system.workspace_dir(), memory_system.session_id());
@@ -6442,7 +6494,9 @@ impl AgentRuntime {
         if !final_response.is_empty() {
             if let Some(mode) = deferred_review_mode.take() {
                 if self.learning_coordinator.is_self_improve_enabled() {
-                    self.learning_coordinator.review_started();
+                    // Counter already incremented by try_start_review() in
+                    // check_memory_nudge()/check_skill_nudge() — do NOT call
+                    // review_started() here to avoid double increment.
                     let notify = Some((msg.channel.clone(), msg.chat_id.clone()));
                     self.spawn_review(mode, deferred_review_snapshot, notify);
                 }
@@ -6507,15 +6561,52 @@ impl AgentRuntime {
                 crate::memory_system::PostSamplingAction::ExtractSessionMemory => {
                     info!("[post-sampling] Spawning Session Memory extraction task");
 
-                    // 克隆必要的数据用于异步任务
-                    let provider_pool = Arc::clone(&self.provider_pool);
-                    let history_clone = history.clone();
+                    // 先确保 session memory 文件存在于磁盘上，
+                    // 必须在 mark_extraction_started() 之前完成，
+                    // 否则模板写入的 mtime 会晚于 extraction_start_system，
+                    // 导致 compact 等待时误判提取已完成
                     let memory_path = crate::session_memory::get_session_memory_path(
                         memory_system.workspace_dir(),
                         memory_system.session_id(),
                     );
+                    let template = crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE;
+                    match crate::session_memory::setup_session_memory_file(&memory_path, template)
+                        .await
+                    {
+                        Ok(_) => {
+                            info!(
+                                path = %memory_path.display(),
+                                "[layer3] Session memory file ensured on disk"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                path = %memory_path.display(),
+                                error = %e,
+                                "[layer3] Failed to initialize session memory file"
+                            );
+                        }
+                    }
+
+                    // 标记提取开始（设置 extraction_started_at + has_pending_extraction）
+                    // 在模板写入之后，这样 mtime 基准不会被模板写入干扰
+                    memory_system.mark_extraction_started();
+
+                    // 克隆必要的数据用于异步任务
+                    let provider_pool = Arc::clone(&self.provider_pool);
+                    let history_clone = history.clone();
                     let model = self.config.agents.defaults.model.clone();
                     let max_section_length = memory_system.config().layer3.max_section_length;
+                    // 获取提取结果发送端（用于后台任务完成后通知主线程更新状态）
+                    let result_sender = memory_system.session_memory_result_sender();
+
+                    // 获取已提取历史的最后一条消息的 ID 和索引（用于更新状态游标）
+                    // 使用最后一条消息（而非最后一条 user），避免 count_tool_calls_since
+                    // 重复统计已被本次提取覆盖的 assistant tool calls
+                    let last_msg_id = history_clone.last().and_then(|m| m.id.clone());
+                    let last_msg_index = history_clone.len().saturating_sub(1);
+                    let current_token_count =
+                        crate::token::estimate_messages_tokens(&history_clone);
 
                     // 非阻塞执行
                     let handle = tokio::spawn(async move {
@@ -6526,9 +6617,7 @@ impl AgentRuntime {
 
                         let current_memory = tokio::fs::read_to_string(&memory_path)
                             .await
-                            .unwrap_or_else(|_| {
-                                crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE.to_string()
-                            });
+                            .unwrap_or_else(|_| template.to_string());
 
                         let result = crate::session_memory::extract_session_memory(
                             provider_pool,
@@ -6537,17 +6626,31 @@ impl AgentRuntime {
                             history_clone,
                             &memory_path,
                             &current_memory,
-                            crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE,
+                            template,
                             max_section_length,
                         )
                         .await;
 
-                        match result {
-                            Ok(_) => info!("[layer3] Session Memory extraction completed"),
-                            Err(e) => {
-                                warn!(error = %e, "[layer3] Session Memory extraction failed")
+                        // 通过 watch channel 发送提取结果给主线程
+                        let extraction_result = match result {
+                            Ok(_) => {
+                                info!("[layer3] Session Memory extraction completed");
+                                crate::memory_system::SessionMemoryExtractionResult {
+                                    last_message_id: last_msg_id,
+                                    last_message_index: last_msg_index,
+                                    token_count: current_token_count,
+                                    success: true,
+                                }
                             }
-                        }
+                            Err(e) => {
+                                warn!(error = %e, "[layer3] Session Memory extraction failed");
+                                crate::memory_system::SessionMemoryExtractionResult {
+                                    success: false,
+                                    ..Default::default()
+                                }
+                            }
+                        };
+                        let _ = result_sender.send(extraction_result);
                     });
 
                     // 保存任务句柄
@@ -6640,10 +6743,10 @@ impl AgentRuntime {
                                 );
                                 // 标记需要刷新缓存
                                 reload_flag_for_type
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    .store(true, std::sync::atomic::Ordering::Release);
                                 // 标记需要重新加载游标状态（通知主线程）
                                 cursor_reload_flag_for_type
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    .store(true, std::sync::atomic::Ordering::Release);
                             } else {
                                 warn!(
                                     memory_type = memory_type.name(),
@@ -8697,23 +8800,27 @@ impl AgentRuntime {
 
         // 获取当前 AbortToken 并创建 child token（用于链式取消）
         let child_abort_token = current_abort_token().map(|t| t.child()).unwrap_or_default();
+        let abort_token_for_scope = child_abort_token.clone();
 
-        // 在 ForkChild 上下文中执行
-        scope_agent_context(identity.clone(), async {
-            info!(
-                agent_id = %identity.agent_id,
-                role = "fork-child",
-                "Executing fork mode"
-            );
+        // 在 ForkChild 上下文中执行（同时作用域化 AbortToken 和 AgentContext，
+        // 确保 current_abort_token() 在子代理内部返回正确的 child token）
+        scope_abort_token(
+            abort_token_for_scope,
+            scope_agent_context(identity.clone(), async {
+                info!(
+                    agent_id = %identity.agent_id,
+                    role = "fork-child",
+                    "Executing fork mode"
+                );
 
-            // 构建 Fork 消息
-            let safe_prompt = Self::sanitize_fork_prompt(&prompt);
-            let fork_messages = vec![
-                ChatMessage::system(
-                    "You are a forked agent. Execute directly without spawning subagents.",
-                ),
-                ChatMessage::user(&format!(
-                    "<fork_directive>\n\
+                // 构建 Fork 消息
+                let safe_prompt = Self::sanitize_fork_prompt(&prompt);
+                let fork_messages = vec![
+                    ChatMessage::system(
+                        "You are a forked agent. Execute directly without spawning subagents.",
+                    ),
+                    ChatMessage::user(&format!(
+                        "<fork_directive>\n\
                     RULES:\n\
                     1. Do NOT spawn sub-agents; execute directly.\n\
                     2. Do NOT converse; execute and report results.\n\
@@ -8721,47 +8828,51 @@ impl AgentRuntime {
                     4. Keep report under 500 words.\n\
                     \n\
                     Task: {}",
-                    safe_prompt
-                )),
-            ];
+                        safe_prompt
+                    )),
+                ];
 
-            // 构建缓存安全参数，填入父对话历史以继承上下文
-            let cache_safe_params = CacheSafeParams {
-                fork_context_messages: parent_history,
-                ..CacheSafeParams::default()
-            };
+                // 构建缓存安全参数，填入父对话历史以继承上下文
+                let cache_safe_params = CacheSafeParams {
+                    fork_context_messages: parent_history,
+                    ..CacheSafeParams::default()
+                };
 
-            // 构建 SubagentOverrides，传递 AbortToken
-            let overrides = SubagentOverrides {
-                abort_token: Some(child_abort_token),
-                ..Default::default()
-            };
+                // 构建 SubagentOverrides，传递 AbortToken
+                let overrides = SubagentOverrides {
+                    abort_token: Some(child_abort_token),
+                    ..Default::default()
+                };
 
-            // 构建 ForkedAgentParams（使用 builder 模式）
-            let params = ForkedAgentParams::builder()
-                .provider_pool(self.provider_pool.clone())
-                .prompt_messages(fork_messages)
-                .cache_safe_params(cache_safe_params)
-                .fork_label("fork")
-                .max_turns(10)
-                .agent_type(None)
-                .disallowed_tools(vec!["agent".to_string(), "spawn".to_string()])
-                .one_shot(true)
-                .overrides(overrides)
-                .build()
-                .map_err(|e| {
-                    blockcell_core::Error::Tool(format!("ForkedAgentParams build failed: {}", e))
-                })?;
+                // 构建 ForkedAgentParams（使用 builder 模式）
+                let params = ForkedAgentParams::builder()
+                    .provider_pool(self.provider_pool.clone())
+                    .prompt_messages(fork_messages)
+                    .cache_safe_params(cache_safe_params)
+                    .fork_label("fork")
+                    .max_turns(10)
+                    .agent_type(None)
+                    .disallowed_tools(vec!["agent".to_string(), "spawn".to_string()])
+                    .one_shot(true)
+                    .overrides(overrides)
+                    .build()
+                    .map_err(|e| {
+                        blockcell_core::Error::Tool(format!(
+                            "ForkedAgentParams build failed: {}",
+                            e
+                        ))
+                    })?;
 
-            // 执行 Fork Agent
-            let result = run_forked_agent(params)
-                .await
-                .map_err(|e| blockcell_core::Error::Tool(format!("Fork failed: {}", e)))?;
+                // 执行 Fork Agent
+                let result = run_forked_agent(params)
+                    .await
+                    .map_err(|e| blockcell_core::Error::Tool(format!("Fork failed: {}", e)))?;
 
-            Ok(result
-                .final_content
-                .unwrap_or_else(|| "Fork completed with no output".to_string()))
-        })
+                Ok(result
+                    .final_content
+                    .unwrap_or_else(|| "Fork completed with no output".to_string()))
+            }),
+        ) // scope_agent_context + scope_abort_token
         .await
     }
 
@@ -8924,6 +9035,9 @@ impl AgentRuntime {
         let skills_dir_for_spawn = self.paths.skills_dir();
 
         // 启动后台执行
+        // 克隆 worktree_path 和 paths 给 guard task（用于 panic 时的 worktree 清理）
+        let guard_worktree_path = worktree_path.clone();
+        let guard_paths = paths.clone();
         let join_handle = tokio::spawn(async move {
             // Wrap in both AbortToken and AgentIdentity context for chain cancellation
             let result = scope_abort_token(
@@ -9133,6 +9247,7 @@ impl AgentRuntime {
 
         // Guard: if tokio::spawn fails (runtime shutdown) or task panics,
         // mark the task as Failed to prevent it from being stuck in Running state.
+        // Also clean up worktree on panic since the main spawn closure's cleanup code won't run.
         let guard_task_manager = self.task_manager.clone();
         let guard_task_id = task_id.clone();
         tokio::spawn(async move {
@@ -9142,6 +9257,34 @@ impl AgentRuntime {
                     guard_task_manager
                         .set_failed(&guard_task_id, "Agent task panicked")
                         .await;
+
+                    // 清理 worktree（主 spawn 的清理代码因 panic 不会执行）
+                    if let Some(ref wt_path) = guard_worktree_path {
+                        let wt_name =
+                            format!("agent-{}", &guard_task_id[..16.min(guard_task_id.len())]);
+                        let status_result = tokio::process::Command::new("git")
+                            .args(["status", "--porcelain"])
+                            .current_dir(wt_path)
+                            .output()
+                            .await;
+                        let has_uncommitted = status_result
+                            .as_ref()
+                            .is_ok_and(|o| o.status.success() && !o.stdout.is_empty());
+                        if has_uncommitted {
+                            warn!(worktree = %wt_name, "Worktree has uncommitted changes (panic), preserving for manual review");
+                        } else {
+                            let _ = tokio::process::Command::new("git")
+                                .args(["worktree", "remove", &wt_path.display().to_string()])
+                                .current_dir(guard_paths.workspace())
+                                .output()
+                                .await;
+                            let _ = tokio::process::Command::new("git")
+                                .args(["branch", "-D", &wt_name])
+                                .current_dir(guard_paths.workspace())
+                                .output()
+                                .await;
+                        }
+                    }
                 } else {
                     // Cancelled/aborted — this is normal (e.g. /tasks cancel), don't mark as failed
                     warn!(task_id = %guard_task_id, "Typed agent task was cancelled/aborted");
@@ -9610,6 +9753,9 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
             None
         };
 
+        // 克隆给 guard task（用于 panic 时的 worktree 清理）
+        let guard_worktree_path = worktree_path.clone();
+        let guard_workspace = workspace.clone();
         let join_handle = tokio::spawn(async move {
             // Wrap in both AbortToken and AgentIdentity context for chain cancellation
             let result = scope_abort_token(
@@ -9777,6 +9923,7 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
 
         // Guard: if tokio::spawn fails (runtime shutdown) or task panics,
         // mark the task as Failed to prevent it from being stuck in Running state.
+        // Also clean up worktree on panic since the main spawn closure's cleanup code won't run.
         let guard_task_manager = self.task_manager.clone();
         let guard_task_id = task_id.clone();
         tokio::spawn(async move {
@@ -9789,6 +9936,11 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
                     guard_task_manager
                         .set_failed(&guard_task_id, &format!("Task panicked: {}", e))
                         .await;
+
+                    // 清理 worktree（主 spawn 的清理代码因 panic 不会执行）
+                    if guard_worktree_path.is_some() {
+                        Self::cleanup_worktree(&guard_workspace, &guard_task_id).await;
+                    }
                 } else {
                     warn!(task_id = %guard_task_id, "Typed agent task was cancelled (not a panic)");
                 }
@@ -9872,7 +10024,11 @@ async fn run_subagent_task(
         sub_runtime.outbound_tx = Some(tx);
     }
     if let Some(at) = abort_token {
-        sub_runtime.abort_token = at;
+        sub_runtime.abort_token = at.clone();
+        // Register the AbortToken with the task manager so that /tasks cancel
+        // can trigger chain cancellation. Without this registration, cancelling
+        // a task via TaskManager would not propagate to the subagent runtime.
+        task_manager.register_abort_token(&task_id, at);
     }
     if let Err(e) = sub_runtime.init_memory_file_store() {
         tracing::warn!(error = %e, "Failed to initialize subagent file memory store");
@@ -12619,7 +12775,7 @@ description: local demo
 
         let mut claimed = runtime
             .test_ghost_ledger()
-            .claim_reviewable_episodes(1)
+            .claim_reviewable_episodes(1, "test-worker", 600)
             .expect("claim pre-compress episode");
         let episode = claimed.pop().expect("pre-compress episode");
         assert_eq!(episode.boundary_kind, "pre_compress");
@@ -12654,7 +12810,7 @@ description: local demo
 
         let mut claimed = runtime
             .test_ghost_ledger()
-            .claim_reviewable_episodes(4)
+            .claim_reviewable_episodes(4, "test-worker", 600)
             .expect("claim session-end episodes");
         let episode = claimed
             .drain(..)
