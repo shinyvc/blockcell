@@ -2941,8 +2941,9 @@ or\n\
                         pre_write_version = %prev_ver,
                         "Write to skill file failed, attempting to restore pre-write version"
                     );
-                    if let Err(restore_err) =
-                        self.version_manager.switch_to_version(&record.skill_name, prev_ver)
+                    if let Err(restore_err) = self
+                        .version_manager
+                        .switch_to_version(&record.skill_name, prev_ver)
                     {
                         warn!(
                             skill = %record.skill_name,
@@ -3139,8 +3140,9 @@ or\n\
                         pre_write_version = %prev_ver,
                         "Version snapshot creation failed after live write, restoring pre-write version"
                     );
-                    if let Err(restore_err) =
-                        self.version_manager.switch_to_version(&record.skill_name, prev_ver)
+                    if let Err(restore_err) = self
+                        .version_manager
+                        .switch_to_version(&record.skill_name, prev_ver)
                     {
                         warn!(
                             skill = %record.skill_name,
@@ -3195,7 +3197,10 @@ or\n\
         // 版本快照成功后，清理 staged promote 保留的 .bak 目录。
         // 只有版本历史迁移成功时才清理，否则保留 .bak 以备手动恢复
         if record.context.staged && version_history_migrated {
-            let bak_dir = self.skills_dir.join(&record.skill_name).with_extension("bak");
+            let bak_dir = self
+                .skills_dir
+                .join(&record.skill_name)
+                .with_extension("bak");
             if bak_dir.exists() {
                 if let Err(e) = std::fs::remove_dir_all(&bak_dir) {
                     warn!(
