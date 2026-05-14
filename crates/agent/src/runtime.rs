@@ -2151,6 +2151,106 @@ impl AgentRuntime {
             as blockcell_tools::AgentRuntimeHandle;
         self.runtime_handle = Some(handle);
     }
+}
+
+/// 创建技能部署成功后的回调，记录 EvolutionSuccess ghost learning boundary。
+///
+/// 此函数可被不同运行路径（run_message_task、CLI interactive、gateway、scheduler worker）共享，
+/// 确保所有部署路径都能触发 ghost learning boundary 记录。
+pub fn create_evolution_deploy_callback(
+    config: &Config,
+    paths: &Paths,
+) -> Option<Arc<dyn Fn(&str) + Send + Sync>> {
+    if !config.agents.ghost.learning.enabled {
+        return None;
+    }
+
+    let config = config.clone();
+    let paths = paths.clone();
+
+    Some(Arc::new(move |skill_name: &str| {
+        let boundary = GhostLearningBoundary {
+            kind: GhostLearningBoundaryKind::EvolutionSuccess,
+            session_key: None,
+            subject_key: Some(format!("skill:{}", skill_name)),
+            user_intent_summary: format!("Skill '{}' evolution deployed successfully", skill_name),
+            assistant_outcome_summary: String::new(),
+            tool_call_count: 0,
+            memory_write_count: 0,
+            correction_count: 0,
+            preference_correction_count: 0,
+            success: true,
+            complexity_score: 0,
+            reusable_lesson: None,
+        };
+
+        let policy = GhostLearningPolicy::from_config(&config.agents.ghost.learning);
+        let decision = policy.decide(&boundary);
+
+        if let Err(e) = persist_ghost_learning_boundary_with_decision(
+            &config,
+            &paths,
+            boundary,
+            vec![],
+            decision,
+        ) {
+            tracing::warn!(
+                skill = %skill_name,
+                error = %e,
+                "[evolution] Failed to persist EvolutionSuccess ghost boundary"
+            );
+        }
+    }))
+}
+
+impl AgentRuntime {
+    /// Wire the evolution deploy callback so that successful skill deployments
+    /// trigger an EvolutionSuccess Ghost learning boundary.
+    /// Must be called after construction (learning_coordinator needs to exist).
+    pub fn wire_evolution_deploy_callback(&mut self) {
+        let learning_coordinator = self.learning_coordinator.clone();
+        let config = self.config.clone();
+        let paths = self.paths.clone();
+
+        let callback: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |skill_name: &str| {
+            if !config.agents.ghost.learning.enabled {
+                return;
+            }
+            let boundary = GhostLearningBoundary {
+                kind: GhostLearningBoundaryKind::EvolutionSuccess,
+                session_key: None,
+                subject_key: Some(format!("skill:{}", skill_name)),
+                user_intent_summary: format!(
+                    "Skill '{}' evolution deployed successfully",
+                    skill_name
+                ),
+                assistant_outcome_summary: String::new(),
+                tool_call_count: 0,
+                memory_write_count: 0,
+                correction_count: 0,
+                preference_correction_count: 0,
+                success: true,
+                complexity_score: 0,
+                reusable_lesson: None,
+            };
+            learning_coordinator.update_ghost_policy(&config.agents.ghost.learning);
+            let decision = learning_coordinator.ghost_decide(&boundary);
+            if let Err(e) = persist_ghost_learning_boundary_with_decision(
+                &config,
+                &paths,
+                boundary,
+                vec![],
+                decision,
+            ) {
+                tracing::warn!(
+                    skill = %skill_name,
+                    error = %e,
+                    "[evolution] Failed to persist EvolutionSuccess ghost boundary"
+                );
+            }
+        });
+        self.context_builder.set_evolution_deploy_callback(callback);
+    }
 
     /// Cancel this runtime and all its sub-agents.
     pub fn cancel(&self) {
@@ -7780,6 +7880,7 @@ impl AgentRuntime {
         let core_evolution = self.core_evolution.clone();
         let event_emitter = self.system_event_emitter.clone();
         let evolution_workflow_store = self.evolution_workflow_store.clone();
+        let ghost_memory_lifecycle = self.ghost_memory_lifecycle.clone();
 
         let tool_executor =
             move |tool_name: &str, params: serde_json::Value| -> Result<serde_json::Value> {
@@ -7852,7 +7953,9 @@ impl AgentRuntime {
                     task_manager: Some(Arc::new(task_manager.clone())),
                     memory_store: memory_store.clone(),
                     memory_file_store: None,
-                    ghost_memory_lifecycle: None,
+                    ghost_memory_lifecycle: ghost_memory_lifecycle.clone().map(|manager| {
+                        manager as Arc<dyn blockcell_tools::GhostMemoryLifecycleOps + Send + Sync>
+                    }),
                     skill_file_store: None,
                     session_search: None,
                     outbound_tx: outbound_tx.clone(),
@@ -8703,6 +8806,7 @@ async fn run_message_task(
 
     // 初始化 runtime handle（必须在 set_abort_token 之后，确保 handle 捕获正确的 abort_token）
     runtime.init_runtime_handle();
+    runtime.wire_evolution_deploy_callback();
 
     let error_chat_id = msg.chat_id.clone();
 

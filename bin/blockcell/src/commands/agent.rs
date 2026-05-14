@@ -449,12 +449,17 @@ pub async fn run(
     let skill_evo_llm_provider = create_skill_evolution_llm_provider(&config, &provider_pool);
     let skill_evo_workflow_db = paths.workspace().join("skill_evolution_workflow.db");
     let skill_evo_workflow_store = EvolutionWorkflowStore::open(&skill_evo_workflow_db)?;
-    let skill_evo_worker = SkillEvolutionWorker::new(
+    let mut skill_evo_worker = SkillEvolutionWorker::new(
         skill_evo_workflow_store,
         paths.skills_dir(),
         EvolutionServiceConfig::default(),
         skill_evo_llm_provider,
     );
+    // 为 SkillEvolutionWorker 设置部署回调，确保 scheduler worker 的进化部署路径也能触发 ghost learning boundary
+    if let Some(callback) = blockcell_agent::create_evolution_deploy_callback(&config, &paths) {
+        skill_evo_worker.set_deploy_callback(callback);
+        info!("[evolution-deploy-callback] 已连接到 SkillEvolutionWorker EvolutionService");
+    }
     let skill_evo_worker_arc = Arc::new(skill_evo_worker);
 
     if let Some(msg) = message {
@@ -609,6 +614,22 @@ pub async fn run(
         }
         // Clean up event handler
         event_handler.abort();
+
+        // 单次模式驱动 skill evolution pipeline tick，
+        // 确保消息处理期间触发的 notify() 有消费者，pipeline 能推进。
+        // Bounded loop：单次消息可能触发多个 evolution workflow，drain 到无可 claim 为止。
+        {
+            let skill_evo_worker_clone = skill_evo_worker_arc.clone();
+            let _ = tokio::spawn(async move {
+                let max_ticks = 10; // 防止无限循环
+                for _ in 0..max_ticks {
+                    if !skill_evo_worker_clone.tick().await {
+                        break; // 无可 claim 的 workflow，退出
+                    }
+                }
+            })
+            .await;
+        }
     } else {
         // Interactive mode with CronService
         println!("blockcell interactive mode (Ctrl+C to exit)");
@@ -825,6 +846,7 @@ pub async fn run(
             warn!(error = %e, "Failed to initialize memory injector");
         }
         runtime.init_runtime_handle();
+        runtime.wire_evolution_deploy_callback();
 
         let event_emitter = runtime.event_emitter_handle();
 

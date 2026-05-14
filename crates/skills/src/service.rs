@@ -1330,9 +1330,8 @@ impl EvolutionService {
                         "🧠 [自进化] 技能 `{}` 进化 pipeline 完成，观察窗口已启动",
                         skill_name
                     );
-                    if let Some(ref cb) = self.deploy_callback {
-                        cb(skill_name);
-                    }
+                    // 注意：此处不触发 deploy_callback，因为只是进入 Observing 状态，
+                    // 观察期仍可能回滚。callback 应在观察期最终 Completed 后触发。
                 }
                 Ok(SingleEvolutionResult::Failed) => {
                     warn!(
@@ -1432,6 +1431,10 @@ impl EvolutionService {
                     "🧠 [观察] 观察窗口到期，错误率正常，标记完成"
                 );
                 self.evolution.mark_completed(evolution_id)?;
+                // 观察期最终成功后才触发 deploy_callback，避免记录可能被回滚的"成功"
+                if let Some(ref cb) = self.deploy_callback {
+                    cb(skill_name);
+                }
                 self.persist_evolution_experience(evolution_id);
                 self.cleanup_evolution(skill_name, evolution_id).await;
             }

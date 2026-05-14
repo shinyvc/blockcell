@@ -23,6 +23,26 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 根据 source_path 构建临时编译文件路径。
+/// 无扩展名时不加后缀，保留原始文件名语义让 shebang fallback 生效；
+/// 有扩展名时保留原扩展名。
+fn make_compile_temp_path(skill_name: &str, source_path: &str) -> PathBuf {
+    let source_ext = Path::new(source_path).extension().and_then(|e| e.to_str());
+    match source_ext {
+        Some(ext) => std::env::temp_dir().join(format!(
+            "{}_compile_{}.{}",
+            skill_name,
+            RECORD_TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+            ext
+        )),
+        None => std::env::temp_dir().join(format!(
+            "{}_compile_{}",
+            skill_name,
+            RECORD_TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        )),
+    }
+}
+
 /// RAII guard that removes a temporary file on drop.
 /// Prevents file leaks if the enclosing function panics or is cancelled.
 struct TempFileGuard {
@@ -870,15 +890,15 @@ impl SkillEvolution {
                 }
             }
             SkillLayout::LocalScript => {
-                info!(evolution_id = %evolution_id, "🔨 [compile] LocalScript skill — running local script syntax/entry validation");
+                info!(evolution_id = %evolution_id, "🔨 [compile] LocalScript skill — 对 patch.diff 临时文件做语法/入口验证");
+                // 将 patch.diff 写入临时文件再检查，而非读取磁盘旧文件
                 let source_path = record.context.source_path.as_deref().ok_or_else(|| {
                     Error::Evolution("Missing source_path for LocalScript skill".to_string())
                 })?;
-                let script_path = self
-                    .skill_root_dir_for_record(&record)
-                    .join(&record.skill_name)
-                    .join(source_path);
-                self.compile_local_script(&script_path).await?
+                let temp_path = make_compile_temp_path(&record.skill_name, &source_path);
+                let temp_guard = TempFileGuard::new(temp_path);
+                std::fs::write(temp_guard.path(), &patch.diff)?;
+                self.compile_local_script(temp_guard.path()).await?
             }
             SkillLayout::Hybrid => match record.context.skill_type {
                 SkillType::Python => {
@@ -913,15 +933,14 @@ impl SkillEvolution {
                     }
                 }
                 SkillType::LocalScript => {
-                    info!(evolution_id = %evolution_id, "🔨 [compile] Hybrid skill — validating local script asset");
+                    info!(evolution_id = %evolution_id, "🔨 [compile] Hybrid skill — 对 patch.diff 临时文件验证 local script asset");
                     let source_path = record.context.source_path.as_deref().ok_or_else(|| {
                         Error::Evolution("Missing source_path for LocalScript skill".to_string())
                     })?;
-                    let script_path = self
-                        .skill_root_dir_for_record(&record)
-                        .join(&record.skill_name)
-                        .join(source_path);
-                    self.compile_local_script(&script_path).await?
+                    let temp_path = make_compile_temp_path(&record.skill_name, &source_path);
+                    let temp_guard = TempFileGuard::new(temp_path);
+                    std::fs::write(temp_guard.path(), &patch.diff)?;
+                    self.compile_local_script(temp_guard.path()).await?
                 }
                 SkillType::Rhai => {
                     info!(evolution_id = %evolution_id, "🔨 [compile] Hybrid skill — falling back to Rhai compilation");
@@ -998,6 +1017,14 @@ impl SkillEvolution {
             "🚀 [deploy] Pre-conditions met, deploying new version"
         );
 
+        // 首次进化前确保 baseline 版本快照存在，否则 rollback 无法恢复原始内容
+        // 但对于 staged 新技能导入，主 skills_dir/<skill> 通常还不存在，
+        // 此时 create_version() 会 read_dir 不存在的目录导致失败，所以跳过 baseline
+        let main_skill_dir = self.skills_dir.join(&record.skill_name);
+        if !record.context.staged || main_skill_dir.exists() {
+            self.version_manager.ensure_baseline(&record.skill_name)?;
+        }
+
         // 创建新版本（直接写入）
         self.create_new_version(&record)?;
 
@@ -1057,31 +1084,50 @@ impl SkillEvolution {
     ///
     /// Runs after compile check passes. This is a deterministic validation that ensures
     /// the generated code doesn't break the skill's contract (required sections, fields).
+    /// 对于 PromptTool/PromptOnly 类型，patch.diff 就是新 SKILL.md 内容，直接检查 patch.diff
+    /// 而非磁盘旧文件。对于 meta.yaml，检查从 LLM response 提取的 yaml。
     /// Returns (passed, Option<error_description>).
     pub fn contract_check(&self, evolution_id: &str) -> Result<(bool, Option<String>)> {
         let record = self.load_record(evolution_id)?;
+        let patch = record
+            .patch
+            .as_ref()
+            .ok_or_else(|| Error::Evolution("No patch for contract check".to_string()))?;
+
         let skill_root = self.skill_root_dir_for_record(&record);
         let skill_dir = skill_root.join(&record.skill_name);
 
         let mut issues: Vec<String> = Vec::new();
 
-        let meta_path = skill_dir.join("meta.yaml");
-        if meta_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&meta_path) {
-                if !content.contains("name:") && !content.contains("name :") {
-                    issues.push("meta.yaml: missing required 'name' field".to_string());
-                }
-                if !content.contains("description:") && !content.contains("description :") {
-                    issues.push("meta.yaml: missing required 'description' field".to_string());
-                }
-                if content.trim().is_empty() {
-                    issues.push("meta.yaml: file is empty".to_string());
-                }
+        // meta.yaml 检查：优先检查从 LLM response 提取的 yaml（新内容），若无则检查磁盘旧文件
+        let extracted_meta = self.extract_yaml_from_response(&patch.explanation);
+        let meta_content = if let Some(ref meta) = extracted_meta {
+            Some(meta.clone())
+        } else {
+            let meta_path = skill_dir.join("meta.yaml");
+            std::fs::read_to_string(&meta_path).ok()
+        };
+        if let Some(content) = meta_content {
+            if !content.contains("name:") && !content.contains("name :") {
+                issues.push("meta.yaml: missing required 'name' field".to_string());
+            }
+            if !content.contains("description:") && !content.contains("description :") {
+                issues.push("meta.yaml: missing required 'description' field".to_string());
+            }
+            if content.trim().is_empty() {
+                issues.push("meta.yaml: file is empty".to_string());
             }
         }
 
-        let skill_md_path = skill_dir.join("SKILL.md");
-        let skill_md_content = std::fs::read_to_string(&skill_md_path).ok();
+        // SKILL.md 检查：对于 PromptTool/PromptOnly 类型，patch.diff 就是新 SKILL.md 内容
+        // 对于其他类型（LocalScript/Rhai 等），SKILL.md 不在 patch.diff 中，仍读磁盘旧文件
+        let skill_md_content = match record.context.layout {
+            SkillLayout::PromptTool => Some(patch.diff.clone()),
+            SkillLayout::Hybrid if record.context.skill_type == SkillType::PromptOnly => {
+                Some(patch.diff.clone())
+            }
+            _ => std::fs::read_to_string(skill_dir.join("SKILL.md")).ok(),
+        };
 
         match record.context.layout {
             SkillLayout::PromptTool => {
@@ -1156,28 +1202,36 @@ impl SkillEvolution {
             }
         }
 
-        let primary_file = if let Some(source_path) = record.context.source_path.as_ref() {
-            skill_dir.join(source_path)
-        } else {
-            match record.context.layout {
-                SkillLayout::RhaiOrchestration => skill_dir.join("SKILL.rhai"),
-                SkillLayout::PromptTool => skill_dir.join("SKILL.md"),
-                SkillLayout::LocalScript => skill_dir.join("scripts/skill.sh"),
-                SkillLayout::Hybrid => match record.context.skill_type {
-                    SkillType::Python => skill_dir.join("SKILL.py"),
-                    SkillType::LocalScript => skill_dir.join("scripts/skill.sh"),
-                    _ => skill_dir.join("SKILL.md"),
-                },
+        // primary_file 存在性检查：对于 PromptTool/PromptOnly 类型，patch.diff 就是新文件内容，
+        // 尚未写入磁盘，所以跳过磁盘存在性检查（已在上方通过 skill_md_content 验证）
+        let primary_file_is_new_content = matches!(record.context.layout, SkillLayout::PromptTool)
+            || (record.context.layout == SkillLayout::Hybrid
+                && record.context.skill_type == SkillType::PromptOnly);
+
+        if !primary_file_is_new_content {
+            let primary_file = if let Some(source_path) = record.context.source_path.as_ref() {
+                skill_dir.join(source_path)
+            } else {
+                match record.context.layout {
+                    SkillLayout::RhaiOrchestration => skill_dir.join("SKILL.rhai"),
+                    SkillLayout::LocalScript => skill_dir.join("scripts/skill.sh"),
+                    SkillLayout::PromptTool => skill_dir.join("SKILL.md"),
+                    SkillLayout::Hybrid => match record.context.skill_type {
+                        SkillType::Python => skill_dir.join("SKILL.py"),
+                        SkillType::LocalScript => skill_dir.join("scripts/skill.sh"),
+                        _ => skill_dir.join("SKILL.md"),
+                    },
+                }
+            };
+            if !primary_file.exists() {
+                issues.push(format!(
+                    "Primary skill file missing: {}",
+                    primary_file
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ));
             }
-        };
-        if !primary_file.exists() {
-            issues.push(format!(
-                "Primary skill file missing: {}",
-                primary_file
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            ));
         }
 
         let passed = issues.is_empty();
@@ -1210,6 +1264,29 @@ impl SkillEvolution {
             reason = %reason,
             "Rolling back evolution"
         );
+
+        // staged 新技能导入且只有 v1（无 baseline）时，无法回滚到上一版本，
+        // 直接删除已 promoted 的主 skills_dir/<skill> 并清理版本历史
+        if record.context.staged {
+            let versions = self.version_manager.list_versions(&record.skill_name)?;
+            if versions.len() < 2 {
+                let main_skill_dir = self.skills_dir.join(&record.skill_name);
+                if main_skill_dir.exists() {
+                    std::fs::remove_dir_all(&main_skill_dir)?;
+                    info!(
+                        evolution_id = %evolution_id,
+                        skill = %record.skill_name,
+                        "🧹 [rollback] 删除 staged 新导入的坏 skill（无 baseline 可回滚）"
+                    );
+                }
+                // 清理版本快照和历史文件（它们在主 skill 目录下，已被删除）
+                // 如果主目录不存在则版本文件也不存在，无需额外清理
+                record.status = EvolutionStatus::RolledBack;
+                record.updated_at = chrono::Utc::now().timestamp();
+                self.save_record(&record)?;
+                return Ok(());
+            }
+        }
 
         // 恢复到上一版本
         self.restore_previous_version(&record.skill_name)?;
@@ -2809,11 +2886,23 @@ or\n\
     }
 
     /// P0-2: create_new_version 直接写入完整脚本（不再 apply diff）
+    ///
+    /// 原子性保证：先记录当前版本号，写入新内容后创建 v2 快照。
+    /// 若快照创建失败（IO 错误/崩溃），回退到写入前的版本恢复磁盘内容。
+    ///
+    /// 部署事务：写入、promote、版本历史迁移、快照创建任一步骤失败，
+    /// 都统一恢复旧版本或 .bak，避免 partial 状态留在磁盘。
     fn create_new_version(&self, record: &EvolutionRecord) -> Result<()> {
         let patch = record
             .patch
             .as_ref()
             .ok_or_else(|| Error::Evolution("No patch to deploy".to_string()))?;
+
+        // 记住写入前的版本号，用于失败时恢复
+        let pre_write_version = self
+            .version_manager
+            .get_current_version(&record.skill_name)
+            .ok();
 
         let skill_root = self.skill_root_dir_for_record(record);
         let staged_skill_dir = skill_root.join(&record.skill_name);
@@ -2838,7 +2927,34 @@ or\n\
         }
 
         // 直接写入完整内容（所有生成都是完整文件）
-        std::fs::write(&skill_path, &patch.diff)?;
+        // 写入失败时尝试恢复：如果是非 staged 技能，pre_write_version 对应的文件
+        // 可能已被 truncate，但 write 失败意味着内容未完整写入，恢复也无从下手。
+        // 因此写入失败直接返回——此时 skill 文件可能损坏，但至少不会留下
+        // 错误的版本快照。staged 技能写入的是 staging 目录，不影响主目录。
+        if let Err(e) = std::fs::write(&skill_path, &patch.diff) {
+            // 非 staged：尝试用 pre_write_version 恢复磁盘文件
+            if !record.context.staged {
+                if let Some(ref prev_ver) = pre_write_version {
+                    warn!(
+                        skill = %record.skill_name,
+                        error = %e,
+                        pre_write_version = %prev_ver,
+                        "Write to skill file failed, attempting to restore pre-write version"
+                    );
+                    if let Err(restore_err) = self
+                        .version_manager
+                        .switch_to_version(&record.skill_name, prev_ver)
+                    {
+                        warn!(
+                            skill = %record.skill_name,
+                            error = %restore_err,
+                            "Failed to restore pre-write version after write failure"
+                        );
+                    }
+                }
+            }
+            return Err(Error::from(e));
+        }
 
         if let Some(meta) = self.extract_yaml_from_response(&patch.explanation) {
             let meta_path = staged_skill_dir.join("meta.yaml");
@@ -2846,26 +2962,42 @@ or\n\
         }
 
         // If this is a staged external skill, promote it into the main skills dir now.
+        let mut version_history_migrated = false;
         if record.context.staged {
             let dest_skill_dir = self.skills_dir.join(&record.skill_name);
             std::fs::create_dir_all(&self.skills_dir)?;
 
-            // Atomic promotion: rename old → .bak, rename new → dest, then delete .bak.
-            // This avoids data loss if rename fails after remove_dir_all succeeds.
+            // Atomic promotion: rename old → .bak, rename new → dest.
+            // .bak 保留到版本快照成功后再清理，失败时可用于恢复。
+            let mut bak_exists = false;
             if dest_skill_dir.exists() {
                 let bak_dir = dest_skill_dir.with_extension("bak");
-                // Clean up any previous .bak first
+                // 清理旧 .bak：如果删除失败说明有权限/锁问题，
+                // 后续会误迁移 stale .bak 的版本历史，因此必须中止。
                 if bak_dir.exists() {
-                    std::fs::remove_dir_all(&bak_dir).ok();
+                    std::fs::remove_dir_all(&bak_dir).map_err(|e| {
+                        Error::Evolution(format!(
+                            "Cannot remove stale .bak dir for staged promote: {}",
+                            e
+                        ))
+                    })?;
                 }
+                // 将旧目录 rename 为 .bak 作为备份。
+                // 如果 rename 失败，不采用 remove_dir_all fallback——
+                // 那会让旧 skill 无备份就丢失，后续快照失败时无法恢复。
                 if let Err(e) = std::fs::rename(&dest_skill_dir, &bak_dir) {
                     warn!(
                         skill = %record.skill_name,
                         error = %e,
-                        "Failed to rename existing skill dir to .bak, falling back to remove_dir_all"
+                        "🧹 [create_new_version] staged 备份旧目录到 .bak 失败，中止 promote"
                     );
-                    std::fs::remove_dir_all(&dest_skill_dir)?;
+                    return Err(Error::Evolution(format!(
+                        "Cannot backup existing skill dir for staged promote (rename failed: {}). \
+                         Refusing to proceed without backup — old skill would be lost on rollback.",
+                        e
+                    )));
                 }
+                bak_exists = true;
             }
 
             // Prefer atomic rename if possible; fallback to copy+remove.
@@ -2875,20 +3007,84 @@ or\n\
                     error = %e,
                     "Staged skill promote via rename failed, falling back to copy"
                 );
-                copy_dir_all(&staged_skill_dir, &dest_skill_dir)?;
+                if let Err(copy_err) = copy_dir_all(&staged_skill_dir, &dest_skill_dir) {
+                    // copy fallback 失败：恢复 .bak（如果存在）
+                    warn!(
+                        skill = %record.skill_name,
+                        error = %copy_err,
+                        "🧹 [create_new_version] staged promote copy fallback 失败，恢复 .bak"
+                    );
+                    if bak_exists {
+                        let bak_dir = dest_skill_dir.with_extension("bak");
+                        if dest_skill_dir.exists() {
+                            std::fs::remove_dir_all(&dest_skill_dir).ok();
+                        }
+                        if let Err(restore_err) = std::fs::rename(&bak_dir, &dest_skill_dir) {
+                            warn!(
+                                skill = %record.skill_name,
+                                error = %restore_err,
+                                "Failed to restore .bak after promote copy failure, .bak preserved"
+                            );
+                        }
+                    }
+                    return Err(Error::Evolution(format!(
+                        "Staged skill promote failed: rename ({}) and copy ({})",
+                        e, copy_err
+                    )));
+                }
                 std::fs::remove_dir_all(&staged_skill_dir).ok();
             }
 
-            // Clean up .bak directory after successful promotion
+            // 将 .bak 中的版本历史和快照迁移到新主目录，
+            // 确保 create_version() 能看到已有 baseline，新版本成为 v2 而非 v1。
+            // 迁移失败时恢复 .bak → 主目录，避免旧 skill 停留在 .bak 丢失。
             let bak_dir = dest_skill_dir.with_extension("bak");
             if bak_dir.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&bak_dir) {
+                let bak_history = bak_dir.join("version_history.json");
+                let bak_versions = bak_dir.join("versions");
+                let migrate_result: Result<()> = (|| {
+                    if bak_history.exists() {
+                        std::fs::copy(&bak_history, dest_skill_dir.join("version_history.json"))
+                            .map_err(|e| {
+                                Error::Evolution(format!(
+                                    "Failed to migrate version_history.json from .bak: {}",
+                                    e
+                                ))
+                            })?;
+                    }
+                    if bak_versions.exists() {
+                        copy_dir_all(&bak_versions, &dest_skill_dir.join("versions")).map_err(
+                            |e| {
+                                Error::Evolution(format!(
+                                    "Failed to migrate versions/ from .bak: {}",
+                                    e
+                                ))
+                            },
+                        )?;
+                    }
+                    Ok(())
+                })();
+
+                if let Err(e) = migrate_result {
                     warn!(
                         skill = %record.skill_name,
                         error = %e,
-                        "Failed to clean up .bak directory after skill promotion"
+                        "🧹 [create_new_version] staged 版本历史迁移失败，恢复 .bak 到主目录"
                     );
+                    // 删除 promoted 的新目录，恢复 .bak
+                    if dest_skill_dir.exists() {
+                        std::fs::remove_dir_all(&dest_skill_dir).ok();
+                    }
+                    if let Err(restore_err) = std::fs::rename(&bak_dir, &dest_skill_dir) {
+                        warn!(
+                            skill = %record.skill_name,
+                            error = %restore_err,
+                            "Failed to restore .bak after migration failure, .bak preserved"
+                        );
+                    }
+                    return Err(e);
                 }
+                version_history_migrated = true;
             }
 
             if let Some(meta) = self.extract_yaml_from_response(&patch.explanation) {
@@ -2905,8 +3101,8 @@ or\n\
 
             // Clean up the staging root directory after successful promote.
             // The skill subdirectory was already moved/removed above, but the
-            // parent staging directory (staging_skills_dir) may still exist as
-            // an orphan. Only remove it if empty to avoid deleting other staged skills.
+            // parent staging directory (staging_skills_dir) may still exist as an
+            // orphan. Only remove it if empty to avoid deleting other staged skills.
             if let Some(ref staging_dir) = record.context.staging_skills_dir {
                 let staging_path = PathBuf::from(staging_dir);
                 if staging_path.exists() {
@@ -2928,17 +3124,93 @@ or\n\
             record.id,
             patch.explanation.chars().take(200).collect::<String>()
         ));
-        let version = self.version_manager.create_version(
+        let version = match self.version_manager.create_version(
             &record.skill_name,
             VersionSource::Evolution,
             changelog,
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                // 快照创建失败：磁盘已被新内容覆盖，但版本历史里没有 v2。
+                // 尝试恢复到写入前的版本快照，避免 rollback() 因版本不足被拒绝。
+                if let Some(ref prev_ver) = pre_write_version {
+                    warn!(
+                        skill = %record.skill_name,
+                        error = %e,
+                        pre_write_version = %prev_ver,
+                        "Version snapshot creation failed after live write, restoring pre-write version"
+                    );
+                    if let Err(restore_err) = self
+                        .version_manager
+                        .switch_to_version(&record.skill_name, prev_ver)
+                    {
+                        warn!(
+                            skill = %record.skill_name,
+                            error = %restore_err,
+                            "Failed to restore pre-write version after snapshot failure"
+                        );
+                    }
+                }
+
+                // staged 技能快照失败后的清理：区分"新导入"和"覆盖已有"
+                if record.context.staged {
+                    let main_skill_dir = self.skills_dir.join(&record.skill_name);
+                    let bak_dir = main_skill_dir.with_extension("bak");
+                    if bak_dir.exists() {
+                        // 覆盖已有 skill 的情况：.bak 仍保留着旧版本，
+                        // 尝试恢复 .bak → 主目录，避免数据丢失
+                        warn!(
+                            skill = %record.skill_name,
+                            "🧹 [create_new_version] staged 覆盖已有 skill 快照失败，从 .bak 恢复旧版本"
+                        );
+                        if main_skill_dir.exists() {
+                            std::fs::remove_dir_all(&main_skill_dir).ok();
+                        }
+                        if let Err(restore_err) = std::fs::rename(&bak_dir, &main_skill_dir) {
+                            warn!(
+                                skill = %record.skill_name,
+                                error = %restore_err,
+                                "Failed to restore .bak after snapshot failure, .bak preserved"
+                            );
+                        }
+                    } else if !pre_write_version.is_some() || main_skill_dir.exists() {
+                        // 全新 staged skill（无 baseline、无 .bak）：删除主目录避免残留坏 skill
+                        if main_skill_dir.exists() {
+                            std::fs::remove_dir_all(&main_skill_dir).ok();
+                            warn!(
+                                skill = %record.skill_name,
+                                "🧹 [create_new_version] staged 新技能快照失败且无 .bak 可恢复，删除已 promoted 的主目录"
+                            );
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         info!(
             skill = %record.skill_name,
             version = %version.version,
             "New skill version deployed via evolution"
         );
+
+        // 版本快照成功后，清理 staged promote 保留的 .bak 目录。
+        // 只有版本历史迁移成功时才清理，否则保留 .bak 以备手动恢复
+        if record.context.staged && version_history_migrated {
+            let bak_dir = self
+                .skills_dir
+                .join(&record.skill_name)
+                .with_extension("bak");
+            if bak_dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&bak_dir) {
+                    warn!(
+                        skill = %record.skill_name,
+                        error = %e,
+                        "Failed to clean up .bak directory after version snapshot success"
+                    );
+                }
+            }
+        }
 
         // Clean up skill directory — remove temp/cache/backup files
         let final_skill_dir = self.skills_dir.join(&record.skill_name);

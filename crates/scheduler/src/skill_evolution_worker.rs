@@ -61,6 +61,15 @@ impl SkillEvolutionWorker {
         }
     }
 
+    /// 设置技能部署成功后的回调（例如记录 EvolutionSuccess ghost learning boundary）。
+    ///
+    /// 必须在 `run_loop` 之前调用。deploy_callback 在观察期最终成功后触发
+    ///（即 tick_single_observation 确认错误率正常且窗口到期时），
+    /// 而非 process_pending_evolution 返回 Completed（进入 Observing）时触发。
+    pub fn set_deploy_callback(&mut self, callback: Arc<dyn Fn(&str) + Send + Sync>) {
+        self.service.set_deploy_callback(callback);
+    }
+
     pub fn notify(&self) {
         self.wakeup.notify_one();
     }
@@ -90,7 +99,9 @@ impl SkillEvolutionWorker {
         }
     }
 
-    async fn tick(&self) {
+    /// 驱动一次 skill evolution pipeline tick（单次模式使用）
+    /// 返回 true 表示本次 claim 到了 workflow，false 表示无可 claim 的 workflow。
+    pub async fn tick(&self) -> bool {
         if let Err(e) = self.recover() {
             warn!(error = %e, "Failed to recover skill evolution workflows");
         }
@@ -110,11 +121,11 @@ impl SkillEvolutionWorker {
                 if let Err(e) = self.service.tick_observations().await {
                     warn!(error = %e, "Skill evolution observation tick failed");
                 }
-                return;
+                return false;
             }
             Err(e) => {
                 error!(error = %e, "Failed to claim skill evolution workflow");
-                return;
+                return false;
             }
         };
 
@@ -134,7 +145,7 @@ impl SkillEvolutionWorker {
                 None,
             );
             let _ = self.store.release_lease(&workflow.id, &self.worker_id);
-            return;
+            return true;
         }
 
         match self
@@ -144,11 +155,11 @@ impl SkillEvolutionWorker {
             Ok(true) => {}
             Ok(false) => {
                 warn!(workflow_id = %workflow.id, "Lost skill evolution lease before pipeline");
-                return;
+                return true;
             }
             Err(e) => {
                 warn!(workflow_id = %workflow.id, error = %e, "Failed to renew skill evolution lease");
-                return;
+                return true;
             }
         }
 
@@ -160,7 +171,7 @@ impl SkillEvolutionWorker {
             Err(e) => {
                 error!(workflow_id = %workflow.id, error = %e, "Failed to insert skill evolution step");
                 let _ = self.store.release_lease(&workflow.id, &self.worker_id);
-                return;
+                return true;
             }
         };
 
@@ -180,18 +191,18 @@ impl SkillEvolutionWorker {
             Ok(true) => {}
             Ok(false) => {
                 warn!(workflow_id = %workflow.id, "Lost skill evolution lease after pipeline");
-                return;
+                return true;
             }
             Err(e) => {
                 warn!(workflow_id = %workflow.id, error = %e, "Failed to renew skill evolution lease after pipeline");
-                return;
+                return true;
             }
         }
 
         match result {
             Ok(PipelineOutcome::Done(output_json)) => {
                 if !self.complete_step(&workflow, &step_id, Some(&output_json)) {
-                    return;
+                    return true;
                 }
                 // Use "Observing" instead of "Promoted" — the skill is in
                 // observation window and may still be rolled back if error
@@ -214,7 +225,7 @@ impl SkillEvolutionWorker {
                     "Skill evolution pipeline still running, deferring with backoff"
                 );
                 if !self.complete_step(&workflow, &step_id, Some("{\"status\":\"StillRunning\"}")) {
-                    return;
+                    return true;
                 }
                 match self.store.defer_workflow_if_owned(
                     &workflow.id,
@@ -263,6 +274,8 @@ impl SkillEvolutionWorker {
         if let Err(e) = self.service.tick_observations().await {
             warn!(error = %e, "Skill evolution observation tick failed");
         }
+
+        true
     }
 
     async fn enqueue_pending_records(&self) -> Result<()> {
