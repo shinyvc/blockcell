@@ -59,7 +59,11 @@ impl CrossProcessLock {
     fn acquire(lock_path: &Path) -> std::io::Result<Self> {
         for attempt in 0..Self::MAX_RETRIES {
             match Self::try_create_lock(lock_path) {
-                Ok(()) => return Ok(Self { lock_path: lock_path.to_path_buf() }),
+                Ok(()) => {
+                    return Ok(Self {
+                        lock_path: lock_path.to_path_buf(),
+                    })
+                }
                 Err(_) => {
                     // 锁文件已存在，检查持有进程是否已退出
                     if Self::is_holder_dead(lock_path) {
@@ -74,7 +78,9 @@ impl CrossProcessLock {
                     }
                     // 活进程持锁，等待后重试
                     if attempt < Self::MAX_RETRIES - 1 {
-                        std::thread::sleep(std::time::Duration::from_millis(Self::RETRY_INTERVAL_MS));
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            Self::RETRY_INTERVAL_MS,
+                        ));
                     }
                 }
             }
@@ -87,7 +93,10 @@ impl CrossProcessLock {
         );
         Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
-            format!("跨进程锁获取超时: 另一个进程仍在持有锁 ({})", lock_path.display()),
+            format!(
+                "跨进程锁获取超时: 另一个进程仍在持有锁 ({})",
+                lock_path.display()
+            ),
         ))
     }
 

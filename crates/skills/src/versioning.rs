@@ -201,6 +201,31 @@ impl VersionManager {
         Ok(())
     }
 
+    /// 确保技能存在 baseline 版本快照（首次进化前调用）
+    ///
+    /// 如果版本历史为空，先为当前磁盘内容创建 v1 baseline，确保后续 rollback 有版本可回退。
+    /// 如果已有版本历史则跳过。
+    pub fn ensure_baseline(&self, skill_name: &str) -> Result<()> {
+        let history = self.get_history(skill_name)?;
+        if !history.versions.is_empty() {
+            return Ok(());
+        }
+
+        // 当前磁盘内容作为 v1 baseline
+        let baseline = self.create_version(
+            skill_name,
+            VersionSource::Manual,
+            Some("Baseline snapshot before first evolution".to_string()),
+        )?;
+
+        info!(
+            skill = %skill_name,
+            version = %baseline.version,
+            "Created baseline version snapshot before first evolution"
+        );
+        Ok(())
+    }
+
     /// 列出所有版本
     pub fn list_versions(&self, skill_name: &str) -> Result<Vec<SkillVersion>> {
         let history = self.get_history(skill_name)?;

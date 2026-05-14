@@ -614,6 +614,22 @@ pub async fn run(
         }
         // Clean up event handler
         event_handler.abort();
+
+        // 单次模式驱动 skill evolution pipeline tick，
+        // 确保消息处理期间触发的 notify() 有消费者，pipeline 能推进。
+        // Bounded loop：单次消息可能触发多个 evolution workflow，drain 到无可 claim 为止。
+        {
+            let skill_evo_worker_clone = skill_evo_worker_arc.clone();
+            let _ = tokio::spawn(async move {
+                let max_ticks = 10; // 防止无限循环
+                for _ in 0..max_ticks {
+                    if !skill_evo_worker_clone.tick().await {
+                        break; // 无可 claim 的 workflow，退出
+                    }
+                }
+            })
+            .await;
+        }
     } else {
         // Interactive mode with CronService
         println!("blockcell interactive mode (Ctrl+C to exit)");
