@@ -897,10 +897,12 @@ async fn spawn_agent_runtime(
         create_skill_evolution_llm_provider(&agent_config, &provider_pool, agent_id);
     let skill_evo_workflow_db = agent_paths.workspace().join("skill_evolution_workflow.db");
     let skill_evo_workflow_store = EvolutionWorkflowStore::open(&skill_evo_workflow_db)?;
+    // 从 Config.evolution 转换配置，而非使用默认值
+    let skill_evo_config: EvolutionServiceConfig = agent_config.evolution.clone().into();
     let mut skill_evo_worker = SkillEvolutionWorker::new(
         skill_evo_workflow_store,
         agent_paths.skills_dir(),
-        EvolutionServiceConfig::default(),
+        skill_evo_config,
         skill_evo_llm_provider,
     );
     // 为 SkillEvolutionWorker 设置部署回调，确保 scheduler worker 的进化部署路径也能触发 ghost learning boundary
@@ -2013,9 +2015,11 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
 
     // Create a shared EvolutionService for the HTTP handlers (trigger, delete, status).
     // This is separate from the one inside AgentRuntime but shares the same disk records.
+    // 从 Config.evolution 转换配置，而非使用默认值
+    let evo_service_config: EvolutionServiceConfig = config.evolution.clone().into();
     let shared_evo_service = Arc::new(Mutex::new(EvolutionService::new(
         paths.skills_dir(),
-        EvolutionServiceConfig::default(),
+        evo_service_config,
     )));
 
     let gateway_state = GatewayState {

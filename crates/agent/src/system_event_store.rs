@@ -105,7 +105,70 @@ impl SystemEventStoreOps for InMemorySystemEventStore {
         let cutoff = Utc::now().timestamp_millis() - (max_age_secs as i64 * 1000);
         let mut events = get_lock(&self.events);
         let before = events.len();
-        events.retain(|event| event.created_at_ms >= cutoff);
+        // 先将过期事件标记为 delivered（释放"资源"——待处理事件是一种逻辑资源）
+        // 这样依赖 pending 状态的消费者不会看到已过期但仍 pending 的事件
+        for event in events.iter_mut() {
+            if event.created_at_ms < cutoff && !event.delivered {
+                event.delivered = true;
+            }
+        }
+        // 然后移除已过期且已 delivered 或已 acked 的事件
+        // 保留条件：未过期，或过期但仍未投递（需要继续投递）
+        events.retain(|event| event.created_at_ms >= cutoff || !event.delivered);
         before.saturating_sub(events.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blockcell_core::system_event::{DeliveryPolicy, EventPriority};
+
+    fn make_event(id: &str, created_at_ms: i64, delivered: bool) -> SystemEvent {
+        SystemEvent {
+            id: id.to_string(),
+            kind: "test".to_string(),
+            source: "test".to_string(),
+            scope: EventScope::Global,
+            priority: EventPriority::Normal,
+            title: "test event".to_string(),
+            summary: "test summary".to_string(),
+            details: serde_json::Value::Null,
+            created_at_ms,
+            correlation_id: None,
+            dedup_key: None,
+            delivery: DeliveryPolicy::default(),
+            delivered,
+            acked: false,
+        }
+    }
+
+    /// 测试：cleanup_expired 先标记过期事件为 delivered 再移除
+    ///
+    /// 验证：
+    /// - 过期且未 delivered 的事件先被标记为 delivered（释放资源）
+    /// - 然后已 delivered 的过期事件被移除
+    /// - 非 delivered 的未过期事件不受影响
+    #[test]
+    fn test_cleanup_expired_marks_delivered_before_removing() {
+        let store = InMemorySystemEventStore::default();
+        let now = Utc::now().timestamp_millis();
+
+        // 两个过期事件（一个 delivered，一个未 delivered）
+        store.emit(make_event("old-1", now - 200_000, true));
+        store.emit(make_event("old-2", now - 200_000, false));
+        // 一个未过期事件
+        store.emit(make_event("new-1", now, false));
+
+        // 清理前：old-2 仍 pending
+        assert_eq!(store.count_pending(), 2); // old-2 + new-1
+
+        // 清理 100 秒前的事件
+        let removed = store.cleanup_expired(100);
+        // old-1 (delivered+expired) 被移除
+        // old-2 (pending+expired) 先被标记为 delivered，然后也被移除
+        assert_eq!(removed, 2);
+        // new-1 仍 pending
+        assert_eq!(store.count_pending(), 1);
     }
 }

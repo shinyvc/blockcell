@@ -143,11 +143,13 @@ impl CapabilityVersionManager {
         self.create_version(capability_id, artifact_path, source, changelog)
     }
 
-    /// Rollback to the previous version. Returns the artifact path of the restored version.
+    /// 回滚到当前版本的前一个版本。返回恢复后的 artifact 路径。
+    /// 非破坏性回滚：保留所有版本历史，支持 roll-forward。
+    /// 基于 current_version 定位，而非总是取倒数第二个版本。
     pub fn rollback(&self, capability_id: &str) -> Result<Option<String>> {
         let mut history = self.get_history(capability_id)?;
 
-        if history.versions.len() < 2 {
+        if history.versions.is_empty() {
             warn!(
                 capability_id = %capability_id,
                 "📦 [能力版本] 没有可回滚的版本: {}",
@@ -156,21 +158,61 @@ impl CapabilityVersionManager {
             return Ok(None);
         }
 
-        // Remove current version
-        let removed = history.versions.pop();
-        if let Some(ref v) = removed {
-            // Delete the snapshot file
-            let _ = std::fs::remove_file(&v.artifact_path);
-        }
-
-        // Set current to previous
-        let prev = history
+        // 基于 current_version 找到当前版本在列表中的位置，再切到前一个版本
+        let current_idx = history
             .versions
-            .last()
-            .ok_or_else(|| Error::Other("No previous version".to_string()))?;
+            .iter()
+            .position(|v| v.version == history.current_version);
+
+        let prev_idx = match current_idx {
+            Some(0) => {
+                // 当前已是第一个版本，无法继续回滚
+                warn!(
+                    capability_id = %capability_id,
+                    current_version = %history.current_version,
+                    "📦 [能力版本] 当前已是第一个版本，无法回滚: {}",
+                    capability_id
+                );
+                return Ok(None);
+            }
+            Some(idx) => idx - 1,
+            None => {
+                // current_version 在列表中未找到，回退到倒数第二个版本
+                if history.versions.len() < 2 {
+                    return Ok(None);
+                }
+                history.versions.len() - 2
+            }
+        };
+
+        let prev = &history.versions[prev_idx];
         history.current_version = prev.version.clone();
         let restore_path = prev.artifact_path.clone();
 
+        // 先验证并复制 artifact 到临时文件，成功后再原子替换并保存 history
+        // 防止 copy 失败时 history 已回滚但 artifact 未变，导致版本状态不一致
+        let safe_id = capability_id.replace('.', "_");
+        let ext = std::path::Path::new(&restore_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("sh");
+        let active_path = self.artifacts_dir.join(format!("{}.{}", safe_id, ext));
+
+        // 验证快照文件存在并可读
+        if !std::path::Path::new(&restore_path).exists() {
+            warn!(
+                capability_id = %capability_id,
+                restore_path = %restore_path,
+                "📦 [能力版本] 回滚快照文件不存在: {}",
+                restore_path
+            );
+            return Ok(None);
+        }
+
+        // 先复制 artifact（如果失败则不修改 history，保持一致性）
+        std::fs::copy(&restore_path, &active_path)?;
+
+        // artifact 复制成功，现在才保存 history
         self.save_history(&history)?;
 
         info!(
@@ -179,15 +221,6 @@ impl CapabilityVersionManager {
             "📦 [能力版本] 回滚到: {} -> {}",
             capability_id, history.current_version
         );
-
-        // Copy the snapshot back to the artifacts dir
-        let safe_id = capability_id.replace('.', "_");
-        let ext = std::path::Path::new(&restore_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("sh");
-        let active_path = self.artifacts_dir.join(format!("{}.{}", safe_id, ext));
-        std::fs::copy(&restore_path, &active_path)?;
 
         Ok(Some(active_path.to_string_lossy().to_string()))
     }
@@ -403,15 +436,30 @@ mod tests {
         )
         .unwrap();
 
-        // Rollback
+        // Rollback (non-destructive: all versions preserved)
         let restored = vm.rollback("rollback.cap").unwrap();
         assert!(restored.is_some());
 
         let current = vm.get_current_version("rollback.cap").unwrap();
         assert_eq!(current, "v1");
 
+        // All versions still exist after rollback (non-destructive)
         let versions = vm.list_versions("rollback.cap").unwrap();
-        assert_eq!(versions.len(), 1);
+        assert_eq!(versions.len(), 2);
+
+        // Can roll-forward back to v2
+        let history_file = tmp.join("tool_versions").join("rollback_cap_history.json");
+        let content = std::fs::read_to_string(&history_file).unwrap();
+        let mut history: CapabilityVersionHistory = serde_json::from_str(&content).unwrap();
+        history.current_version = "v2".to_string();
+        std::fs::write(
+            &history_file,
+            serde_json::to_string_pretty(&history).unwrap(),
+        )
+        .unwrap();
+
+        let current_after_forward = vm.get_current_version("rollback.cap").unwrap();
+        assert_eq!(current_after_forward, "v2");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -455,5 +503,70 @@ mod tests {
         let h3 = simple_hash(b"world");
         assert_eq!(h1, h2);
         assert_ne!(h1, h3);
+    }
+
+    /// 回归测试：基于 current_version 定位的连续回滚 v3 -> v2 -> v1
+    #[test]
+    fn test_sequential_rollback_v3_to_v2_to_v1() {
+        let tmp = std::env::temp_dir().join("test_cap_ver_seq_rollback");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let vm = CapabilityVersionManager::new(tmp.clone());
+        let artifacts_dir = tmp.join("tool_artifacts");
+        std::fs::create_dir_all(&artifacts_dir).unwrap();
+        let artifact = artifacts_dir.join("seq_rollback_cap.sh");
+
+        // 创建 v1
+        std::fs::write(&artifact, "#!/bin/bash\necho v1").unwrap();
+        vm.create_version(
+            "seq.rollback",
+            artifact.to_str().unwrap(),
+            CapabilityVersionSource::Evolution,
+            None,
+        )
+        .unwrap();
+        assert_eq!(vm.get_current_version("seq.rollback").unwrap(), "v1");
+
+        // 创建 v2
+        std::fs::write(&artifact, "#!/bin/bash\necho v2").unwrap();
+        vm.create_version(
+            "seq.rollback",
+            artifact.to_str().unwrap(),
+            CapabilityVersionSource::Evolution,
+            None,
+        )
+        .unwrap();
+        assert_eq!(vm.get_current_version("seq.rollback").unwrap(), "v2");
+
+        // 创建 v3
+        std::fs::write(&artifact, "#!/bin/bash\necho v3").unwrap();
+        vm.create_version(
+            "seq.rollback",
+            artifact.to_str().unwrap(),
+            CapabilityVersionSource::Evolution,
+            None,
+        )
+        .unwrap();
+        assert_eq!(vm.get_current_version("seq.rollback").unwrap(), "v3");
+
+        // 第一次回滚：v3 -> v2
+        vm.rollback("seq.rollback").unwrap();
+        assert_eq!(vm.get_current_version("seq.rollback").unwrap(), "v2");
+
+        // 第二次回滚：v2 -> v1
+        vm.rollback("seq.rollback").unwrap();
+        assert_eq!(vm.get_current_version("seq.rollback").unwrap(), "v1");
+
+        // 第三次回滚：v1 已是第一个版本，无法继续
+        let result = vm.rollback("seq.rollback").unwrap();
+        assert!(result.is_none());
+        assert_eq!(vm.get_current_version("seq.rollback").unwrap(), "v1");
+
+        // 所有版本仍然存在（非破坏性）
+        let versions = vm.list_versions("seq.rollback").unwrap();
+        assert_eq!(versions.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

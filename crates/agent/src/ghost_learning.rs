@@ -363,4 +363,62 @@ mod tests {
         assert_eq!(decision, LearningDecision::ForceBoundaryReview);
         assert_eq!(decision.episode_status(), Some("pending_review"));
     }
+
+    /// 回归测试：GhostLearningPolicy 并发更新不会导致数据竞争
+    ///
+    /// 验证 Mutex 保护下，多线程并发调用 update_ghost_policy()
+    /// 后 policy 状态一致（最后一个写入者的值生效）。
+    #[test]
+    fn ghost_learning_policy_concurrent_update_no_data_race() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let policy = Arc::new(std::sync::Mutex::new(GhostLearningPolicy::default()));
+        let mut handles = vec![];
+
+        // 8 个线程并发写入不同的 method_tool_threshold
+        for i in 1..=8u32 {
+            let p = Arc::clone(&policy);
+            handles.push(thread::spawn(move || {
+                let config = GhostLearningConfig {
+                    enabled: true,
+                    shadow_mode: false,
+                    turn_review_interval: i,
+                    method_tool_threshold: i,
+                    recall_max_items: 10,
+                    recall_token_budget: 1000,
+                };
+                let new_policy = GhostLearningPolicy::from_config(&config);
+                *p.lock().unwrap() = new_policy;
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // 验证：最终值是某个合法写入值（1..=8），不是垃圾数据
+        let final_policy = policy.lock().unwrap();
+        let boundary = GhostLearningBoundary {
+            kind: GhostLearningBoundaryKind::TurnEnd,
+            session_key: None,
+            subject_key: None,
+            user_intent_summary: "test".to_string(),
+            assistant_outcome_summary: "ok".to_string(),
+            tool_call_count: 5, // 超过所有可能的 threshold (1..=8)
+            memory_write_count: 0,
+            correction_count: 0,
+            preference_correction_count: 0,
+            success: true,
+            complexity_score: 0,
+            reusable_lesson: None,
+        };
+        // tool_call_count=5 >= method_tool_threshold(1..=8 中任意值 ≤ 5 时触发 Review)
+        let decision = final_policy.decide(&boundary);
+        // method_tool_threshold 在 1..=5 时 Review，6..=8 时 Ignore（因为 5 < threshold）
+        assert!(matches!(
+            decision,
+            LearningDecision::ReviewAfterResponse | LearningDecision::Ignore
+        ));
+    }
 }

@@ -248,6 +248,10 @@ pub async fn run_pending_background_reviews(
     }
 
     let ledger = GhostLedger::open(&paths.ghost_ledger_db())?;
+    // 在 claim 前清理过期 lease，释放因 worker 崩溃/超时而残留的 reviewing 状态
+    if let Err(e) = ledger.cleanup_expired_leases() {
+        warn!(error = %e, "Failed to cleanup expired review leases before claiming");
+    }
     let worker_id = format!("ghost-review-{}", uuid::Uuid::new_v4());
     let episodes =
         ledger.claim_reviewable_episodes(limit, &worker_id, REVIEW_LEASE_DURATION_SECS)?;

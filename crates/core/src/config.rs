@@ -2323,6 +2323,62 @@ pub struct SelfImproveConfig {
     pub review: SelfImproveReviewConfig,
 }
 
+/// 进化服务配置（对应 blockcell_skills::EvolutionServiceConfig）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvolutionConfig {
+    /// 触发进化所需的连续错误次数（默认 1）
+    #[serde(default = "default_evolution_error_threshold")]
+    pub error_threshold: u32,
+    /// 错误统计的时间窗口（分钟，默认 30）
+    #[serde(default = "default_evolution_error_window_minutes")]
+    pub error_window_minutes: u32,
+    /// 是否启用自动进化（默认 true）
+    #[serde(default = "default_evolution_enabled")]
+    pub enabled: bool,
+    /// 每个阶段失败后的最大重试次数（默认 3）
+    #[serde(default = "default_evolution_max_retries")]
+    pub max_retries: u32,
+    /// LLM 调用超时时间（秒，默认 300）
+    #[serde(default = "default_evolution_llm_timeout_secs")]
+    pub llm_timeout_secs: u64,
+    /// 回滚冷却期时长（分钟，默认 60）
+    #[serde(default = "default_evolution_cooldown_minutes")]
+    pub cooldown_minutes: u32,
+}
+
+fn default_evolution_error_threshold() -> u32 {
+    1
+}
+fn default_evolution_error_window_minutes() -> u32 {
+    30
+}
+fn default_evolution_enabled() -> bool {
+    true
+}
+fn default_evolution_max_retries() -> u32 {
+    3
+}
+fn default_evolution_llm_timeout_secs() -> u64 {
+    300
+}
+fn default_evolution_cooldown_minutes() -> u32 {
+    60
+}
+
+impl Default for EvolutionConfig {
+    fn default() -> Self {
+        Self {
+            error_threshold: default_evolution_error_threshold(),
+            error_window_minutes: default_evolution_error_window_minutes(),
+            enabled: default_evolution_enabled(),
+            max_retries: default_evolution_max_retries(),
+            llm_timeout_secs: default_evolution_llm_timeout_secs(),
+            cooldown_minutes: default_evolution_cooldown_minutes(),
+        }
+    }
+}
+
 /// Self-Improve Nudge 配置 — Skill 和 Memory 使用独立阈值
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2480,6 +2536,9 @@ pub struct Config {
     /// Self-Improve 配置 (Nudge + Review)
     #[serde(default)]
     pub self_improve: SelfImproveConfig,
+    /// 进化服务配置（错误阈值、冷却期等）
+    #[serde(default)]
+    pub evolution: EvolutionConfig,
 }
 
 fn default_cron_tick_interval() -> u64 {
@@ -2628,6 +2687,7 @@ impl Default for Config {
             cron_tick_interval_secs: default_cron_tick_interval(),
             openclaw_skill_enabled: false,
             self_improve: SelfImproveConfig::default(),
+            evolution: EvolutionConfig::default(),
         }
     }
 }

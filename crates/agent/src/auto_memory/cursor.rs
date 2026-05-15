@@ -41,7 +41,7 @@ static CURSOR_FILE_LOCKS: Lazy<std::sync::Mutex<HashMap<PathBuf, Arc<std::sync::
 /// - 锁文件内容为持有锁的 PID，便于诊断残留锁
 /// - Drop 时删除锁文件，释放锁
 /// - 如果锁文件已存在，短暂等待后重试
-struct CrossProcessLock {
+pub struct CrossProcessLock {
     lock_path: PathBuf,
 }
 
@@ -56,7 +56,7 @@ impl CrossProcessLock {
     /// 尝试创建锁文件，若已存在则等待并重试。
     /// 只有当锁文件中记录的 PID 已不存在时，才清理残留锁。
     /// 活进程持有的锁不会被强制删除，避免中断合法的 read-merge-write。
-    fn acquire(lock_path: &Path) -> std::io::Result<Self> {
+    pub fn acquire(lock_path: &Path) -> std::io::Result<Self> {
         for attempt in 0..Self::MAX_RETRIES {
             match Self::try_create_lock(lock_path) {
                 Ok(()) => {

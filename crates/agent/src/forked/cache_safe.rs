@@ -151,6 +151,14 @@ impl CacheSafeParams {
     }
 
     /// 检查是否与另一个 CacheSafeParams 兼容（可以共享缓存）
+    ///
+    /// 兼容条件：
+    /// - system_prompt 必须完全匹配
+    /// - model 必须匹配
+    /// - user_context 必须匹配（用户级上下文变更使缓存失效）
+    /// - system_context 必须匹配（系统级上下文变更使缓存失效）
+    /// - fork_context_messages 必须匹配（fork 上下文消息变更使缓存失效）
+    /// - 工具定义必须匹配
     pub fn is_compatible_with(&self, other: &CacheSafeParams) -> bool {
         // 系统提示必须完全匹配
         if self.system_prompt != other.system_prompt {
@@ -159,6 +167,27 @@ impl CacheSafeParams {
         // 模型必须匹配
         if self.model != other.model {
             return false;
+        }
+        // 用户上下文必须匹配
+        if self.user_context != other.user_context {
+            return false;
+        }
+        // 系统上下文必须匹配
+        if self.system_context != other.system_context {
+            return false;
+        }
+        // fork 上下文消息必须匹配（ChatMessage 无 PartialEq，通过序列化比较）
+        if self.fork_context_messages.len() != other.fork_context_messages.len() {
+            return false;
+        }
+        for (left, right) in self
+            .fork_context_messages
+            .iter()
+            .zip(other.fork_context_messages.iter())
+        {
+            if left.role != right.role || left.content != right.content {
+                return false;
+            }
         }
         // 工具定义必须匹配
         // 两边都有完整定义，直接比较
@@ -358,5 +387,53 @@ mod tests {
         assert_eq!(params.model, "model-a");
         assert_eq!(params.tools.len(), 1);
         assert!(params.tools_hash.is_some());
+    }
+
+    /// 测试：is_compatible_with() 比较 user_context、system_context 和 fork_context_messages
+    ///
+    /// 验证上下文差异会导致缓存不兼容：
+    /// - user_context 不同 → 不兼容
+    /// - system_context 不同 → 不兼容
+    /// - fork_context_messages 不同 → 不兼容
+    #[test]
+    fn test_is_compatible_with_context_comparison() {
+        // 基础参数
+        let base = CacheSafeParams::new("system", "model-a");
+
+        // user_context 不同 → 不兼容
+        let mut with_user_ctx = CacheSafeParams::new("system", "model-a");
+        with_user_ctx
+            .user_context
+            .insert("key".to_string(), "value".to_string());
+        assert!(!base.is_compatible_with(&with_user_ctx));
+        assert!(!with_user_ctx.is_compatible_with(&base));
+
+        // 相同 user_context → 兼容
+        let mut same_user_ctx = CacheSafeParams::new("system", "model-a");
+        same_user_ctx
+            .user_context
+            .insert("key".to_string(), "value".to_string());
+        assert!(with_user_ctx.is_compatible_with(&same_user_ctx));
+
+        // system_context 不同 → 不兼容
+        let mut with_sys_ctx = CacheSafeParams::new("system", "model-a");
+        with_sys_ctx
+            .system_context
+            .insert("env".to_string(), "prod".to_string());
+        assert!(!base.is_compatible_with(&with_sys_ctx));
+
+        // fork_context_messages 不同 → 不兼容
+        let mut with_fork = CacheSafeParams::new("system", "model-a");
+        with_fork
+            .fork_context_messages
+            .push(ChatMessage::user("hello"));
+        assert!(!base.is_compatible_with(&with_fork));
+
+        // 相同 fork_context_messages → 兼容
+        let mut same_fork = CacheSafeParams::new("system", "model-a");
+        same_fork
+            .fork_context_messages
+            .push(ChatMessage::user("hello"));
+        assert!(with_fork.is_compatible_with(&same_fork));
     }
 }

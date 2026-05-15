@@ -45,7 +45,8 @@ pub async fn run(description: &str, watch: bool) -> anyhow::Result<()> {
     // Derive a skill name from the description
     let skill_name = derive_skill_name(description);
 
-    let evo_config = EvolutionServiceConfig::default();
+    // 从 Config.evolution 转换配置，而非使用默认值
+    let evo_config: EvolutionServiceConfig = config.evolution.clone().into();
     let service = EvolutionService::new(skills_dir, evo_config);
 
     println!();

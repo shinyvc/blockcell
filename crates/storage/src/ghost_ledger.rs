@@ -521,6 +521,26 @@ impl GhostLedger {
         Ok(affected == 1)
     }
 
+    /// 清理过期的 review lease：释放资源并将 episode 状态回退为 review_failed。
+    ///
+    /// 当 review worker 因超时/崩溃未能正常释放 lease 时，
+    /// 此方法将 episode 的 review_owner 和 review_lease_until 清空，
+    /// 并将状态从 'reviewing' 回退为 'review_failed'，
+    /// 使 episode 可被其他 worker 重新 claim。
+    pub fn cleanup_expired_leases(&self) -> Result<usize> {
+        let now = now_rfc3339();
+        let conn = self.lock_conn()?;
+        let affected = conn
+            .execute(
+                "UPDATE episodes
+                 SET status = 'review_failed', review_owner = NULL, review_lease_until = NULL, updated_at = ?1
+                 WHERE status = 'reviewing' AND (review_lease_until IS NULL OR review_lease_until < ?2)",
+                params![now, now],
+            )
+            .map_err(map_sqlite_error)?;
+        Ok(affected as usize)
+    }
+
     pub fn insert_review_run(&self, run: NewGhostReviewRun) -> Result<String> {
         let run_id = Uuid::new_v4().to_string();
         let now = now_rfc3339();
@@ -1154,5 +1174,44 @@ mod tests {
             ledger.get_episode(&failed_id).unwrap().unwrap().status,
             "reviewing"
         );
+    }
+
+    /// 测试：cleanup_expired_leases 释放过期 lease 并将状态回退为 review_failed
+    #[test]
+    fn ghost_ledger_cleanup_expired_leases() {
+        let (_dir, db) = test_db();
+        let ledger = GhostLedger::open(&db).unwrap();
+
+        let episode_id = ledger.insert_episode(sample_episode()).unwrap();
+        ledger
+            .update_episode_status(&episode_id, "pending_review")
+            .unwrap();
+
+        // Claim episode with a very short lease (1 second)
+        let claimed = ledger
+            .claim_reviewable_episodes(10, "test-worker", 1)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            ledger.get_episode(&episode_id).unwrap().unwrap().status,
+            "reviewing"
+        );
+
+        // 等待 lease 过期
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // 清理过期 lease
+        let cleaned = ledger.cleanup_expired_leases().unwrap();
+        assert_eq!(cleaned, 1);
+
+        // episode 状态应回退为 review_failed
+        let episode = ledger.get_episode(&episode_id).unwrap().unwrap();
+        assert_eq!(episode.status, "review_failed");
+
+        // 清理后应可被重新 claim
+        let reclaimed = ledger
+            .claim_reviewable_episodes(10, "new-worker", 600)
+            .unwrap();
+        assert_eq!(reclaimed.len(), 1);
     }
 }

@@ -569,7 +569,13 @@ impl CoreEvolution {
                     let mut expired = r.clone();
                     expired.status = CoreEvolutionStatus::Failed;
                     expired.updated_at = now;
-                    let _ = self.save_record(&expired);
+                    if let Err(e) = self.save_record(&expired) {
+                        tracing::warn!(
+                            capability_id = %capability_id,
+                            error = %e,
+                            "[核心进化] 保存过期 Blocked 记录失败，该记录可能仍阻塞进化"
+                        );
+                    }
                     continue;
                 }
                 return Ok(true);

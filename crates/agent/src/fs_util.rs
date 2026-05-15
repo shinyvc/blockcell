@@ -19,6 +19,36 @@ fn unique_bak_path(path: &Path) -> PathBuf {
     path.with_extension(format!("bak.{pid}.{counter}"))
 }
 
+/// 查找 `atomic_write` 产生的最新备份文件。
+///
+/// `atomic_write` 在 Windows 上使用 `<original>.bak.<pid>.<counter>` 格式备份，
+/// 此函数扫描目录中所有匹配 `<original>.bak.*` 模式的文件，
+/// 返回修改时间最新的那个（即最近一次 `atomic_write` 产生的备份）。
+///
+/// 用于崩溃恢复：当主文件不存在但存在备份时，找到最新的备份来恢复数据。
+pub fn find_latest_backup(original_path: &Path) -> Option<PathBuf> {
+    let dir = original_path.parent()?;
+    let file_name = original_path.file_name().and_then(|n| n.to_str())?;
+
+    // 构造备份文件名前缀：例如 ".dream_state.json" -> ".dream_state.json.bak."
+    let bak_prefix = format!("{file_name}.bak.");
+
+    let mut latest: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name_str = name.to_str()?;
+        if name_str.starts_with(&bak_prefix) {
+            let mtime = entry.metadata().ok()?.modified().ok()?;
+            if latest.as_ref().map_or(true, |(_, t)| mtime > *t) {
+                latest = Some((entry.path(), mtime));
+            }
+        }
+    }
+
+    latest.map(|(path, _)| path)
+}
+
 /// 原子写入 `data` 到 `path`，使用临时文件 + rename 策略。
 ///
 /// 每次调用使用唯一的 `.tmp.<pid>.<counter>` 和 `.bak.<pid>.<counter>`

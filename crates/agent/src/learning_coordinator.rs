@@ -178,13 +178,13 @@ impl LearningCoordinator {
         } else if skill_due {
             "skill_nudge".to_string()
         } else {
-            self.throttle.review_completed(); // rollback — no nudge due
+            self.throttle.cancel_review(); // rollback — no nudge due
             return existing_action.cloned().unwrap_or(LearningAction::Skip);
         };
 
         if self.dedup.is_duplicate(&dedup_key) {
             // Counters NOT reset — next turn will still see the same counts
-            self.throttle.review_completed(); // rollback — dedup blocked
+            self.throttle.cancel_review(); // rollback — dedup blocked
             return existing_action.cloned().unwrap_or(LearningAction::Skip);
         }
 
@@ -224,7 +224,7 @@ impl LearningCoordinator {
                 },
             }
         } else {
-            self.throttle.review_completed(); // rollback — no nudge due after actual check
+            self.throttle.cancel_review(); // rollback — no nudge due after actual check
             return existing_action.cloned().unwrap_or(LearningAction::Skip);
         };
 
@@ -281,12 +281,12 @@ impl LearningCoordinator {
         let memory_due = memory_nudge != NudgeResult::NoNudge && has_memory_store;
 
         if !memory_due {
-            self.throttle.review_completed(); // rollback the try_start_review increment
+            self.throttle.cancel_review(); // rollback the try_start_review increment
             return None;
         }
 
         if self.dedup.is_duplicate("memory_nudge") {
-            self.throttle.review_completed(); // rollback the try_start_review increment
+            self.throttle.cancel_review(); // rollback the try_start_review increment
             return None;
         }
 
@@ -329,7 +329,7 @@ impl LearningCoordinator {
 
         if !skill_due {
             if !existing_memory {
-                self.throttle.review_completed(); // rollback only if we reserved a slot
+                self.throttle.cancel_review(); // rollback only if we reserved a slot
             }
             return None;
         }
@@ -342,7 +342,7 @@ impl LearningCoordinator {
 
         if self.dedup.is_duplicate(dedup_key) {
             if !existing_memory {
-                self.throttle.review_completed(); // rollback only if we reserved a slot
+                self.throttle.cancel_review(); // rollback only if we reserved a slot
             }
             return None;
         }

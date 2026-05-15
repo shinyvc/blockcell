@@ -17,6 +17,7 @@ use blockcell_agent::forked::{
     create_dream_can_use_tool, run_forked_agent, CacheSafeParams, ForkedAgentParams,
 };
 use blockcell_agent::memory_event;
+use blockcell_agent::CrossProcessLock;
 use blockcell_core::types::ChatMessage;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -64,17 +65,25 @@ struct MemoryDirState {
 }
 
 /// 梦境状态
+///
+/// 字段必须添加 `#[serde(default)]` 以保证向后兼容：
+/// 当新增字段时，旧版 .dream_state.json 文件仍能正确反序列化。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DreamState {
     /// 上次整合时间戳
+    #[serde(default)]
     pub last_consolidation_time: Option<u64>,
     /// 上次整合时的会话数
+    #[serde(default)]
     pub last_session_count: usize,
     /// 当前会话数
+    #[serde(default)]
     pub current_session_count: usize,
     /// 整合次数
+    #[serde(default)]
     pub consolidation_count: usize,
     /// 是否正在整合
+    #[serde(default)]
     pub is_consolidating: bool,
 }
 
@@ -97,16 +106,104 @@ impl DreamState {
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 主文件不存在，尝试从 atomic_write 产生的备份恢复
+                // 备份文件名格式为 .dream_state.json.bak.<pid>.<counter>
+                let bak_path = blockcell_agent::fs_util::find_latest_backup(&path);
+                if let Some(bak) = bak_path {
+                    tracing::warn!(
+                        path = %path.display(),
+                        bak = %bak.display(),
+                        "[dream] 主文件不存在但发现备份文件，尝试恢复"
+                    );
+                    match fs::read_to_string(&bak).await {
+                        Ok(bak_content) => {
+                            match serde_json::from_str(&bak_content) {
+                                Ok(state) => {
+                                    // 恢复成功：将备份内容写入主文件
+                                    let write_content = serde_json::to_string_pretty(&state)?;
+                                    tokio::task::spawn_blocking(move || {
+                                        blockcell_agent::fs_util::atomic_write(
+                                            &path,
+                                            write_content.as_bytes(),
+                                        )
+                                    })
+                                    .await
+                                    .map_err(|e| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::Other,
+                                            e.to_string(),
+                                        )
+                                    })?
+                                    .map_err(|e| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::Other,
+                                            e.to_string(),
+                                        )
+                                    })?;
+                                    tracing::info!("[dream] 从备份文件恢复成功");
+                                    Ok(state)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "[dream] 解析备份文件失败，使用默认值");
+                                    Ok(Self::default())
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            tracing::warn!("[dream] 读取备份文件失败，使用默认值");
+                            Ok(Self::default())
+                        }
+                    }
+                } else {
+                    Ok(Self::default())
+                }
+            }
             Err(e) => Err(e),
         }
     }
 
-    /// 保存状态
+    /// 保存状态（原子写入 + 跨进程锁，防止并发写入和崩溃导致文件损坏）
+    ///
+    /// 使用与 agent 侧 `increment_dream_session_count()` 相同的锁文件
+    /// `.dream_state.json.lock`，确保 scheduler 和 agent 的 read-modify-write
+    /// 序列互斥，避免 TOCTOU 竞争导致计数丢失。
     pub async fn save(&self, config_dir: &Path) -> std::io::Result<()> {
+        let lock_path = config_dir
+            .join(DREAM_STATE_FILE)
+            .with_extension("json.lock");
+        let _lock_guard = match CrossProcessLock::acquire(&lock_path) {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "[dream] 获取跨进程锁失败，继续非原子保存"
+                );
+                // Fallback: proceed without lock (best-effort)
+                let path = config_dir.join(DREAM_STATE_FILE);
+                let content = serde_json::to_string_pretty(self)?;
+                let write_result = tokio::task::spawn_blocking(move || {
+                    blockcell_agent::fs_util::atomic_write(&path, content.as_bytes())
+                })
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                write_result
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                return Ok(());
+            }
+        };
+
         let path = config_dir.join(DREAM_STATE_FILE);
         let content = serde_json::to_string_pretty(self)?;
-        fs::write(&path, content).await
+        // 使用 blockcell_agent::fs_util::atomic_write 保证原子性
+        // （backup-based 策略，Windows 安全）
+        let write_result = tokio::task::spawn_blocking(move || {
+            blockcell_agent::fs_util::atomic_write(&path, content.as_bytes())
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        write_result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
     }
 
     /// 增加会话计数
@@ -1268,5 +1365,60 @@ mod tests {
         assert_eq!(SESSION_GATE_THRESHOLD, 5);
         assert_eq!(SESSION_MEMORY_EXPIRY_DAYS, 7);
         assert_eq!(MAX_SESSIONS_TO_PROCESS, 10);
+    }
+
+    /// 测试：DreamState 与 agent 侧 DreamStateData 的 JSON schema 一致性
+    ///
+    /// 验证两个独立定义的结构体序列化/反序列化结果完全一致，
+    /// 防止字段名、类型或 serde 属性不匹配导致跨 crate 数据丢失。
+    /// 长期方案：将共享结构体移至 blockcell-core crate。
+    #[test]
+    fn test_dream_state_schema_consistency_with_agent_side() {
+        use blockcell_agent::dream_state::DreamStateData;
+
+        // 构造一个包含所有字段的完整实例
+        let scheduler_state = DreamState {
+            last_consolidation_time: Some(1234567890),
+            last_session_count: 10,
+            current_session_count: 15,
+            consolidation_count: 3,
+            is_consolidating: true,
+        };
+
+        // 序列化 scheduler 侧结构体
+        let scheduler_json = serde_json::to_value(&scheduler_state).unwrap();
+
+        // 用 agent 侧结构体反序列化
+        let agent_state: DreamStateData = serde_json::from_value(scheduler_json.clone()).unwrap();
+
+        // 验证所有字段值一致
+        assert_eq!(agent_state.last_consolidation_time, Some(1234567890u64));
+        assert_eq!(agent_state.last_session_count, 10);
+        assert_eq!(agent_state.current_session_count, 15);
+        assert_eq!(agent_state.consolidation_count, 3);
+        assert!(agent_state.is_consolidating);
+
+        // 反向：用 agent 侧结构体序列化，scheduler 侧反序列化
+        let agent_json = serde_json::to_value(&agent_state).unwrap();
+        let restored: DreamState = serde_json::from_value(agent_json.clone()).unwrap();
+        assert_eq!(restored.last_consolidation_time, Some(1234567890));
+        assert_eq!(restored.last_session_count, 10);
+        assert_eq!(restored.current_session_count, 15);
+        assert_eq!(restored.consolidation_count, 3);
+        assert!(restored.is_consolidating);
+
+        // 验证 JSON key 集合完全一致
+        let scheduler_keys: std::collections::BTreeSet<String> = scheduler_json
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let agent_keys: std::collections::BTreeSet<String> =
+            agent_json.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            scheduler_keys, agent_keys,
+            "scheduler 和 agent 侧 DreamState 的 JSON key 集合不一致"
+        );
     }
 }
