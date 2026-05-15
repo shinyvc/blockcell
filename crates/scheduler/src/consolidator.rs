@@ -639,6 +639,10 @@ impl DreamConsolidator {
         let mut entries = fs::read_dir(&sessions_dir).await?;
 
         while let Some(entry) = entries.next_entry().await? {
+            // 跳过非目录条目（如 .DS_Store）
+            if entry.file_type().await.map(|t| !t.is_dir()).unwrap_or(true) {
+                continue;
+            }
             let memory_file = entry.path().join("memory.md");
             if fs::try_exists(&memory_file).await? {
                 if let Ok(metadata) = fs::metadata(&memory_file).await {
@@ -923,6 +927,10 @@ impl DreamConsolidator {
         let mut skipped_active = 0;
 
         while let Some(entry) = entries.next_entry().await? {
+            // 跳过非目录条目（如 .DS_Store）
+            if entry.file_type().await.map(|t| !t.is_dir()).unwrap_or(true) {
+                continue;
+            }
             let session_dir = entry.path();
 
             // 检查是否为活跃会话
