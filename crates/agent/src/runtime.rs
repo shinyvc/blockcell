@@ -3487,6 +3487,7 @@ impl AgentRuntime {
         history: &[ChatMessage],
         final_response: &str,
         tool_call_counts: &HashMap<String, u32>,
+        success: bool,
     ) -> Result<Option<String>> {
         if !self.ghost_learning_enabled()
             || matches!(
@@ -3512,7 +3513,7 @@ impl AgentRuntime {
             memory_write_count: 0,
             correction_count: Self::detect_correction_signal_count(&msg.content),
             preference_correction_count: Self::detect_preference_correction_count(&msg.content),
-            success: true,
+            success,
             complexity_score: estimate_turn_complexity_score(&msg.content),
             reusable_lesson: None,
         };
@@ -6659,6 +6660,7 @@ impl AgentRuntime {
             &history,
             &final_response,
             &tool_call_counts,
+            !llm_failed_after_retries,
         ) {
             Ok(episode_id) => episode_id,
             Err(e) => {
@@ -8589,6 +8591,7 @@ fn capture_delegation_end_learning_boundary_with_config(
     task_id: Option<&str>,
     task_goal: &str,
     child_summary: &str,
+    success: bool,
 ) -> Result<Option<String>> {
     let task_goal = task_goal.trim();
     let child_summary = child_summary.trim();
@@ -8627,7 +8630,7 @@ fn capture_delegation_end_learning_boundary_with_config(
         memory_write_count: 0,
         correction_count: 0,
         preference_correction_count: 0,
-        success: true,
+        success,
         complexity_score: estimate_turn_complexity_score(task_goal),
         reusable_lesson: Some(truncate_str(child_summary, 240)),
     };
@@ -8675,6 +8678,7 @@ impl AgentRuntime {
             None,
             task_goal,
             child_summary,
+            true,
         )
     }
 }
@@ -9756,9 +9760,15 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
                     .await
                     .map_err(|e| blockcell_core::Error::Tool(format!("Fork failed: {}", e)))?;
 
-                Ok(result
+                // 如果工具结果被截断，追加提示让用户知道
+                let mut content = result
                     .final_content
-                    .unwrap_or_else(|| "Fork completed with no output".to_string()))
+                    .unwrap_or_else(|| "Fork completed with no output".to_string());
+                if result.truncated {
+                    tracing::warn!("[fork] 工具结果被截断，可能丢失部分信息");
+                    content.push_str("\n\n[注意: 结果因长度限制被截断，可能丢失部分信息]");
+                }
+                Ok(content)
             }),
         )
         .await
@@ -10224,6 +10234,7 @@ async fn run_subagent_task(
                 Some(&task_id),
                 &task_str,
                 &result,
+                true,
             ) {
                 warn!(
                     task_id = %task_id,
@@ -10252,6 +10263,24 @@ async fn run_subagent_task(
             let err_msg = format!("{}", e);
             task_manager.set_failed(&task_id, &err_msg).await;
             error!(task_id = %task_id, error = %e, "Subagent failed");
+
+            // 失败的 delegation 也是重要的学习机会
+            if let Err(ghost_err) = capture_delegation_end_learning_boundary_with_config(
+                &learning_config,
+                &learning_paths,
+                &origin_channel,
+                &origin_chat_id,
+                Some(&task_id),
+                &task_str,
+                &err_msg,
+                false,
+            ) {
+                warn!(
+                    task_id = %task_id,
+                    error = %ghost_err,
+                    "Failed to persist delegation-end ghost learning episode (failure case)"
+                );
+            }
 
             let short_id = truncate_str(&task_id, 8);
             let failure_message = format!(

@@ -269,23 +269,36 @@ impl LearningCoordinator {
         if !self.self_improve_review_enabled {
             return None;
         }
-        // Atomically check throttle + increment counter
+
+        // 先用只读判断检查阈值和资源可用性，避免阈值已到但资源不可用时消耗计数器
+        {
+            let engine = self.nudge_engine.lock().unwrap_or_else(recover_mutex);
+            if !engine.would_memory_nudge() || !has_memory_store {
+                return None;
+            }
+        }
+
+        // throttle 检查必须在 dedup 写入之前完成，
+        // 否则 throttle 失败时 dedup 已写入，导致后续同类 nudge 被误判重复
         if !self.throttle.try_start_review() {
             return None;
         }
+
+        // dedup 只读检查：如果 key 已存在，rollback throttle 并返回
+        if self.dedup.contains_recent("memory_nudge") {
+            self.throttle.cancel_review();
+            return None;
+        }
+
+        // throttle 和 dedup 都通过，确认 review 会启动，现在写入 dedup 记录
+        self.dedup.record("memory_nudge");
 
         let mut engine = self.nudge_engine.lock().unwrap_or_else(recover_mutex);
         // Capture count before check resets it
         let turns_before = engine.turns_since_memory();
         let memory_nudge = engine.check_memory_nudge();
-        let memory_due = memory_nudge != NudgeResult::NoNudge && has_memory_store;
 
-        if !memory_due {
-            self.throttle.cancel_review(); // rollback the try_start_review increment
-            return None;
-        }
-
-        if self.dedup.is_duplicate("memory_nudge") {
+        if memory_nudge == NudgeResult::NoNudge {
             self.throttle.cancel_review(); // rollback the try_start_review increment
             return None;
         }
@@ -312,35 +325,47 @@ impl LearningCoordinator {
         if !self.self_improve_review_enabled {
             return None;
         }
+
+        // 先用只读判断检查阈值和资源可用性，避免阈值已到但资源不可用时消耗计数器
+        {
+            let engine = self.nudge_engine.lock().unwrap_or_else(recover_mutex);
+            if !engine.would_skill_nudge() || !has_skill_tool {
+                return None;
+            }
+        }
+
+        // throttle 检查必须在 dedup 写入之前完成，
+        // 否则 throttle 失败时 dedup 已写入，导致后续同类 nudge 被误判重复
         // Only reserve a new throttle slot if no memory review is already pending.
         // If existing_memory is true, the caller's memory slot covers this review too.
         if !existing_memory {
-            // Atomically check throttle + increment counter
             if !self.throttle.try_start_review() {
                 return None;
             }
         }
 
-        let mut engine = self.nudge_engine.lock().unwrap_or_else(recover_mutex);
-        // Capture count before check resets it
-        let iterations_before = engine.iterations_since_skill();
-        let skill_nudge = engine.check_skill_nudge();
-        let skill_due = skill_nudge != NudgeResult::NoNudge && has_skill_tool;
-
-        if !skill_due {
-            if !existing_memory {
-                self.throttle.cancel_review(); // rollback only if we reserved a slot
-            }
-            return None;
-        }
-
+        // dedup 只读检查：如果 key 已存在，rollback throttle 并返回
         let dedup_key = if existing_memory {
             "combined_nudge"
         } else {
             "skill_nudge"
         };
+        if self.dedup.contains_recent(dedup_key) {
+            if !existing_memory {
+                self.throttle.cancel_review();
+            }
+            return None;
+        }
 
-        if self.dedup.is_duplicate(dedup_key) {
+        // throttle 和 dedup 都通过，确认 review 会启动，现在写入 dedup 记录
+        self.dedup.record(dedup_key);
+
+        let mut engine = self.nudge_engine.lock().unwrap_or_else(recover_mutex);
+        // Capture count before check resets it
+        let iterations_before = engine.iterations_since_skill();
+        let skill_nudge = engine.check_skill_nudge();
+
+        if skill_nudge == NudgeResult::NoNudge {
             if !existing_memory {
                 self.throttle.cancel_review(); // rollback only if we reserved a slot
             }

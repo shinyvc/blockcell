@@ -29,6 +29,9 @@ pub struct DreamStateData {
     /// 是否正在整合中
     #[serde(default)]
     pub is_consolidating: bool,
+    /// 整合开始时间戳（Unix 秒），用于 stale 检测
+    #[serde(default)]
+    pub consolidating_started_at: Option<u64>,
 }
 
 /// 获取 .dream_state.json 文件路径
@@ -168,6 +171,7 @@ mod tests {
             current_session_count: 15,
             consolidation_count: 3,
             is_consolidating: false,
+            consolidating_started_at: Some(1234567800),
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
         let restored: DreamStateData = serde_json::from_str(&json).unwrap();
@@ -176,9 +180,13 @@ mod tests {
         assert_eq!(restored.current_session_count, 15);
         assert_eq!(restored.consolidation_count, 3);
         assert!(!restored.is_consolidating);
+        assert_eq!(restored.consolidating_started_at, Some(1234567800));
     }
 
     /// 测试：崩溃恢复 — 主文件不存在但备份文件存在时恢复
+    ///
+    /// 创建 `.dream_state.json.bak.<pid>.<counter>` 格式的备份文件，
+    /// 与 `find_latest_backup()` 的查找前缀匹配。
     #[tokio::test]
     async fn test_dream_state_crash_recovery_from_backup() {
         let tmp = std::env::temp_dir().join("test_dream_state_crash_recovery");
@@ -194,12 +202,15 @@ mod tests {
         };
         write_dream_state(&tmp, &state).await.unwrap();
 
-        // 模拟崩溃：删除主文件，保留备份
+        // 模拟崩溃：创建正确格式的备份文件，删除主文件
         let main_path = tmp.join(".dream_state.json");
-        let bak_path = tmp.join(".dream_state.json.bak");
-
-        // 复制主文件内容到备份
+        // 使用 atomic_write 产生备份（Windows 上会自动产生 .bak.* 文件）
+        // 在所有平台上，手动创建一个 .bak.<pid>.<counter> 格式的备份文件
         let main_content = std::fs::read_to_string(&main_path).unwrap();
+        let bak_path = tmp.join(format!(
+            ".dream_state.json.bak.{}.0",
+            std::process::id()
+        ));
         std::fs::write(&bak_path, &main_content).unwrap();
         // 删除主文件
         std::fs::remove_file(&main_path).unwrap();

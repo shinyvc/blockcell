@@ -13,10 +13,24 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
 }
 
 /// 生成唯一的备份文件路径: `<original>.bak.<pid>.<counter>`
+///
+/// 使用追加方式而非 `with_extension`，确保对 `.dream_state.json` 等多扩展名文件
+/// 生成 `.dream_state.json.bak.<pid>.<counter>` 而非 `.dream_state.bak.<pid>.<counter>`。
 fn unique_bak_path(path: &Path) -> PathBuf {
     let pid = std::process::id();
     let counter = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    path.with_extension(format!("bak.{pid}.{counter}"))
+    // 追加 .bak.<pid>.<counter> 到完整文件名，而非替换扩展名
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    let bak_name = format!("{file_name}.bak.{pid}.{counter}");
+    path.with_file_name(bak_name)
+}
+
+/// 生成备份文件名前缀，供 `find_latest_backup` 使用。
+///
+/// 与 `unique_bak_path` 共用同一命名逻辑，确保查找和生成使用相同的命名格式。
+fn bak_prefix_for(path: &Path) -> String {
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    format!("{file_name}.bak.")
 }
 
 /// 查找 `atomic_write` 产生的最新备份文件。
@@ -28,10 +42,10 @@ fn unique_bak_path(path: &Path) -> PathBuf {
 /// 用于崩溃恢复：当主文件不存在但存在备份时，找到最新的备份来恢复数据。
 pub fn find_latest_backup(original_path: &Path) -> Option<PathBuf> {
     let dir = original_path.parent()?;
-    let file_name = original_path.file_name().and_then(|n| n.to_str())?;
 
-    // 构造备份文件名前缀：例如 ".dream_state.json" -> ".dream_state.json.bak."
-    let bak_prefix = format!("{file_name}.bak.");
+    // 使用与 unique_bak_path 相同的命名逻辑构造前缀
+    // 例如 ".dream_state.json" -> ".dream_state.json.bak."
+    let bak_prefix = bak_prefix_for(original_path);
 
     let mut latest: Option<(PathBuf, std::time::SystemTime)> = None;
     for entry in std::fs::read_dir(dir).ok()? {

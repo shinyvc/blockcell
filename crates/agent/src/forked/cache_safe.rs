@@ -176,7 +176,8 @@ impl CacheSafeParams {
         if self.system_context != other.system_context {
             return false;
         }
-        // fork 上下文消息必须匹配（ChatMessage 无 PartialEq，通过序列化比较）
+        // fork 上下文消息必须匹配（ChatMessage 无 PartialEq，通过规范化序列化比较）
+        // 比较所有字段：role、content、reasoning_content、tool_calls、tool_call_id、name、id
         if self.fork_context_messages.len() != other.fork_context_messages.len() {
             return false;
         }
@@ -185,7 +186,10 @@ impl CacheSafeParams {
             .iter()
             .zip(other.fork_context_messages.iter())
         {
-            if left.role != right.role || left.content != right.content {
+            // 序列化比较确保所有字段一致，避免仅比较 role/content 遗漏差异
+            let left_json = serde_json::to_string(left).ok();
+            let right_json = serde_json::to_string(right).ok();
+            if left_json != right_json {
                 return false;
             }
         }

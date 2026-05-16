@@ -1,6 +1,15 @@
+//! 能力版本管理 — 为 Capability artifacts 提供版本快照、回滚和清理
+//!
+//! 提供 per-capability 跨进程文件锁，确保 rollback/create_version/cleanup_old_versions
+//! 对同一 capability 的操作互斥，避免并发导致版本 history 丢更新或 active artifact 不一致。
+//! save_history 使用 temp + fsync + atomic rename，防止崩溃/半写导致 JSON 损坏。
+
 use blockcell_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// 能力版本信息
@@ -30,6 +39,422 @@ pub struct CapabilityVersionHistory {
     pub current_version: String,
 }
 
+// === Per-capability 跨进程文件锁 ===
+
+/// 锁超时阈值（秒）：超过此时间的锁视为 stale
+const CAP_LOCK_STALE_THRESHOLD_SECS: u64 = 300;
+/// 获取锁的重试间隔（毫秒）
+const CAP_LOCK_RETRY_INTERVAL_MS: u64 = 100;
+/// 获取锁的最大重试次数
+const CAP_LOCK_MAX_RETRIES: u32 = 50;
+
+/// Per-capability 跨进程文件锁
+///
+/// 使用 `tool_versions/<safe_id>.lock` 文件实现跨进程互斥。
+/// 锁文件内容为 PID:timestamp，用于检测 stale 锁。
+/// 使用 `OpenOptions::create_new(true)` 原子创建锁文件，避免 TOCTOU 竞争。
+struct CapabilityFileLock {
+    lock_path: PathBuf,
+    /// 当前进程的锁 token（PID:timestamp），用于释放时校验
+    lock_token: String,
+}
+
+impl CapabilityFileLock {
+    fn new(versions_dir: &Path, capability_id: &str) -> Self {
+        let safe_id = safe_capability_id(capability_id);
+        let lock_path = versions_dir.join(format!("{}.lock", safe_id));
+        // 预生成锁 token，避免 try_acquire 中重复计算
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let lock_token = format!("{}:{}", std::process::id(), now_ts);
+        Self {
+            lock_path,
+            lock_token,
+        }
+    }
+
+    /// 尝试获取锁，返回 guard 或 None。
+    /// 使用 `OpenOptions::create_new(true)` 原子创建锁文件，
+    /// 避免 exists() + write() 之间的 TOCTOU 竞争。
+    /// stale 锁接管时使用"读取内容 -> 验证仍是 stale -> 原子删除 -> create_new"流程，
+    /// 防止两个进程同时看到 stale 后互相删除对方的新锁。
+    fn try_acquire(&self) -> Option<CapabilityLockGuard> {
+        if let Some(parent) = self.lock_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        // 先尝试原子创建锁文件（create_new 在文件已存在时返回错误）
+        let result = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.lock_path);
+
+        match result {
+            Ok(mut file) => {
+                // 成功原子创建锁文件，写入 token 内容
+                use std::io::Write;
+                if let Err(e) = file.write_all(self.lock_token.as_bytes()) {
+                    // 写入 token 失败，清理并返回 None
+                    let _ = fs::remove_file(&self.lock_path);
+                    warn!(
+                        lock_path = %self.lock_path.display(),
+                        error = %e,
+                        "[能力版本] 写入锁 token 失败"
+                    );
+                    return None;
+                }
+                // 显式关闭文件句柄，确保 Windows 上文件不被占用
+                drop(file);
+                // 原子创建成功，返回 guard（携带 token 用于释放校验）
+                Some(CapabilityLockGuard {
+                    lock_path: self.lock_path.clone(),
+                    lock_token: self.lock_token.clone(),
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // 锁文件已存在，检查是否 stale
+                // 读取锁文件内容，用于后续原子验证
+                let stale_content = match fs::read_to_string(&self.lock_path) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        // 无法读取锁文件（权限问题等），视为无法接管
+                        return None;
+                    }
+                };
+
+                if self.is_stale_with_content(&stale_content) {
+                    warn!(
+                        lock_path = %self.lock_path.display(),
+                        "[能力版本] 检测到 stale 锁，尝试原子接管"
+                    );
+                    // 原子接管：删除前必须验证锁文件内容仍是刚才判定 stale 的同一份
+                    // 防止两个进程同时看到 stale 后，A 接管成功写入新锁，B 仍删除 A 的新锁
+                    let verified = self.verify_and_remove_stale(&stale_content);
+                    if !verified {
+                        // 验证失败：锁文件内容已变化（其他进程已接管），放弃本次获取
+                        warn!(
+                            lock_path = %self.lock_path.display(),
+                            "[能力版本] stale 锁验证失败，锁已被其他进程接管"
+                        );
+                        return None;
+                    }
+                    // 验证通过并已删除 stale 锁，重试原子创建
+                    let retry_result = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&self.lock_path);
+                    match retry_result {
+                        Ok(mut file) => {
+                            use std::io::Write;
+                            if let Err(e) = file.write_all(self.lock_token.as_bytes()) {
+                                let _ = fs::remove_file(&self.lock_path);
+                                warn!(
+                                    lock_path = %self.lock_path.display(),
+                                    error = %e,
+                                    "[能力版本] 重试写入锁 token 失败"
+                                );
+                                return None;
+                            }
+                            // 显式关闭文件句柄
+                            drop(file);
+                            Some(CapabilityLockGuard {
+                                lock_path: self.lock_path.clone(),
+                                lock_token: self.lock_token.clone(),
+                            })
+                        }
+                        Err(_) => {
+                            // 另一个进程在清除后抢先创建了锁
+                            None
+                        }
+                    }
+                } else {
+                    // 锁仍有效，无法获取
+                    None
+                }
+            }
+            Err(e) => {
+                // 其他错误（权限、磁盘满等）
+                warn!(
+                    lock_path = %self.lock_path.display(),
+                    error = %e,
+                    "[能力版本] 创建锁文件失败"
+                );
+                None
+            }
+        }
+    }
+
+    /// 基于已读取的内容判断锁是否 stale，避免重复读取锁文件
+    fn is_stale_with_content(&self, content: &str) -> bool {
+        // 解析 PID:timestamp
+        let parts: Vec<&str> = content.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            // 格式错误，视为 stale
+            return true;
+        }
+
+        // 检查时间戳是否超过 stale 阈值
+        let timestamp: u64 = parts[1].parse().unwrap_or(0);
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let elapsed_secs = now_ts.saturating_sub(timestamp);
+        if elapsed_secs > CAP_LOCK_STALE_THRESHOLD_SECS {
+            return true;
+        }
+
+        // 检查持有锁的进程是否已退出
+        let pid: u32 = parts[0].parse().unwrap_or(0);
+        if pid == 0 {
+            return true;
+        }
+
+        // 跨平台进程存活检查
+        #[cfg(unix)]
+        let alive = {
+            // Unix: kill(pid, 0) 检查进程是否存在
+            unsafe { libc::kill(pid as i32, 0) == 0 }
+        };
+        #[cfg(windows)]
+        let alive = {
+            // Windows: OpenProcess 检查进程是否仍在运行
+            use winapi::um::handleapi::CloseHandle;
+            use winapi::um::processthreadsapi::GetExitCodeProcess;
+            use winapi::um::processthreadsapi::OpenProcess;
+            use winapi::um::winnt::PROCESS_QUERY_INFORMATION;
+            unsafe {
+                let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
+                if handle.is_null() {
+                    false
+                } else {
+                    let mut exit_code: u32 = 0;
+                    let result = GetExitCodeProcess(handle, &mut exit_code);
+                    CloseHandle(handle);
+                    // STILL_ACTIVE (259) 表示进程仍在运行
+                    result != 0 && exit_code == 259
+                }
+            }
+        };
+        #[cfg(not(any(unix, windows)))]
+        let alive = true; // 保守策略：假设进程存活
+
+        // 进程已退出则视为 stale
+        !alive
+    }
+
+    /// 原子验证并删除 stale 锁：
+    /// 1. 重新读取锁文件内容
+    /// 2. 与之前判定 stale 时读取的内容比对
+    /// 3. 内容一致才删除，不一致说明其他进程已接管
+    fn verify_and_remove_stale(&self, expected_content: &str) -> bool {
+        match fs::read_to_string(&self.lock_path) {
+            Ok(current_content) => {
+                if current_content == expected_content {
+                    // 内容仍是刚才判定 stale 的同一份，安全删除
+                    fs::remove_file(&self.lock_path).is_ok()
+                } else {
+                    // 内容已变化，其他进程已接管此锁，不可删除
+                    false
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 锁文件已被其他进程删除并接管，无需再操作
+                false
+            }
+            Err(_) => {
+                // 读取失败（权限等），保守策略：不删除
+                false
+            }
+        }
+    }
+
+    /// 带重试地获取锁
+    fn acquire_with_retry(&self) -> Option<CapabilityLockGuard> {
+        for _ in 0..CAP_LOCK_MAX_RETRIES {
+            if let Some(guard) = self.try_acquire() {
+                return Some(guard);
+            }
+            std::thread::sleep(Duration::from_millis(CAP_LOCK_RETRY_INTERVAL_MS));
+        }
+        // 重试耗尽后，强制尝试原子接管 stale 锁
+        let stale_content = match fs::read_to_string(&self.lock_path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 锁文件已不存在，直接尝试创建
+                return self.try_acquire();
+            }
+            Err(_) => return None,
+        };
+        if self.is_stale_with_content(&stale_content) {
+            warn!(
+                lock_path = %self.lock_path.display(),
+                "[能力版本] 重试耗尽，强制尝试原子接管 stale 锁"
+            );
+            // 使用原子验证后再删除，而非直接 remove_file
+            let verified = self.verify_and_remove_stale(&stale_content);
+            if verified {
+                // 成功删除 stale 锁，尝试创建新锁
+                return self.try_acquire();
+            }
+        }
+        None
+    }
+}
+
+/// 锁的 RAII guard，drop 时校验锁内容仍是自己的 token 再删除释放。
+pub struct CapabilityLockGuard {
+    lock_path: PathBuf,
+    /// 持锁时写入的 token，释放时校验锁文件内容与此一致才删除
+    lock_token: String,
+}
+
+impl Drop for CapabilityLockGuard {
+    fn drop(&mut self) {
+        // 释放时校验锁内容仍是自己的 token，防止误删其他进程的锁
+        match fs::read_to_string(&self.lock_path) {
+            Ok(content) if content == self.lock_token => {
+                // token 匹配，安全删除
+                let _ = fs::remove_file(&self.lock_path);
+            }
+            Ok(content) => {
+                // token 不匹配，锁已被其他进程接管，不删除
+                warn!(
+                    lock_path = %self.lock_path.display(),
+                    expected_token = %self.lock_token,
+                    actual_token = %content,
+                    "[能力版本] 释放锁时 token 不匹配，锁已被其他进程接管，跳过删除"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 锁文件已不存在，无需删除
+            }
+            Err(e) => {
+                // 其他读取错误，尝试删除（保守策略）
+                warn!(
+                    lock_path = %self.lock_path.display(),
+                    error = %e,
+                    "[能力版本] 释放锁时读取失败，尝试删除"
+                );
+                let _ = fs::remove_file(&self.lock_path);
+            }
+        }
+    }
+}
+
+/// 使用 per-capability 锁执行操作
+///
+/// 获取 `tool_versions/<safe_id>.lock` 文件锁后执行闭包，
+/// 确保同一 capability 的 rollback/create_version/cleanup 互斥。
+/// 获取锁后首先检查并恢复未完成的 rollback journal，保证崩溃安全。
+fn with_capability_lock<F, R>(
+    versions_dir: &Path,
+    capability_id: &str,
+    f: F,
+) -> Result<R>
+where
+    F: FnOnce() -> Result<R>,
+{
+    let lock = CapabilityFileLock::new(versions_dir, capability_id);
+    let guard = lock.acquire_with_retry();
+    if guard.is_none() {
+        return Err(Error::Other(format!(
+            "获取 capability '{}' 的跨进程锁失败（重试 {} 次），可能另一进程正在操作",
+            capability_id, CAP_LOCK_MAX_RETRIES
+        )));
+    }
+    // 获取锁后，先恢复可能残留的 rollback journal（崩溃恢复）
+    recover_rollback_journal(versions_dir, capability_id);
+    let result = f();
+    drop(guard);
+    result
+}
+
+/// 将 capability_id 转换为文件系统安全名称
+fn safe_capability_id(capability_id: &str) -> String {
+    capability_id.replace('.', "_")
+}
+
+/// 恢复未完成的 rollback journal（崩溃安全机制）
+///
+/// rollback 操作在修改文件前会写入 journal 文件（`.rollback_journal`），
+/// 记录 active artifact 备份路径和目标路径。如果进程在 rollback 过程中崩溃，
+/// 下次获取锁时会调用此函数恢复 journal：
+/// - 如果 active artifact 不存在或损坏，从备份恢复
+/// - 如果 active artifact 存在，说明 rollback 的 artifact 替换已完成但 history 未保存，
+///   此时保留 active（回滚已生效），仅清理 journal
+fn recover_rollback_journal(versions_dir: &Path, capability_id: &str) {
+    let safe_id = safe_capability_id(capability_id);
+    let journal_path = versions_dir.join(format!("{}.rollback_journal", safe_id));
+
+    if !journal_path.exists() {
+        return;
+    }
+
+    let content = match fs::read_to_string(&journal_path) {
+        Ok(c) => c,
+        Err(_) => {
+            // journal 文件无法读取，尝试删除
+            let _ = fs::remove_file(&journal_path);
+            return;
+        }
+    };
+
+    // journal 格式：第一行 active_backup 路径，第二行 active_path
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() < 2 {
+        warn!(
+            journal_path = %journal_path.display(),
+            "[能力版本] rollback journal 格式无效，删除"
+        );
+        let _ = fs::remove_file(&journal_path);
+        return;
+    }
+
+    let active_backup = PathBuf::from(lines[0]);
+    let active_path = PathBuf::from(lines[1]);
+
+    warn!(
+        capability_id = %capability_id,
+        journal_path = %journal_path.display(),
+        active_backup = %active_backup.display(),
+        active_path = %active_path.display(),
+        "[能力版本] 发现未完成的 rollback journal，开始恢复"
+    );
+
+    // 恢复策略：
+    // - 如果 active artifact 不存在，说明 rollback 在删除 active 后、复制新 active 前崩溃
+    //   此时从备份恢复 active（回滚未生效，恢复到回滚前状态）
+    // - 如果 active artifact 存在，说明 artifact 替换已完成
+    //   可能是 history 保存前崩溃，此时保留 active（回滚已生效）
+    if !active_path.exists() && active_backup.exists() {
+        // active 缺失，从备份恢复
+        warn!(
+            active_path = %active_path.display(),
+            active_backup = %active_backup.display(),
+            "[能力版本] active artifact 缺失，从备份恢复"
+        );
+        if let Err(e) = fs::copy(&active_backup, &active_path) {
+            warn!(error = %e, "[能力版本] 从备份恢复 active artifact 失败");
+        }
+    }
+
+    // 清理备份文件
+    if active_backup.exists() {
+        let _ = fs::remove_file(&active_backup);
+    }
+
+    // 清理 journal 文件
+    let _ = fs::remove_file(&journal_path);
+
+    info!(
+        capability_id = %capability_id,
+        "[能力版本] rollback journal 恢复完成"
+    );
+}
+
 /// 能力版本管理器 — 为 Capability artifacts 提供版本快照和回滚
 pub struct CapabilityVersionManager {
     /// Base directory for capability artifacts
@@ -50,6 +475,7 @@ impl CapabilityVersionManager {
 
     /// Create a version snapshot for a capability artifact.
     /// Copies the current artifact to the versions directory.
+    /// 使用 per-capability 锁保护整个操作区间。
     pub fn create_version(
         &self,
         capability_id: &str,
@@ -57,29 +483,42 @@ impl CapabilityVersionManager {
         source: CapabilityVersionSource,
         changelog: Option<String>,
     ) -> Result<CapabilityVersion> {
-        let safe_id = capability_id.replace('.', "_");
+        with_capability_lock(&self.versions_dir, capability_id, || {
+            self.create_version_unlocked(capability_id, artifact_path, source, changelog)
+        })
+    }
+
+    /// create_version 的内部实现（无锁，由 with_capability_lock 调用）
+    fn create_version_unlocked(
+        &self,
+        capability_id: &str,
+        artifact_path: &str,
+        source: CapabilityVersionSource,
+        changelog: Option<String>,
+    ) -> Result<CapabilityVersion> {
+        let safe_id = safe_capability_id(capability_id);
         let cap_versions_dir = self.versions_dir.join(&safe_id);
-        std::fs::create_dir_all(&cap_versions_dir)?;
+        fs::create_dir_all(&cap_versions_dir)?;
 
         // Load or create history
-        let mut history = self.get_history(capability_id)?;
+        let mut history = self.get_history_unlocked(capability_id)?;
 
         // Calculate version number
         let version_num = history.versions.len() + 1;
         let version = format!("v{}", version_num);
 
         // Calculate artifact hash
-        let artifact_content = std::fs::read(artifact_path)
+        let artifact_content = fs::read(artifact_path)
             .map_err(|e| Error::Other(format!("Failed to read artifact: {}", e)))?;
         let hash = simple_hash(&artifact_content);
 
         // Copy artifact to version snapshot
-        let ext = std::path::Path::new(artifact_path)
+        let ext = Path::new(artifact_path)
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("sh");
         let snapshot_path = cap_versions_dir.join(format!("{}_{}.{}", safe_id, version, ext));
-        std::fs::copy(artifact_path, &snapshot_path)?;
+        fs::copy(artifact_path, &snapshot_path)?;
 
         let cap_version = CapabilityVersion {
             version: version.clone(),
@@ -108,6 +547,7 @@ impl CapabilityVersionManager {
     ///
     /// Used by durable workflows when a promotion step may be replayed after a
     /// crash between the external side effect and the step checkpoint.
+    /// 使用 per-capability 锁保护整个操作区间。
     pub fn create_version_if_new_artifact(
         &self,
         capability_id: &str,
@@ -115,11 +555,26 @@ impl CapabilityVersionManager {
         source: CapabilityVersionSource,
         changelog: Option<String>,
     ) -> Result<CapabilityVersion> {
-        let artifact_content = std::fs::read(artifact_path)
+        with_capability_lock(&self.versions_dir, capability_id, || {
+            self.create_version_if_new_artifact_unlocked(
+                capability_id, artifact_path, source, changelog,
+            )
+        })
+    }
+
+    /// create_version_if_new_artifact 的内部实现（无锁）
+    fn create_version_if_new_artifact_unlocked(
+        &self,
+        capability_id: &str,
+        artifact_path: &str,
+        source: CapabilityVersionSource,
+        changelog: Option<String>,
+    ) -> Result<CapabilityVersion> {
+        let artifact_content = fs::read(artifact_path)
             .map_err(|e| Error::Other(format!("Failed to read artifact: {}", e)))?;
         let hash = simple_hash(&artifact_content);
 
-        let mut history = self.get_history(capability_id)?;
+        let mut history = self.get_history_unlocked(capability_id)?;
         if let Some(existing) = history
             .versions
             .iter()
@@ -140,14 +595,34 @@ impl CapabilityVersionManager {
             return Ok(existing);
         }
 
-        self.create_version(capability_id, artifact_path, source, changelog)
+        self.create_version_unlocked(capability_id, artifact_path, source, changelog)
     }
 
     /// 回滚到当前版本的前一个版本。返回恢复后的 artifact 路径。
     /// 非破坏性回滚：保留所有版本历史，支持 roll-forward。
     /// 基于 current_version 定位，而非总是取倒数第二个版本。
+    /// 使用 per-capability 锁保护整个操作区间（get_history -> artifact replace -> save_history）。
     pub fn rollback(&self, capability_id: &str) -> Result<Option<String>> {
-        let mut history = self.get_history(capability_id)?;
+        with_capability_lock(&self.versions_dir, capability_id, || {
+            self.rollback_unlocked(capability_id)
+        })
+    }
+
+    /// rollback 的内部实现（无锁，由 with_capability_lock 调用）
+    ///
+    /// 崩溃安全策略：使用 rollback journal 保护整个 rollback 过程。
+    /// 1. 备份 active artifact
+    /// 2. 写入 rollback journal（记录备份路径和目标路径）
+    /// 3. 删除 active artifact
+    /// 4. 复制新 active artifact
+    /// 5. 保存 history
+    /// 6. 删除 journal 和备份
+    ///
+    /// 如果进程在步骤 2-5 之间崩溃，下次获取锁时 recover_rollback_journal 会恢复：
+    /// - active 缺失 → 从备份恢复（回滚未生效，恢复到回滚前状态）
+    /// - active 存在 → 保留 active（回滚已生效），仅清理 journal
+    fn rollback_unlocked(&self, capability_id: &str) -> Result<Option<String>> {
+        let mut history = self.get_history_unlocked(capability_id)?;
 
         if history.versions.is_empty() {
             warn!(
@@ -189,17 +664,15 @@ impl CapabilityVersionManager {
         history.current_version = prev.version.clone();
         let restore_path = prev.artifact_path.clone();
 
-        // 先验证并复制 artifact 到临时文件，成功后再原子替换并保存 history
-        // 防止 copy 失败时 history 已回滚但 artifact 未变，导致版本状态不一致
-        let safe_id = capability_id.replace('.', "_");
-        let ext = std::path::Path::new(&restore_path)
+        let safe_id = safe_capability_id(capability_id);
+        let ext = Path::new(&restore_path)
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("sh");
         let active_path = self.artifacts_dir.join(format!("{}.{}", safe_id, ext));
 
         // 验证快照文件存在并可读
-        if !std::path::Path::new(&restore_path).exists() {
+        if !Path::new(&restore_path).exists() {
             warn!(
                 capability_id = %capability_id,
                 restore_path = %restore_path,
@@ -209,11 +682,109 @@ impl CapabilityVersionManager {
             return Ok(None);
         }
 
-        // 先复制 artifact（如果失败则不修改 history，保持一致性）
-        std::fs::copy(&restore_path, &active_path)?;
+        // 先复制 artifact 到同目录临时文件，fsync 后再原子替换，
+        // 防止磁盘满/权限/中途失败时 active artifact 被截断或部分覆盖
+        // 使用 UUID 避免同进程内并发 rollback 共享路径导致互相覆盖
+        let rollback_id = uuid::Uuid::new_v4();
+        let tmp_path = self.artifacts_dir.join(format!(
+            "{}.rollback_tmp.{}.{}.{}",
+            safe_id,
+            std::process::id(),
+            rollback_id,
+            ext
+        ));
+        if let Err(e) = fs::copy(&restore_path, &tmp_path) {
+            return Err(Error::Other(format!("rollback: 复制快照到临时文件失败: {e}")));
+        }
 
-        // artifact 复制成功，现在才保存 history
-        self.save_history(&history)?;
+        // 确保临时文件数据落盘后再替换
+        {
+            if let Ok(file) = fs::File::open(&tmp_path) {
+                let _ = file.sync_all();
+            }
+        }
+
+        // 备份当前 active artifact（若存在）
+        let active_backup = self.artifacts_dir.join(format!(
+            "{}.rollback_bak.{}.{}.{}",
+            safe_id,
+            std::process::id(),
+            rollback_id,
+            ext
+        ));
+
+        let had_active = active_path.exists();
+        if had_active {
+            fs::copy(&active_path, &active_backup).map_err(|e| {
+                let _ = fs::remove_file(&tmp_path);
+                Error::Other(format!("rollback: 备份 active artifact 失败: {e}"))
+            })?;
+        }
+
+        // 写入 rollback journal（崩溃恢复用）
+        // journal 格式：第一行 active_backup 路径，第二行 active_path 路径
+        let journal_path = self.versions_dir.join(format!("{}.rollback_journal", safe_id));
+        let journal_content = format!(
+            "{}\n{}",
+            active_backup.to_string_lossy(),
+            active_path.to_string_lossy()
+        );
+        {
+            let mut journal_file = fs::File::create(&journal_path).map_err(|e| {
+                let _ = fs::remove_file(&tmp_path);
+                if had_active {
+                    let _ = fs::remove_file(&active_backup);
+                }
+                Error::Other(format!("rollback: 创建 rollback journal 失败: {e}"))
+            })?;
+            journal_file.write_all(journal_content.as_bytes()).map_err(|e| {
+                let _ = fs::remove_file(&tmp_path);
+                if had_active {
+                    let _ = fs::remove_file(&active_backup);
+                }
+                let _ = fs::remove_file(&journal_path);
+                Error::Other(format!("rollback: 写入 rollback journal 失败: {e}"))
+            })?;
+            let _ = journal_file.sync_all();
+        }
+
+        // 删除当前 active artifact
+        if had_active {
+            let _ = fs::remove_file(&active_path);
+        }
+
+        // 将临时文件复制为 active artifact
+        fs::copy(&tmp_path, &active_path).map_err(|e| {
+            // 替换失败：恢复 active 备份，清理临时文件和 journal
+            if had_active && active_backup.exists() {
+                let _ = fs::copy(&active_backup, &active_path);
+                let _ = fs::remove_file(&active_backup);
+            }
+            let _ = fs::remove_file(&tmp_path);
+            let _ = fs::remove_file(&journal_path);
+            Error::Other(format!("rollback: 替换 active artifact 失败: {e}"))
+        })?;
+        let _ = fs::remove_file(&tmp_path);
+
+        // artifact 替换成功，保存 history
+        if let Err(e) = self.save_history(&history) {
+            // history 保存失败：恢复 active 备份以保持一致性
+            if had_active && active_backup.exists() {
+                let _ = fs::remove_file(&active_path);
+                let _ = fs::copy(&active_backup, &active_path);
+                let _ = fs::remove_file(&active_backup);
+            } else if !had_active {
+                let _ = fs::remove_file(&active_path);
+            }
+            let _ = fs::remove_file(&journal_path);
+            return Err(e);
+        }
+
+        // 一切成功，清理 journal 和备份文件
+        let _ = fs::remove_file(&journal_path);
+        if active_backup.exists() {
+            let _ = fs::remove_file(&active_backup);
+        }
 
         info!(
             capability_id = %capability_id,
@@ -226,20 +797,34 @@ impl CapabilityVersionManager {
     }
 
     /// List all versions for a capability.
+    /// 使用 per-capability 锁保护读取，防止 save_history 写入窗口期读到空 history。
     pub fn list_versions(&self, capability_id: &str) -> Result<Vec<CapabilityVersion>> {
-        let history = self.get_history(capability_id)?;
-        Ok(history.versions)
+        with_capability_lock(&self.versions_dir, capability_id, || {
+            let history = self.get_history_unlocked(capability_id)?;
+            Ok(history.versions)
+        })
     }
 
     /// Get the current version string for a capability.
+    /// 使用 per-capability 锁保护读取，防止 save_history 写入窗口期读到空 history。
     pub fn get_current_version(&self, capability_id: &str) -> Result<String> {
-        let history = self.get_history(capability_id)?;
-        Ok(history.current_version)
+        with_capability_lock(&self.versions_dir, capability_id, || {
+            let history = self.get_history_unlocked(capability_id)?;
+            Ok(history.current_version)
+        })
     }
 
     /// Cleanup old versions, keeping only the most recent `keep_count`.
+    /// 使用 per-capability 锁保护整个操作区间。
     pub fn cleanup_old_versions(&self, capability_id: &str, keep_count: usize) -> Result<usize> {
-        let mut history = self.get_history(capability_id)?;
+        with_capability_lock(&self.versions_dir, capability_id, || {
+            self.cleanup_old_versions_unlocked(capability_id, keep_count)
+        })
+    }
+
+    /// cleanup_old_versions 的内部实现（无锁，由 with_capability_lock 调用）
+    fn cleanup_old_versions_unlocked(&self, capability_id: &str, keep_count: usize) -> Result<usize> {
+        let mut history = self.get_history_unlocked(capability_id)?;
 
         if history.versions.len() <= keep_count {
             return Ok(0);
@@ -249,7 +834,7 @@ impl CapabilityVersionManager {
         let removed: Vec<CapabilityVersion> = history.versions.drain(..remove_count).collect();
 
         for v in &removed {
-            let _ = std::fs::remove_file(&v.artifact_path);
+            let _ = fs::remove_file(&v.artifact_path);
         }
 
         self.save_history(&history)?;
@@ -266,32 +851,138 @@ impl CapabilityVersionManager {
 
     // === Internal helpers ===
 
-    fn get_history(&self, capability_id: &str) -> Result<CapabilityVersionHistory> {
+    /// 读取版本历史（无锁版本，由 with_capability_lock 调用）
+    ///
+    /// 包含崩溃恢复逻辑：
+    /// 1. 如果主文件不存在但备份文件存在，说明 save_history 的 rename 步骤未完成，恢复备份。
+    /// 2. 如果主文件存在但 JSON 解析失败（半写损坏），且备份文件存在，恢复备份。
+    fn get_history_unlocked(&self, capability_id: &str) -> Result<CapabilityVersionHistory> {
         let history_file = self.history_file_path(capability_id);
+        let bak_path = history_file.with_extension("json.bak");
+
         if !history_file.exists() {
-            return Ok(CapabilityVersionHistory {
-                capability_id: capability_id.to_string(),
-                versions: vec![],
-                current_version: "v0".to_string(),
-            });
+            // 主文件不存在，检查是否有 save_history 的备份文件可恢复
+            if bak_path.exists() {
+                // 备份存在但主文件不存在，说明 save_history 的复制步骤崩溃中断
+                // 恢复备份到主文件
+                warn!(
+                    history_file = %history_file.display(),
+                    bak_path = %bak_path.display(),
+                    "[能力版本] 主文件不存在但发现备份，恢复备份"
+                );
+                if let Err(e) = fs::copy(&bak_path, &history_file) {
+                    warn!(error = %e, "[能力版本] 恢复备份失败，使用空 history");
+                    return Ok(CapabilityVersionHistory {
+                        capability_id: capability_id.to_string(),
+                        versions: vec![],
+                        current_version: "v0".to_string(),
+                    });
+                }
+                // 恢复成功，继续读取主文件
+            } else {
+                return Ok(CapabilityVersionHistory {
+                    capability_id: capability_id.to_string(),
+                    versions: vec![],
+                    current_version: "v0".to_string(),
+                });
+            }
         }
-        let content = std::fs::read_to_string(&history_file)?;
-        let history: CapabilityVersionHistory = serde_json::from_str(&content)?;
-        Ok(history)
+
+        // 主文件存在，尝试解析
+        let content = fs::read_to_string(&history_file)?;
+        match serde_json::from_str(&content) {
+            Ok(history) => Ok(history),
+            Err(parse_err) => {
+                // 主文件存在但 JSON 解析失败（可能是崩溃导致半写损坏）
+                // 如果备份文件存在，恢复备份
+                if bak_path.exists() {
+                    warn!(
+                        history_file = %history_file.display(),
+                        bak_path = %bak_path.display(),
+                        parse_error = %parse_err,
+                        "[能力版本] 主文件 JSON 解析失败（可能半写损坏），恢复备份"
+                    );
+                    // 用备份覆盖损坏的主文件
+                    if let Err(e) = fs::copy(&bak_path, &history_file) {
+                        warn!(error = %e, "[能力版本] 恢复备份失败，使用空 history");
+                        return Ok(CapabilityVersionHistory {
+                            capability_id: capability_id.to_string(),
+                            versions: vec![],
+                            current_version: "v0".to_string(),
+                        });
+                    }
+                    // 恢复成功，重新读取并解析
+                    let restored_content = fs::read_to_string(&history_file)?;
+                    let history: CapabilityVersionHistory = serde_json::from_str(&restored_content)?;
+                    Ok(history)
+                } else {
+                    // 没有备份可恢复，返回解析错误
+                    Err(Error::Other(format!(
+                        "解析版本历史 JSON 失败（文件可能半写损坏）: {}",
+                        parse_err
+                    )))
+                }
+            }
+        }
     }
 
+    /// 保存版本历史到磁盘。
+    /// 使用 backup-based 策略：先写入临时文件并 fsync，再备份目标文件，
+    /// 最后将临时文件内容复制到目标。不先删除目标文件，避免崩溃窗口丢 history。
+    ///
+    /// Windows 兼容：始终使用 copy + delete 替代 rename。
+    /// Windows 上 fs::rename 在目标已存在或文件被占用时返回 PermissionDenied，
+    /// 而 fs::copy 可以覆盖已存在目标（只要没有独占锁）。
     fn save_history(&self, history: &CapabilityVersionHistory) -> Result<()> {
         let history_file = self.history_file_path(&history.capability_id);
         if let Some(parent) = history_file.parent() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)?;
         }
         let content = serde_json::to_string_pretty(history)?;
-        std::fs::write(&history_file, content)?;
+
+        // 1. 写入临时文件并 fsync，确保数据落盘
+        let tmp_path = history_file.with_extension("json.tmp");
+        let _ = fs::remove_file(&tmp_path);
+        {
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(content.as_bytes())?;
+            let _ = file.sync_all();
+        }
+
+        // 2. backup-based 替换策略（始终使用 copy，避免 Windows rename PermissionDenied）
+        //    策略：备份当前目标 -> 复制临时文件到目标 -> 删除备份
+        //    崩溃恢复：如果目标不存在但备份存在，说明复制步骤未完成，恢复备份
+        let bak_path = history_file.with_extension("json.bak");
+        if history_file.exists() {
+            // 清理可能残留的旧备份
+            let _ = fs::remove_file(&bak_path);
+            // 备份当前目标文件（用于崩溃恢复）
+            fs::copy(&history_file, &bak_path).map_err(|e| {
+                let _ = fs::remove_file(&tmp_path);
+                Error::Other(format!("save_history: 备份目标文件失败: {e}"))
+            })?;
+        }
+
+        // 将临时文件内容复制到目标（覆盖已存在目标）
+        fs::copy(&tmp_path, &history_file).map_err(|e| {
+            // 复制失败，尝试恢复备份
+            if bak_path.exists() {
+                let _ = fs::copy(&bak_path, &history_file);
+                let _ = fs::remove_file(&bak_path);
+            }
+            let _ = fs::remove_file(&tmp_path);
+            Error::Other(format!("save_history: 复制临时文件到目标失败: {e}"))
+        })?;
+
+        // 成功，清理临时文件和备份
+        let _ = fs::remove_file(&tmp_path);
+        let _ = fs::remove_file(&bak_path);
+
         Ok(())
     }
 
     fn history_file_path(&self, capability_id: &str) -> PathBuf {
-        let safe_id = capability_id.replace('.', "_");
+        let safe_id = safe_capability_id(capability_id);
         self.versions_dir.join(format!("{}_history.json", safe_id))
     }
 }

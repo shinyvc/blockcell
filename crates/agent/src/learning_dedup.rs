@@ -1,4 +1,9 @@
 //! Learning dedup — prevents duplicate learning within a time window
+//!
+//! 提供两种 API：
+//! - `is_duplicate()`: 原子检查+写入（兼容旧调用）
+//! - `contains_recent()` + `record()`: 拆分版，允许调用方在确认 review 会启动后再 record，
+//!   避免 throttle 失败时 dedup 已写入导致 key 被提前消耗。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -49,6 +54,45 @@ impl LearningDedup {
 
         recent.insert(key.to_string(), Instant::now());
         false
+    }
+
+    /// 只读检查：key 是否在去重窗口内已存在
+    ///
+    /// 与 `is_duplicate()` 不同，此方法不会写入去重表。
+    /// 供调用方在 throttle/dedup 检查阶段使用，避免 throttle 失败时
+    /// dedup 已写入导致 key 被提前消耗。
+    pub fn contains_recent(&self, key: &str) -> bool {
+        if self.dedup_window_secs == 0 {
+            return false;
+        }
+
+        let recent = self.recent.lock().unwrap_or_else(|e| {
+            tracing::warn!("LearningDedup Mutex poisoned, recovering");
+            e.into_inner()
+        });
+
+        let window = self.dedup_window_secs;
+        if let Some(seen_at) = recent.get(key) {
+            seen_at.elapsed().as_secs() < window
+        } else {
+            false
+        }
+    }
+
+    /// 写入去重记录：标记 key 已在当前时间触发
+    ///
+    /// 供调用方在确认 review 会启动后调用，与 `contains_recent()` 配合使用。
+    pub fn record(&self, key: &str) {
+        if self.dedup_window_secs == 0 {
+            return;
+        }
+
+        let mut recent = self.recent.lock().unwrap_or_else(|e| {
+            tracing::warn!("LearningDedup Mutex poisoned, recovering");
+            e.into_inner()
+        });
+
+        recent.insert(key.to_string(), Instant::now());
     }
 
     /// Clear all dedup entries

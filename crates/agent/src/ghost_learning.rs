@@ -197,7 +197,7 @@ impl Default for GhostLearningPolicy {
     fn default() -> Self {
         Self {
             method_tool_threshold: 3,
-            turn_review_interval: 0,
+            turn_review_interval: 6,
         }
     }
 }
