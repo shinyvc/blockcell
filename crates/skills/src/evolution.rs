@@ -895,7 +895,7 @@ impl SkillEvolution {
                 let source_path = record.context.source_path.as_deref().ok_or_else(|| {
                     Error::Evolution("Missing source_path for LocalScript skill".to_string())
                 })?;
-                let temp_path = make_compile_temp_path(&record.skill_name, &source_path);
+                let temp_path = make_compile_temp_path(&record.skill_name, source_path);
                 let temp_guard = TempFileGuard::new(temp_path);
                 std::fs::write(temp_guard.path(), &patch.diff)?;
                 self.compile_local_script(temp_guard.path()).await?
@@ -937,7 +937,7 @@ impl SkillEvolution {
                     let source_path = record.context.source_path.as_deref().ok_or_else(|| {
                         Error::Evolution("Missing source_path for LocalScript skill".to_string())
                     })?;
-                    let temp_path = make_compile_temp_path(&record.skill_name, &source_path);
+                    let temp_path = make_compile_temp_path(&record.skill_name, source_path);
                     let temp_guard = TempFileGuard::new(temp_path);
                     std::fs::write(temp_guard.path(), &patch.diff)?;
                     self.compile_local_script(temp_guard.path()).await?
@@ -3173,7 +3173,7 @@ or\n\
                                 "Failed to restore .bak after snapshot failure, .bak preserved"
                             );
                         }
-                    } else if !pre_write_version.is_some() || main_skill_dir.exists() {
+                    } else if pre_write_version.is_none() || main_skill_dir.exists() {
                         // 全新 staged skill（无 baseline、无 .bak）：删除主目录避免残留坏 skill
                         if main_skill_dir.exists() {
                             std::fs::remove_dir_all(&main_skill_dir).ok();

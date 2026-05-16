@@ -338,10 +338,8 @@ impl LearningCoordinator {
         // 否则 throttle 失败时 dedup 已写入，导致后续同类 nudge 被误判重复
         // Only reserve a new throttle slot if no memory review is already pending.
         // If existing_memory is true, the caller's memory slot covers this review too.
-        if !existing_memory {
-            if !self.throttle.try_start_review() {
-                return None;
-            }
+        if !existing_memory && !self.throttle.try_start_review() {
+            return None;
         }
 
         // dedup 只读检查：如果 key 已存在，rollback throttle 并返回

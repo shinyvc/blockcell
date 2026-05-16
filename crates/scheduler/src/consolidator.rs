@@ -141,18 +141,8 @@ impl DreamState {
                                         )
                                     })
                                     .await
-                                    .map_err(|e| {
-                                        std::io::Error::new(
-                                            std::io::ErrorKind::Other,
-                                            e.to_string(),
-                                        )
-                                    })?
-                                    .map_err(|e| {
-                                        std::io::Error::new(
-                                            std::io::ErrorKind::Other,
-                                            e.to_string(),
-                                        )
-                                    })?;
+                                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                                     tracing::info!("[dream] 从备份文件恢复成功");
                                     Ok(state)
                                 }
@@ -206,8 +196,8 @@ impl DreamState {
             blockcell_agent::fs_util::atomic_write(&path, content.as_bytes())
         })
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        write_result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        write_result.map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(())
     }
 
@@ -222,8 +212,8 @@ impl DreamState {
             blockcell_agent::fs_util::atomic_write(&path, content.as_bytes())
         })
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        write_result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        write_result.map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(())
     }
 
@@ -534,7 +524,8 @@ impl DreamConsolidator {
         // 获取锁失败或 save_unlocked 失败时，必须重试或返回错误，
         // 不能让调用方看到成功但磁盘上仍为 is_consolidating=true。
         {
-            let state_lock_path = self.config_dir
+            let state_lock_path = self
+                .config_dir
                 .join(DREAM_STATE_FILE)
                 .with_extension("json.lock");
 
@@ -570,7 +561,8 @@ impl DreamConsolidator {
                         "[dream] 获取状态锁失败，重试中"
                     );
                     // 递增等待：100ms, 200ms, 300ms
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * retry_count as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * retry_count as u64))
+                        .await;
                     guard_result = CrossProcessLock::acquire(&state_lock_path);
                 }
                 guard_result.unwrap()
@@ -1437,227 +1429,252 @@ pub enum DreamError {
 }
 
 #[cfg(test)]
-    mod tests {
-        use super::*;
+mod tests {
+    use super::*;
 
-        #[test]
-        fn test_dream_state_default() {
-            let state = DreamState::default();
-            assert!(state.last_consolidation_time.is_none());
-            assert_eq!(state.current_session_count, 0);
-            assert!(!state.is_consolidating);
-            assert!(state.consolidating_started_at.is_none());
-        }
+    #[test]
+    fn test_dream_state_default() {
+        let state = DreamState::default();
+        assert!(state.last_consolidation_time.is_none());
+        assert_eq!(state.current_session_count, 0);
+        assert!(!state.is_consolidating);
+        assert!(state.consolidating_started_at.is_none());
+    }
 
-        #[test]
-        fn test_dream_state_increment() {
-            let mut state = DreamState::default();
-            state.increment_session_count();
-            assert_eq!(state.current_session_count, 1);
-        }
+    #[test]
+    fn test_dream_state_increment() {
+        let mut state = DreamState::default();
+        state.increment_session_count();
+        assert_eq!(state.current_session_count, 1);
+    }
 
-        #[tokio::test]
-        async fn test_check_gates_time_failed() {
-            let mut state = DreamState {
-                last_consolidation_time: Some(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                ),
-                last_session_count: 0,
-                current_session_count: 10,
-                consolidation_count: 1,
-                is_consolidating: false,
-                consolidating_started_at: None,
-            };
+    #[tokio::test]
+    async fn test_check_gates_time_failed() {
+        let mut state = DreamState {
+            last_consolidation_time: Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            ),
+            last_session_count: 0,
+            current_session_count: 10,
+            consolidation_count: 1,
+            is_consolidating: false,
+            consolidating_started_at: None,
+        };
 
-            let result = check_gates(&mut state, Path::new("/config"), &ConsolidatorConfig::default()).await;
-            assert_eq!(result, GateCheckResult::TimeGateFailed);
-        }
+        let result = check_gates(
+            &mut state,
+            Path::new("/config"),
+            &ConsolidatorConfig::default(),
+        )
+        .await;
+        assert_eq!(result, GateCheckResult::TimeGateFailed);
+    }
 
-        #[tokio::test]
-        async fn test_check_gates_session_failed() {
-            let mut state = DreamState {
-                last_consolidation_time: Some(0), // 很久以前
-                last_session_count: 0,
-                current_session_count: 3, // 少于阈值 5
-                consolidation_count: 1,
-                is_consolidating: false,
-                consolidating_started_at: None,
-            };
+    #[tokio::test]
+    async fn test_check_gates_session_failed() {
+        let mut state = DreamState {
+            last_consolidation_time: Some(0), // 很久以前
+            last_session_count: 0,
+            current_session_count: 3, // 少于阈值 5
+            consolidation_count: 1,
+            is_consolidating: false,
+            consolidating_started_at: None,
+        };
 
-            let result = check_gates(&mut state, Path::new("/config"), &ConsolidatorConfig::default()).await;
-            assert_eq!(result, GateCheckResult::SessionGateFailed);
-        }
+        let result = check_gates(
+            &mut state,
+            Path::new("/config"),
+            &ConsolidatorConfig::default(),
+        )
+        .await;
+        assert_eq!(result, GateCheckResult::SessionGateFailed);
+    }
 
-        #[tokio::test]
-        async fn test_check_gates_lock_failed_active() {
-            // is_consolidating=true 且 consolidating_started_at 在阈值内 → 仍为活跃整合
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let mut state = DreamState {
-                last_consolidation_time: Some(0),
-                last_session_count: 0,
-                current_session_count: 10,
-                consolidation_count: 1,
-                is_consolidating: true, // 正在整合
-                consolidating_started_at: Some(now), // 刚开始
-            };
+    #[tokio::test]
+    async fn test_check_gates_lock_failed_active() {
+        // is_consolidating=true 且 consolidating_started_at 在阈值内 → 仍为活跃整合
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut state = DreamState {
+            last_consolidation_time: Some(0),
+            last_session_count: 0,
+            current_session_count: 10,
+            consolidation_count: 1,
+            is_consolidating: true,              // 正在整合
+            consolidating_started_at: Some(now), // 刚开始
+        };
 
-            let result = check_gates(&mut state, Path::new("/config"), &ConsolidatorConfig::default()).await;
-            assert_eq!(result, GateCheckResult::LockGateFailed);
-        }
+        let result = check_gates(
+            &mut state,
+            Path::new("/config"),
+            &ConsolidatorConfig::default(),
+        )
+        .await;
+        assert_eq!(result, GateCheckResult::LockGateFailed);
+    }
 
-        #[tokio::test]
-        async fn test_check_gates_stale_consolidating_auto_recover() {
-            // is_consolidating=true 但 consolidating_started_at 超过阈值 → 自动清除 stale 标记
-            let stale_time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                .saturating_sub(CONSOLIDATING_STALE_THRESHOLD_SECS + 100);
-            let mut state = DreamState {
-                last_consolidation_time: Some(0),
-                last_session_count: 0,
-                current_session_count: 10,
-                consolidation_count: 1,
-                is_consolidating: true,
-                consolidating_started_at: Some(stale_time), // 超时
-            };
+    #[tokio::test]
+    async fn test_check_gates_stale_consolidating_auto_recover() {
+        // is_consolidating=true 但 consolidating_started_at 超过阈值 → 自动清除 stale 标记
+        let stale_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(CONSOLIDATING_STALE_THRESHOLD_SECS + 100);
+        let mut state = DreamState {
+            last_consolidation_time: Some(0),
+            last_session_count: 0,
+            current_session_count: 10,
+            consolidation_count: 1,
+            is_consolidating: true,
+            consolidating_started_at: Some(stale_time), // 超时
+        };
 
-            let result = check_gates(&mut state, Path::new("/config"), &ConsolidatorConfig::default()).await;
-            // stale 标记被清除后，应继续检查时间和会话门控
-            assert_eq!(result, GateCheckResult::Passed);
-            // 内存中状态已清除
-            assert!(!state.is_consolidating);
-            assert!(state.consolidating_started_at.is_none());
-        }
+        let result = check_gates(
+            &mut state,
+            Path::new("/config"),
+            &ConsolidatorConfig::default(),
+        )
+        .await;
+        // stale 标记被清除后，应继续检查时间和会话门控
+        assert_eq!(result, GateCheckResult::Passed);
+        // 内存中状态已清除
+        assert!(!state.is_consolidating);
+        assert!(state.consolidating_started_at.is_none());
+    }
 
-        #[tokio::test]
-        async fn test_check_gates_passed() {
-            let mut state = DreamState {
-                last_consolidation_time: Some(0), // 很久以前
-                last_session_count: 0,
-                current_session_count: 10, // 超过阈值 5
-                consolidation_count: 1,
-                is_consolidating: false,
-                consolidating_started_at: None,
-            };
+    #[tokio::test]
+    async fn test_check_gates_passed() {
+        let mut state = DreamState {
+            last_consolidation_time: Some(0), // 很久以前
+            last_session_count: 0,
+            current_session_count: 10, // 超过阈值 5
+            consolidation_count: 1,
+            is_consolidating: false,
+            consolidating_started_at: None,
+        };
 
-            let result = check_gates(&mut state, Path::new("/config"), &ConsolidatorConfig::default()).await;
-            assert_eq!(result, GateCheckResult::Passed);
-        }
+        let result = check_gates(
+            &mut state,
+            Path::new("/config"),
+            &ConsolidatorConfig::default(),
+        )
+        .await;
+        assert_eq!(result, GateCheckResult::Passed);
+    }
 
-        // ========== 核心路径测试 ==========
+    // ========== 核心路径测试 ==========
 
-        #[test]
-        fn test_gathered_signal_creation() {
-            use std::time::SystemTime;
+    #[test]
+    fn test_gathered_signal_creation() {
+        use std::time::SystemTime;
 
-            let signal = GatheredSignal {
-                title: "User Preferences".to_string(),
-                content: "User prefers dark mode".to_string(),
-                importance: 8,
-                source_time: SystemTime::now(),
-            };
+        let signal = GatheredSignal {
+            title: "User Preferences".to_string(),
+            content: "User prefers dark mode".to_string(),
+            importance: 8,
+            source_time: SystemTime::now(),
+        };
 
-            assert_eq!(signal.title, "User Preferences");
-            assert_eq!(signal.importance, 8);
-        }
+        assert_eq!(signal.title, "User Preferences");
+        assert_eq!(signal.importance, 8);
+    }
 
-        #[test]
-        fn test_dream_state_serialization() {
-            let state = DreamState {
-                last_consolidation_time: Some(1234567890),
-                last_session_count: 5,
-                current_session_count: 10,
-                consolidation_count: 3,
-                is_consolidating: false,
-                consolidating_started_at: None,
-            };
+    #[test]
+    fn test_dream_state_serialization() {
+        let state = DreamState {
+            last_consolidation_time: Some(1234567890),
+            last_session_count: 5,
+            current_session_count: 10,
+            consolidation_count: 3,
+            is_consolidating: false,
+            consolidating_started_at: None,
+        };
 
-            let json = serde_json::to_string(&state).unwrap();
-            let deserialized: DreamState = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: DreamState = serde_json::from_str(&json).unwrap();
 
-            assert_eq!(deserialized.last_consolidation_time, Some(1234567890));
-            assert_eq!(deserialized.current_session_count, 10);
-        }
+        assert_eq!(deserialized.last_consolidation_time, Some(1234567890));
+        assert_eq!(deserialized.current_session_count, 10);
+    }
 
-        #[test]
-        fn test_gate_check_result_variants() {
-            // 确保所有变体都能正确创建和比较
-            assert_eq!(
-                GateCheckResult::TimeGateFailed,
-                GateCheckResult::TimeGateFailed
-            );
-            assert_eq!(
-                GateCheckResult::SessionGateFailed,
-                GateCheckResult::SessionGateFailed
-            );
-            assert_eq!(
-                GateCheckResult::LockGateFailed,
-                GateCheckResult::LockGateFailed
-            );
-            assert_eq!(GateCheckResult::Passed, GateCheckResult::Passed);
-        }
+    #[test]
+    fn test_gate_check_result_variants() {
+        // 确保所有变体都能正确创建和比较
+        assert_eq!(
+            GateCheckResult::TimeGateFailed,
+            GateCheckResult::TimeGateFailed
+        );
+        assert_eq!(
+            GateCheckResult::SessionGateFailed,
+            GateCheckResult::SessionGateFailed
+        );
+        assert_eq!(
+            GateCheckResult::LockGateFailed,
+            GateCheckResult::LockGateFailed
+        );
+        assert_eq!(GateCheckResult::Passed, GateCheckResult::Passed);
+    }
 
-        #[test]
-        fn test_dream_config_defaults() {
-            assert_eq!(TIME_GATE_THRESHOLD_HOURS, 24);
-            assert_eq!(SESSION_GATE_THRESHOLD, 5);
-            assert_eq!(SESSION_MEMORY_EXPIRY_DAYS, 7);
-            assert_eq!(MAX_SESSIONS_TO_PROCESS, 10);
-            assert_eq!(CONSOLIDATING_STALE_THRESHOLD_SECS, 3600);
-        }
+    #[test]
+    fn test_dream_config_defaults() {
+        assert_eq!(TIME_GATE_THRESHOLD_HOURS, 24);
+        assert_eq!(SESSION_GATE_THRESHOLD, 5);
+        assert_eq!(SESSION_MEMORY_EXPIRY_DAYS, 7);
+        assert_eq!(MAX_SESSIONS_TO_PROCESS, 10);
+        assert_eq!(CONSOLIDATING_STALE_THRESHOLD_SECS, 3600);
+    }
 
-        /// 测试：DreamState 与 agent 侧 DreamStateData 的 JSON schema 一致性
-        ///
-        /// 验证两个独立定义的结构体序列化/反序列化结果完全一致，
-        /// 防止字段名、类型或 serde 属性不匹配导致跨 crate 数据丢失。
-        /// 长期方案：将共享结构体移至 blockcell-core crate。
-        #[test]
-        fn test_dream_state_schema_consistency_with_agent_side() {
-            use blockcell_agent::dream_state::DreamStateData;
+    /// 测试：DreamState 与 agent 侧 DreamStateData 的 JSON schema 一致性
+    ///
+    /// 验证两个独立定义的结构体序列化/反序列化结果完全一致，
+    /// 防止字段名、类型或 serde 属性不匹配导致跨 crate 数据丢失。
+    /// 长期方案：将共享结构体移至 blockcell-core crate。
+    #[test]
+    fn test_dream_state_schema_consistency_with_agent_side() {
+        use blockcell_agent::dream_state::DreamStateData;
 
-            // 构造一个包含所有字段的完整实例
-            let scheduler_state = DreamState {
-                last_consolidation_time: Some(1234567890),
-                last_session_count: 10,
-                current_session_count: 15,
-                consolidation_count: 3,
-                is_consolidating: true,
-                consolidating_started_at: Some(1234567800),
-            };
+        // 构造一个包含所有字段的完整实例
+        let scheduler_state = DreamState {
+            last_consolidation_time: Some(1234567890),
+            last_session_count: 10,
+            current_session_count: 15,
+            consolidation_count: 3,
+            is_consolidating: true,
+            consolidating_started_at: Some(1234567800),
+        };
 
-            // 序列化 scheduler 侧结构体
-            let scheduler_json = serde_json::to_value(&scheduler_state).unwrap();
+        // 序列化 scheduler 侧结构体
+        let scheduler_json = serde_json::to_value(&scheduler_state).unwrap();
 
-            // 用 agent 侧结构体反序列化
-            let agent_state: DreamStateData = serde_json::from_value(scheduler_json.clone()).unwrap();
+        // 用 agent 侧结构体反序列化
+        let agent_state: DreamStateData = serde_json::from_value(scheduler_json.clone()).unwrap();
 
-            // 验证所有字段值一致
-            assert_eq!(agent_state.last_consolidation_time, Some(1234567890u64));
-            assert_eq!(agent_state.last_session_count, 10);
-            assert_eq!(agent_state.current_session_count, 15);
-            assert_eq!(agent_state.consolidation_count, 3);
-            assert!(agent_state.is_consolidating);
-            assert_eq!(agent_state.consolidating_started_at, Some(1234567800u64));
+        // 验证所有字段值一致
+        assert_eq!(agent_state.last_consolidation_time, Some(1234567890u64));
+        assert_eq!(agent_state.last_session_count, 10);
+        assert_eq!(agent_state.current_session_count, 15);
+        assert_eq!(agent_state.consolidation_count, 3);
+        assert!(agent_state.is_consolidating);
+        assert_eq!(agent_state.consolidating_started_at, Some(1234567800u64));
 
-            // 反向：用 agent 侧结构体序列化，scheduler 侧反序列化
-            let agent_json = serde_json::to_value(&agent_state).unwrap();
-            let restored: DreamState = serde_json::from_value(agent_json.clone()).unwrap();
-            assert_eq!(restored.last_consolidation_time, Some(1234567890));
-            assert_eq!(restored.last_session_count, 10);
-            assert_eq!(restored.current_session_count, 15);
-            assert_eq!(restored.consolidation_count, 3);
-            assert!(restored.is_consolidating);
-            assert_eq!(restored.consolidating_started_at, Some(1234567800));
+        // 反向：用 agent 侧结构体序列化，scheduler 侧反序列化
+        let agent_json = serde_json::to_value(&agent_state).unwrap();
+        let restored: DreamState = serde_json::from_value(agent_json.clone()).unwrap();
+        assert_eq!(restored.last_consolidation_time, Some(1234567890));
+        assert_eq!(restored.last_session_count, 10);
+        assert_eq!(restored.current_session_count, 15);
+        assert_eq!(restored.consolidation_count, 3);
+        assert!(restored.is_consolidating);
+        assert_eq!(restored.consolidating_started_at, Some(1234567800));
 
-            // 验证 JSON key 集合完全一致
-            let scheduler_keys: std::collections::BTreeSet<String> = scheduler_json
+        // 验证 JSON key 集合完全一致
+        let scheduler_keys: std::collections::BTreeSet<String> = scheduler_json
             .as_object()
             .unwrap()
             .keys()
