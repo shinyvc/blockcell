@@ -98,7 +98,7 @@ impl LearningThrottle {
         self.active_reviews.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// 记录 review 已完成
+    /// 记录 review 已完成（递减计数 + 更新冷却时间戳）
     pub fn review_completed(&self) {
         let mut current = self.active_reviews.load(Ordering::Acquire);
         while current > 0 {
@@ -114,6 +114,26 @@ impl LearningThrottle {
                     }
                     return;
                 }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// 取消 review（仅递减计数，不更新冷却时间戳）
+    ///
+    /// 用于 evaluate_nudge 中因去重/无 nudgable 而提前退出的场景：
+    /// 这些路径需要平衡 try_start_review() 递增的计数器，
+    /// 但不应启动冷却计时器，否则会导致 review 饥饿。
+    pub fn cancel_review(&self) {
+        let mut current = self.active_reviews.load(Ordering::Acquire);
+        while current > 0 {
+            match self.active_reviews.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
                 Err(actual) => current = actual,
             }
         }
@@ -193,5 +213,59 @@ mod tests {
         assert!(!throttle.try_start_review());
         // 计数器恰好为 1
         assert_eq!(throttle.active_count(), 1);
+    }
+
+    /// 测试：cancel_review() 递减 active_reviews 但不更新冷却时间戳
+    ///
+    /// 验证去重/无 nudgable 路径下 cancel_review 的行为：
+    /// - active_reviews 正常递减
+    /// - 冷却计时器不被启动（避免 review 饥饿）
+    /// - 递减后可以立即重新 try_start_review（冷却期 = 0 时）
+    #[test]
+    fn test_cancel_review_decrements_without_cooldown() {
+        let throttle = LearningThrottle::new(2, 300);
+
+        // 启动一个 review
+        assert!(throttle.try_start_review());
+        assert_eq!(throttle.active_count(), 1);
+
+        // 取消 review（模拟去重/无 nudgable 场景）
+        throttle.cancel_review();
+        assert_eq!(throttle.active_count(), 0);
+
+        // 冷却期 = 300 秒，但 cancel_review 不更新冷却时间戳，
+        // 所以可以立即重新启动（因为 last_review_completed 仍为 None）
+        assert!(throttle.try_start_review());
+    }
+
+    /// 测试：cancel_review() 与 review_completed() 的区别
+    ///
+    /// cancel_review 后冷却期不生效，review_completed 后冷却期生效
+    #[test]
+    fn test_cancel_vs_completed_cooldown_behavior() {
+        // cancel 路径：冷却不生效
+        let throttle_cancel = LearningThrottle::new(1, 300);
+        assert!(throttle_cancel.try_start_review());
+        throttle_cancel.cancel_review();
+        // cancel 后立即可以再次 start（冷却未启动）
+        assert!(throttle_cancel.try_start_review());
+
+        // completed 路径：冷却生效
+        let throttle_complete = LearningThrottle::new(1, 300);
+        assert!(throttle_complete.try_start_review());
+        throttle_complete.review_completed();
+        // completed 后冷却期生效，不能立即 start
+        assert!(!throttle_complete.try_start_review());
+    }
+
+    /// 测试：cancel_review() 在 active_reviews = 0 时不会下溢
+    #[test]
+    fn test_cancel_review_no_underflow() {
+        let throttle = LearningThrottle::new(2, 0);
+        // active_reviews = 0，cancel_review 不应导致下溢
+        throttle.cancel_review();
+        assert_eq!(throttle.active_count(), 0);
+        // 仍然可以正常启动
+        assert!(throttle.try_start_review());
     }
 }

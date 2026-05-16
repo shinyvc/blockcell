@@ -614,6 +614,7 @@ dependencies = [
  "blockcell-core",
  "chrono",
  "flate2",
+ "libc",
  "md5",
  "rhai",
  "serde",
@@ -623,7 +624,9 @@ dependencies = [
  "tar",
  "tokio",
  "tracing",
+ "uuid",
  "which",
+ "winapi",
 ]
 
 [[package]]

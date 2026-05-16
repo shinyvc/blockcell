@@ -132,7 +132,10 @@ impl ContextBuilder {
         let skills_dir = paths.skills_dir();
         let mut skill_manager = SkillManager::new()
             .with_versioning(skills_dir.clone())
-            .with_evolution(skills_dir, EvolutionServiceConfig::default());
+            .with_evolution(
+                skills_dir,
+                EvolutionServiceConfig::from(config.evolution.clone()),
+            );
         skill_manager.set_openclaw_skill_enabled(config.openclaw_skill_enabled);
         let _ = skill_manager.load_from_paths(&paths);
 

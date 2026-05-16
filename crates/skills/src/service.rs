@@ -145,13 +145,13 @@ struct TrackResult {
 }
 
 impl ErrorTracker {
-    fn new(threshold: u32, window_minutes: u32) -> Self {
+    fn new(threshold: u32, window_minutes: u32, cooldown_minutes: u32) -> Self {
         Self {
             errors: HashMap::new(),
             threshold,
             window_minutes,
             cooldowns: HashMap::new(),
-            cooldown_minutes: 60, // 默认 1 小时冷却期
+            cooldown_minutes,
         }
     }
 
@@ -301,6 +301,8 @@ pub struct EvolutionServiceConfig {
     pub max_retries: u32,
     /// LLM 调用超时时间（秒）
     pub llm_timeout_secs: u64,
+    /// 回滚冷却期时长（分钟），默认 60 分钟
+    pub cooldown_minutes: u32,
 }
 
 impl Default for EvolutionServiceConfig {
@@ -311,6 +313,21 @@ impl Default for EvolutionServiceConfig {
             enabled: true,
             max_retries: 3,
             llm_timeout_secs: 300, // 5分钟
+            cooldown_minutes: 60,  // 1小时冷却期
+        }
+    }
+}
+
+/// 从 blockcell_core::EvolutionConfig 转换，接入真实配置链路
+impl From<blockcell_core::EvolutionConfig> for EvolutionServiceConfig {
+    fn from(cfg: blockcell_core::EvolutionConfig) -> Self {
+        Self {
+            error_threshold: cfg.error_threshold,
+            error_window_minutes: cfg.error_window_minutes,
+            enabled: cfg.enabled,
+            max_retries: cfg.max_retries,
+            llm_timeout_secs: cfg.llm_timeout_secs,
+            cooldown_minutes: cfg.cooldown_minutes,
         }
     }
 }
@@ -646,7 +663,11 @@ impl EvolutionService {
     }
 
     pub fn new(skills_dir: PathBuf, config: EvolutionServiceConfig) -> Self {
-        let error_tracker = ErrorTracker::new(config.error_threshold, config.error_window_minutes);
+        let error_tracker = ErrorTracker::new(
+            config.error_threshold,
+            config.error_window_minutes,
+            config.cooldown_minutes,
+        );
 
         Self {
             evolution: SkillEvolution::new(skills_dir, config.llm_timeout_secs),
@@ -914,7 +935,7 @@ impl EvolutionService {
             .run_single_evolution_inner(evolution_id, llm_provider)
             .await;
 
-        // 释放 pipeline 锁
+        // 释放 pipeline 锁（无论 inner 成功或失败都必须释放）
         {
             let mut locks = self.pipeline_locks.lock().await;
             locks.remove(evolution_id);
@@ -1737,7 +1758,14 @@ impl EvolutionService {
             if !is_terminal {
                 record.status = EvolutionStatus::Failed;
                 record.updated_at = chrono::Utc::now().timestamp();
-                let _ = self.evolution.save_record_public(&record);
+                if let Err(e) = self.evolution.save_record_public(&record) {
+                    warn!(
+                        skill = %skill_name,
+                        evolution_id = %evolution_id,
+                        error = %e,
+                        "[自进化] 清理时保存 Failed 状态失败，记录可能残留中间状态"
+                    );
+                }
                 info!(
                     skill = %skill_name,
                     evolution_id = %evolution_id,
@@ -2338,7 +2366,7 @@ mod tests {
 
     #[test]
     fn test_error_tracker_threshold_1_triggers_immediately() {
-        let mut tracker = ErrorTracker::new(1, 30);
+        let mut tracker = ErrorTracker::new(1, 30, 60);
         let r = tracker.record_error("test_skill");
         assert!(r.is_first);
         assert!(r.trigger.is_some());
@@ -2357,7 +2385,7 @@ mod tests {
 
     #[test]
     fn test_error_tracker_threshold_3() {
-        let mut tracker = ErrorTracker::new(3, 30);
+        let mut tracker = ErrorTracker::new(3, 30, 60);
         let r = tracker.record_error("test_skill");
         assert!(r.is_first);
         assert!(r.trigger.is_none());
@@ -2373,7 +2401,7 @@ mod tests {
 
     #[test]
     fn test_error_tracker_clear_allows_retrigger() {
-        let mut tracker = ErrorTracker::new(1, 30);
+        let mut tracker = ErrorTracker::new(1, 30, 60);
         let r = tracker.record_error("test_skill");
         assert!(r.trigger.is_some());
         tracker.clear("test_skill");
@@ -2384,7 +2412,7 @@ mod tests {
 
     #[test]
     fn test_error_tracker_independent_skills() {
-        let mut tracker = ErrorTracker::new(1, 30);
+        let mut tracker = ErrorTracker::new(1, 30, 60);
         let ra = tracker.record_error("skill_a");
         assert!(ra.is_first);
         assert!(ra.trigger.is_some());

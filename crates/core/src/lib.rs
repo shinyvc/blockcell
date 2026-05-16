@@ -26,6 +26,7 @@ pub use capability::{
     PrivilegeLevel, ProviderKind, SurvivalInvariants,
 };
 pub use config::Config;
+pub use config::EvolutionConfig;
 pub use error::{Error, Result};
 pub use message::{InboundMessage, OutboundMessage};
 pub use paths::Paths;

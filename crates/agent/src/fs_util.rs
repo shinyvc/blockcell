@@ -13,10 +13,54 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
 }
 
 /// 生成唯一的备份文件路径: `<original>.bak.<pid>.<counter>`
+///
+/// 使用追加方式而非 `with_extension`，确保对 `.dream_state.json` 等多扩展名文件
+/// 生成 `.dream_state.json.bak.<pid>.<counter>` 而非 `.dream_state.bak.<pid>.<counter>`。
 fn unique_bak_path(path: &Path) -> PathBuf {
     let pid = std::process::id();
     let counter = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    path.with_extension(format!("bak.{pid}.{counter}"))
+    // 追加 .bak.<pid>.<counter> 到完整文件名，而非替换扩展名
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    let bak_name = format!("{file_name}.bak.{pid}.{counter}");
+    path.with_file_name(bak_name)
+}
+
+/// 生成备份文件名前缀，供 `find_latest_backup` 使用。
+///
+/// 与 `unique_bak_path` 共用同一命名逻辑，确保查找和生成使用相同的命名格式。
+fn bak_prefix_for(path: &Path) -> String {
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    format!("{file_name}.bak.")
+}
+
+/// 查找 `atomic_write` 产生的最新备份文件。
+///
+/// `atomic_write` 在 Windows 上使用 `<original>.bak.<pid>.<counter>` 格式备份，
+/// 此函数扫描目录中所有匹配 `<original>.bak.*` 模式的文件，
+/// 返回修改时间最新的那个（即最近一次 `atomic_write` 产生的备份）。
+///
+/// 用于崩溃恢复：当主文件不存在但存在备份时，找到最新的备份来恢复数据。
+pub fn find_latest_backup(original_path: &Path) -> Option<PathBuf> {
+    let dir = original_path.parent()?;
+
+    // 使用与 unique_bak_path 相同的命名逻辑构造前缀
+    // 例如 ".dream_state.json" -> ".dream_state.json.bak."
+    let bak_prefix = bak_prefix_for(original_path);
+
+    let mut latest: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name_str = name.to_str()?;
+        if name_str.starts_with(&bak_prefix) {
+            let mtime = entry.metadata().ok()?.modified().ok()?;
+            if latest.as_ref().map_or(true, |(_, t)| mtime > *t) {
+                latest = Some((entry.path(), mtime));
+            }
+        }
+    }
+
+    latest.map(|(path, _)| path)
 }
 
 /// 原子写入 `data` 到 `path`，使用临时文件 + rename 策略。

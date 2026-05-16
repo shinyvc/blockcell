@@ -449,10 +449,12 @@ pub async fn run(
     let skill_evo_llm_provider = create_skill_evolution_llm_provider(&config, &provider_pool);
     let skill_evo_workflow_db = paths.workspace().join("skill_evolution_workflow.db");
     let skill_evo_workflow_store = EvolutionWorkflowStore::open(&skill_evo_workflow_db)?;
+    // 从 Config.evolution 转换配置，而非使用默认值
+    let skill_evo_config: EvolutionServiceConfig = config.evolution.clone().into();
     let mut skill_evo_worker = SkillEvolutionWorker::new(
         skill_evo_workflow_store,
         paths.skills_dir(),
-        EvolutionServiceConfig::default(),
+        skill_evo_config,
         skill_evo_llm_provider,
     );
     // 为 SkillEvolutionWorker 设置部署回调，确保 scheduler worker 的进化部署路径也能触发 ghost learning boundary

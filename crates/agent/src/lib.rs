@@ -11,7 +11,7 @@ pub mod context;
 pub mod dream_state;
 pub(crate) mod error;
 pub mod forked;
-pub(crate) mod fs_util;
+pub mod fs_util;
 pub mod ghost_background_review;
 pub mod ghost_learning;
 pub mod ghost_memory_provider;
@@ -61,7 +61,8 @@ pub use agent_types::{
 pub use auto_memory::{
     get_memory_dir, get_memory_file_path, should_extract_auto_memory,
     should_extract_auto_memory_with_config, AutoMemoryConfig, AutoMemoryExtractor,
-    ExtractionCursor, ExtractionCursorManager, ExtractionParams, ExtractionResult, MemoryType,
+    CrossProcessLock, ExtractionCursor, ExtractionCursorManager, ExtractionParams,
+    ExtractionResult, MemoryType,
 };
 pub use bus::MessageBus;
 pub use capability_adapter::{

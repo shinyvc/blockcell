@@ -100,7 +100,7 @@ impl RhaiEngine {
     pub fn run(&self, ast: &AST, scope: &mut Scope) -> Result<Dynamic> {
         let (engine, operations, start_time) = self.create_engine_with_limits();
 
-        let result = engine.run_ast_with_scope(scope, ast);
+        let result = engine.eval_ast_with_scope::<Dynamic>(scope, ast);
 
         let final_ops = operations.load(Ordering::Relaxed);
         let elapsed = start_time.elapsed();
@@ -112,7 +112,7 @@ impl RhaiEngine {
         );
 
         match result {
-            Ok(_) => Ok(Dynamic::UNIT),
+            Ok(value) => Ok(value),
             Err(e) => {
                 if let EvalAltResult::ErrorTerminated(ref reason, _) = *e {
                     warn!(reason = %reason, "Script terminated");
@@ -296,5 +296,48 @@ mod tests {
         let executor = SkillExecutor::default();
         let result = executor.execute_script("let x = ", vec![]);
         assert!(result.is_err());
+    }
+
+    /// 回归测试：run() 必须保留脚本返回值（字符串/对象/数组）
+    #[test]
+    fn test_run_preserves_return_value_string() {
+        let engine = RhaiEngine::default();
+        let ast = engine.compile("\"hello world\"").unwrap();
+        let mut scope = Scope::new();
+        let result = engine.run(&ast, &mut scope).unwrap();
+        assert_eq!(result.into_string().unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_run_preserves_return_value_array() {
+        let engine = RhaiEngine::default();
+        let ast = engine.compile("[1, 2, 3]").unwrap();
+        let mut scope = Scope::new();
+        let result = engine.run(&ast, &mut scope).unwrap();
+        let arr = result.cast::<rhai::Array>();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0].as_int().unwrap(), 1);
+        assert_eq!(arr[1].as_int().unwrap(), 2);
+        assert_eq!(arr[2].as_int().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_run_preserves_return_value_object() {
+        let engine = RhaiEngine::default();
+        let ast = engine.compile("#{a: 1, b: 2}").unwrap();
+        let mut scope = Scope::new();
+        let result = engine.run(&ast, &mut scope).unwrap();
+        let map = result.cast::<rhai::Map>();
+        assert_eq!(map.get("a").unwrap().as_int().unwrap(), 1);
+        assert_eq!(map.get("b").unwrap().as_int().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_run_preserves_return_value_integer() {
+        let engine = RhaiEngine::default();
+        let ast = engine.compile("42").unwrap();
+        let mut scope = Scope::new();
+        let result = engine.run(&ast, &mut scope).unwrap();
+        assert_eq!(result.as_int().unwrap(), 42);
     }
 }

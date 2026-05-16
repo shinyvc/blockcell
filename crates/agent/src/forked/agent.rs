@@ -606,6 +606,8 @@ pub struct ForkedAgentResult {
     pub files_modified: Vec<String>,
     /// 最终响应内容
     pub final_content: Option<String>,
+    /// 是否因达到 max_turns 而截断（未完成所有工具调用）
+    pub truncated: bool,
 }
 
 /// Forked Agent 错误
@@ -2284,6 +2286,7 @@ pub async fn run_forked_agent(
     let max_turns = params.max_turns.unwrap_or(5);
     let mut current_messages = messages.clone();
     let mut final_content = None;
+    let mut truncated = false;
 
     for turn in 0..max_turns {
         // 检查取消（使用新的 AbortToken）
@@ -2640,10 +2643,20 @@ pub async fn run_forked_agent(
                     name: Some(tool_name.clone()),
                 };
 
-                current_messages.push(tool_result_msg);
+                current_messages.push(tool_result_msg.clone());
+                output_messages.push(tool_result_msg);
             }
 
             // 继续循环让 LLM 处理工具结果
+            // 如果这是最后一个 turn 且仍有工具调用，标记为截断
+            if turn == max_turns - 1 {
+                truncated = true;
+                tracing::warn!(
+                    fork_label = params.fork_label,
+                    max_turns,
+                    "[forked_agent] 达到 max_turns 上限，结果被截断"
+                );
+            }
             continue;
         }
 
@@ -2692,6 +2705,7 @@ pub async fn run_forked_agent(
         total_usage,
         files_modified,
         final_content,
+        truncated,
     })
 }
 

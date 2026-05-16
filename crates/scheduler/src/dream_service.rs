@@ -130,7 +130,7 @@ impl DreamService {
             time_gate_threshold_hours: self.config.time_gate_threshold_hours,
             session_gate_threshold: self.config.session_gate_threshold,
         };
-        let consolidator = match DreamConsolidator::new(&config_dir).await {
+        let mut consolidator = match DreamConsolidator::new(&config_dir).await {
             Ok(c) => c.with_gate_config(gate_config),
             Err(e) => {
                 tracing::error!(error = %e, "[dream] Failed to create DreamConsolidator");
@@ -139,7 +139,7 @@ impl DreamService {
         };
 
         // 检查门控
-        let gate_result = consolidator.should_dream();
+        let gate_result = consolidator.should_dream().await;
 
         match gate_result {
             GateCheckResult::Passed => {

@@ -18,3 +18,10 @@ md5 = "0.7"
 tar = "0.4"
 flate2 = "1.0"
 shellexpand = "3"
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "winnt", "handleapi"] }

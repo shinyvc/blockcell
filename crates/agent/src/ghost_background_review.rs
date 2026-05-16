@@ -47,6 +47,35 @@ struct GhostReviewToolLoopOutcome {
     stop_reason: String,
 }
 
+/// RAII guard：确保 GhostMemoryProviderManager 在 Drop 时执行 shutdown_all()，
+/// 防止函数内部 ? 提前返回时跳过 shutdown 导致 provider 缓冲区/连接泄漏。
+struct ShutdownGuard<'a> {
+    manager: &'a Arc<crate::ghost_memory_provider::GhostMemoryProviderManager>,
+    armed: bool,
+}
+
+impl<'a> ShutdownGuard<'a> {
+    fn new(manager: &'a Arc<crate::ghost_memory_provider::GhostMemoryProviderManager>) -> Self {
+        Self {
+            manager,
+            armed: true,
+        }
+    }
+
+    /// 显式解除 shutdown 职责（用于需要手动控制 shutdown 时机的场景）
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ShutdownGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.manager.shutdown_all();
+        }
+    }
+}
+
 pub async fn run_background_review_for_episode(
     paths: &Paths,
     provider_pool: Arc<ProviderPool>,
@@ -95,17 +124,19 @@ pub async fn run_background_review_for_episode(
         );
     };
 
-    let ghost_memory_lifecycle: Option<Arc<dyn GhostMemoryLifecycleOps + Send + Sync>> = {
-        let manager = Arc::new(
-            crate::ghost_memory_provider::GhostMemoryProviderManager::with_local_file(
-                paths.clone(),
-            ),
-        );
-        manager.initialize_all("ghost_background_review", "reviewer");
-        Some(manager as Arc<dyn GhostMemoryLifecycleOps + Send + Sync>)
-    };
+    let manager = Arc::new(
+        crate::ghost_memory_provider::GhostMemoryProviderManager::with_local_file(
+            paths.clone(),
+        ),
+    );
+    manager.initialize_all("ghost_background_review", "reviewer");
+    let ghost_memory_lifecycle: Option<Arc<dyn GhostMemoryLifecycleOps + Send + Sync>> =
+        Some(manager.clone() as Arc<dyn GhostMemoryLifecycleOps + Send + Sync>);
 
-    match run_restricted_review_tool_loop(
+    // RAII guard：无论函数如何退出（包括 ? 提前返回），都会执行 shutdown_all()
+    let mut _shutdown_guard = ShutdownGuard::new(&manager);
+
+    let result = match run_restricted_review_tool_loop(
         paths,
         provider.as_ref(),
         &snapshot,
@@ -187,7 +218,13 @@ pub async fn run_background_review_for_episode(
                 review_worker_id,
             )
         }
-    }
+    };
+
+    // 显式 shutdown 并解除 guard 职责，避免 Drop 中重复调用
+    manager.shutdown_all();
+    _shutdown_guard.disarm();
+
+    result
 }
 
 pub fn spawn_background_review_for_episode(
@@ -248,6 +285,10 @@ pub async fn run_pending_background_reviews(
     }
 
     let ledger = GhostLedger::open(&paths.ghost_ledger_db())?;
+    // 在 claim 前清理过期 lease，释放因 worker 崩溃/超时而残留的 reviewing 状态
+    if let Err(e) = ledger.cleanup_expired_leases() {
+        warn!(error = %e, "Failed to cleanup expired review leases before claiming");
+    }
     let worker_id = format!("ghost-review-{}", uuid::Uuid::new_v4());
     let episodes =
         ledger.claim_reviewable_episodes(limit, &worker_id, REVIEW_LEASE_DURATION_SECS)?;

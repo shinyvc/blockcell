@@ -17,6 +17,7 @@ use blockcell_agent::forked::{
     create_dream_can_use_tool, run_forked_agent, CacheSafeParams, ForkedAgentParams,
 };
 use blockcell_agent::memory_event;
+use blockcell_agent::CrossProcessLock;
 use blockcell_core::types::ChatMessage;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -34,6 +35,11 @@ pub const DREAM_STATE_FILE: &str = ".dream_state.json";
 pub const SESSION_MEMORY_EXPIRY_DAYS: u64 = 7;
 /// 每次处理的最大 session memory 文件数
 pub const MAX_SESSIONS_TO_PROCESS: usize = 10;
+/// is_consolidating 标记的 stale 阈值（秒）
+///
+/// 超过此时间仍为 is_consolidating=true 时，视为上次整合异常退出留下的 stale 标记，
+/// gate 自动清除并允许新的整合。默认 1 小时，远大于正常整合超时（300s）。
+pub const CONSOLIDATING_STALE_THRESHOLD_SECS: u64 = 3600;
 
 /// Dream 执行统计数据
 #[derive(Debug, Clone, Default)]
@@ -64,18 +70,33 @@ struct MemoryDirState {
 }
 
 /// 梦境状态
+///
+/// 字段必须添加 `#[serde(default)]` 以保证向后兼容：
+/// 当新增字段时，旧版 .dream_state.json 文件仍能正确反序列化。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DreamState {
     /// 上次整合时间戳
+    #[serde(default)]
     pub last_consolidation_time: Option<u64>,
     /// 上次整合时的会话数
+    #[serde(default)]
     pub last_session_count: usize,
     /// 当前会话数
+    #[serde(default)]
     pub current_session_count: usize,
     /// 整合次数
+    #[serde(default)]
     pub consolidation_count: usize,
     /// 是否正在整合
+    #[serde(default)]
     pub is_consolidating: bool,
+    /// 整合开始时间戳（Unix 秒），用于检测 stale 的 is_consolidating 标记
+    ///
+    /// 当 is_consolidating=true 但 consolidating_started_at 超过
+    /// CONSOLIDATING_STALE_THRESHOLD_SECS 时，视为 stale 标记，
+    /// gate 自动清除并允许新的整合。
+    #[serde(default)]
+    pub consolidating_started_at: Option<u64>,
 }
 
 impl DreamState {
@@ -97,16 +118,113 @@ impl DreamState {
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 主文件不存在，尝试从 atomic_write 产生的备份恢复
+                // 备份文件名格式为 .dream_state.json.bak.<pid>.<counter>
+                let bak_path = blockcell_agent::fs_util::find_latest_backup(&path);
+                if let Some(bak) = bak_path {
+                    tracing::warn!(
+                        path = %path.display(),
+                        bak = %bak.display(),
+                        "[dream] 主文件不存在但发现备份文件，尝试恢复"
+                    );
+                    match fs::read_to_string(&bak).await {
+                        Ok(bak_content) => {
+                            match serde_json::from_str(&bak_content) {
+                                Ok(state) => {
+                                    // 恢复成功：将备份内容写入主文件
+                                    let write_content = serde_json::to_string_pretty(&state)?;
+                                    tokio::task::spawn_blocking(move || {
+                                        blockcell_agent::fs_util::atomic_write(
+                                            &path,
+                                            write_content.as_bytes(),
+                                        )
+                                    })
+                                    .await
+                                    .map_err(|e| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::Other,
+                                            e.to_string(),
+                                        )
+                                    })?
+                                    .map_err(|e| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::Other,
+                                            e.to_string(),
+                                        )
+                                    })?;
+                                    tracing::info!("[dream] 从备份文件恢复成功");
+                                    Ok(state)
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "[dream] 解析备份文件失败，使用默认值");
+                                    Ok(Self::default())
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            tracing::warn!("[dream] 读取备份文件失败，使用默认值");
+                            Ok(Self::default())
+                        }
+                    }
+                } else {
+                    Ok(Self::default())
+                }
+            }
             Err(e) => Err(e),
         }
     }
 
-    /// 保存状态
+    /// 保存状态（原子写入 + 跨进程锁，防止并发写入和崩溃导致文件损坏）
+    ///
+    /// 使用与 agent 侧 `increment_dream_session_count()` 相同的锁文件
+    /// `.dream_state.json.lock`，确保 scheduler 和 agent 的 read-modify-write
+    /// 序列互斥，避免 TOCTOU 竞争导致计数丢失。
+    ///
+    /// 获取锁失败时返回错误，不再继续非原子写入，
+    /// 避免在锁被其他进程持有时引入覆盖 session count 的风险。
     pub async fn save(&self, config_dir: &Path) -> std::io::Result<()> {
+        let lock_path = config_dir
+            .join(DREAM_STATE_FILE)
+            .with_extension("json.lock");
+        let _lock_guard = CrossProcessLock::acquire(&lock_path).map_err(|e| {
+            tracing::warn!(
+                error = %e,
+                "[dream] save: 获取跨进程锁失败，拒绝写入以防止覆盖风险"
+            );
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("获取跨进程锁失败，拒绝非原子写入: {}", e),
+            )
+        })?;
+
         let path = config_dir.join(DREAM_STATE_FILE);
         let content = serde_json::to_string_pretty(self)?;
-        fs::write(&path, content).await
+        // 使用 blockcell_agent::fs_util::atomic_write 保证原子性
+        // （backup-based 策略，Windows 安全）
+        let write_result = tokio::task::spawn_blocking(move || {
+            blockcell_agent::fs_util::atomic_write(&path, content.as_bytes())
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        write_result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
+    }
+
+    /// 保存状态，不获取跨进程锁。
+    ///
+    /// 供已持有 `.dream_state.json.lock` 的调用者使用（如 `dream()` 最终合并），
+    /// 避免持锁后再调用会重新抢锁的 `save()`，导致死锁或锁间隙。
+    async fn save_unlocked(&self, config_dir: &Path) -> std::io::Result<()> {
+        let path = config_dir.join(DREAM_STATE_FILE);
+        let content = serde_json::to_string_pretty(self)?;
+        let write_result = tokio::task::spawn_blocking(move || {
+            blockcell_agent::fs_util::atomic_write(&path, content.as_bytes())
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        write_result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        Ok(())
     }
 
     /// 增加会话计数
@@ -160,14 +278,87 @@ impl Default for ConsolidatorConfig {
 }
 
 /// 三重门控检查（使用配置值）
-pub fn check_gates(
-    state: &DreamState,
-    _config_dir: &Path,
+///
+/// 当 is_consolidating=true 但 consolidating_started_at 超过 stale 阈值时，
+/// 自动清除 stale 标记并持久化，允许新的整合继续。
+/// 这防止了因临时磁盘/锁异常导致 is_consolidating 永久卡住的问题。
+pub async fn check_gates(
+    state: &mut DreamState,
+    config_dir: &Path,
     config: &ConsolidatorConfig,
 ) -> GateCheckResult {
     // 1. 检查锁门控
     if state.is_consolidating {
-        return GateCheckResult::LockGateFailed;
+        // 检查是否为 stale 标记：consolidating_started_at 超过阈值
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let is_stale = match state.consolidating_started_at {
+            Some(started_at) => {
+                // 有开始时间，检查是否超过 stale 阈值
+                now.saturating_sub(started_at) > CONSOLIDATING_STALE_THRESHOLD_SECS
+            }
+            None => {
+                // is_consolidating=true 但没有 consolidating_started_at，
+                // 说明是旧格式数据或异常状态。
+                // 复用 .dream_lock 的有效性检查逻辑：
+                // 如果 lock 文件不存在或已失效（进程退出/超时），标记一定是 stale。
+                let lock_path = config_dir.join(LOCK_FILE_NAME);
+                if !lock_path.exists() {
+                    // 锁文件不存在，没有进程正在整合，标记是 stale
+                    true
+                } else {
+                    // 锁文件存在，但需要检查其有效性（进程是否存活、是否超时）
+                    match check_lock_validity(&lock_path).await {
+                        Ok(true) => {
+                            // 锁仍有效（进程存活且未过期），不是 stale
+                            tracing::warn!(
+                                "[dream] is_consolidating=true 但无 consolidating_started_at，且 .dream_lock 仍有效，gate 阻止新整合"
+                            );
+                            false
+                        }
+                        Ok(false) => {
+                            // 锁已失效（进程退出或超时），标记是 stale
+                            tracing::warn!(
+                                "[dream] is_consolidating=true 但无 consolidating_started_at，且 .dream_lock 已失效，自动清除 stale 标记并清理无效锁"
+                            );
+                            // 清理无效的锁文件
+                            let _ = fs::remove_file(&lock_path).await;
+                            true
+                        }
+                        Err(e) => {
+                            // 无法读取锁文件，视为 stale 并清理
+                            tracing::warn!(
+                                error = %e,
+                                "[dream] is_consolidating=true 但无 consolidating_started_at，无法读取 .dream_lock，视为 stale 并清理"
+                            );
+                            let _ = fs::remove_file(&lock_path).await;
+                            true
+                        }
+                    }
+                }
+            }
+        };
+
+        if is_stale {
+            tracing::warn!(
+                started_at = ?state.consolidating_started_at,
+                "[dream] 检测到 stale 的 is_consolidating 标记，自动清除恢复"
+            );
+            state.is_consolidating = false;
+            state.consolidating_started_at = None;
+            // 持久化清除后的状态，确保后续 gate 不再被卡住
+            if let Err(e) = state.save(config_dir).await {
+                tracing::warn!(
+                    error = %e,
+                    "[dream] 清除 stale 标记后保存状态失败，下次 gate 会再次尝试清除"
+                );
+                // 保存失败不阻止 gate 通过：内存中已清除，下次加载会重新检测
+            }
+        } else {
+            return GateCheckResult::LockGateFailed;
+        }
     }
 
     // 2. 检查时间门控
@@ -238,8 +429,8 @@ impl DreamConsolidator {
     }
 
     /// 检查是否应该执行梦境
-    pub fn should_dream(&self) -> GateCheckResult {
-        check_gates(&self.state, &self.config_dir, &self.gate_config)
+    pub async fn should_dream(&mut self) -> GateCheckResult {
+        check_gates(&mut self.state, &self.config_dir, &self.gate_config).await
     }
 
     /// 执行梦境整合
@@ -264,14 +455,25 @@ impl DreamConsolidator {
             .unwrap_or(24);
         memory_event!(layer6, dream_started, sessions_count, hours_since_last);
 
-        // 标记开始
+        // 标记开始（同时记录开始时间戳，用于 stale 检测）
         self.state.is_consolidating = true;
+        self.state.consolidating_started_at = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
         if let Err(e) = self.state.save(&self.config_dir).await {
             // 保存失败，重置状态并释放锁
             self.state.is_consolidating = false;
+            self.state.consolidating_started_at = None;
             let _ = self.release_lock().await;
             return Err(DreamError::Io(e));
         }
+
+        // 在整合开始前保存当前会话数快照，用于成功后推进 last_session_count。
+        // 避免整合期间新增的会话被误标为已整合（它们未必被本次 gather/prune 处理）。
+        let processed_session_count = self.state.current_session_count;
 
         let start_time = Instant::now();
 
@@ -308,6 +510,7 @@ impl DreamConsolidator {
 
         // 清理：无论成功、失败或超时，都要释放锁和重置标记
         self.state.is_consolidating = false;
+        self.state.consolidating_started_at = None;
 
         // 只有成功时才推进时间门和会话门，失败/超时保留原值以便重试
         if result.is_ok() {
@@ -317,16 +520,111 @@ impl DreamConsolidator {
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
             );
-            self.state.last_session_count = self.state.current_session_count;
+            // 只推进到整合开始前的快照值，而非 current_session_count。
+            // 整合期间新增的会话未必被本次 gather/prune 处理，
+            // 下一轮门控应仍能看到这些新会话。
+            self.state.last_session_count = processed_session_count;
             self.state.consolidation_count += 1;
         }
 
-        // 保存最终状态（失败时记录警告但继续）
-        if let Err(e) = self.state.save(&self.config_dir).await {
-            tracing::warn!(
-                error = %e,
-                "[dream] Failed to save final state"
-            );
+        // 最终保存：在同一个跨进程锁保护下完成 read-merge-write，
+        // 防止 agent 在 load 和 save 之间递增 session_count 并被覆盖。
+        //
+        // 关键：is_consolidating=false 必须落盘，否则后续 gate 永远 LockGateFailed。
+        // 获取锁失败或 save_unlocked 失败时，必须重试或返回错误，
+        // 不能让调用方看到成功但磁盘上仍为 is_consolidating=true。
+        {
+            let state_lock_path = self.config_dir
+                .join(DREAM_STATE_FILE)
+                .with_extension("json.lock");
+
+            // 重试获取状态锁，最多 3 次（间隔递增），确保 is_consolidating=false 能落盘
+            let state_lock_guard = {
+                let mut guard_result = CrossProcessLock::acquire(&state_lock_path);
+                let mut retry_count = 0;
+                const MAX_STATE_LOCK_RETRIES: u32 = 3;
+                while let Err(e) = guard_result {
+                    retry_count += 1;
+                    if retry_count > MAX_STATE_LOCK_RETRIES {
+                        tracing::error!(
+                            error = %e,
+                            retries = retry_count,
+                            "[dream] 获取状态锁失败（已重试 {retry_count} 次），is_consolidating=false 无法落盘，返回错误"
+                        );
+                        // 释放 dream lock
+                        if let Err(e) = self.release_lock().await {
+                            tracing::warn!(error = %e, "[dream] Failed to release lock");
+                        }
+                        // 返回错误而非成功：调用方必须知道状态未持久化
+                        return Err(DreamError::Io(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!(
+                                "获取状态锁失败（重试 {} 次），is_consolidating=false 无法落盘: {}",
+                                retry_count, e
+                            ),
+                        )));
+                    }
+                    tracing::warn!(
+                        error = %e,
+                        retry = retry_count,
+                        "[dream] 获取状态锁失败，重试中"
+                    );
+                    // 递增等待：100ms, 200ms, 300ms
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * retry_count as u64)).await;
+                    guard_result = CrossProcessLock::acquire(&state_lock_path);
+                }
+                guard_result.unwrap()
+            };
+
+            // 在锁内重新读取磁盘上的 current_session_count，
+            // 合并整合期间 agent 递增的增量。
+            // current_session_count 可以 merge 磁盘较大值（反映真实总数），
+            // 但 last_session_count 只推进到整合开始前的快照值，
+            // 防止整合期间新增的会话被误标为已整合。
+            if result.is_ok() {
+                if let Ok(disk) = DreamState::load(&self.config_dir).await {
+                    self.state.current_session_count =
+                        std::cmp::max(self.state.current_session_count, disk.current_session_count);
+                    // last_session_count 已在上方设为 processed_session_count，
+                    // 不再使用 merged current_session_count 更新它
+                }
+            }
+
+            // 保存最终状态（使用 save_unlocked 避免重复抢锁）
+            // 失败时重试最多 2 次，确保 is_consolidating=false 落盘
+            let mut save_retry_count = 0;
+            const MAX_SAVE_RETRIES: u32 = 2;
+            loop {
+                match self.state.save_unlocked(&self.config_dir).await {
+                    Ok(()) => break,
+                    Err(e) => {
+                        save_retry_count += 1;
+                        if save_retry_count > MAX_SAVE_RETRIES {
+                            tracing::error!(
+                                error = %e,
+                                retries = save_retry_count,
+                                "[dream] 最终状态保存失败（已重试 {save_retry_count} 次），is_consolidating=false 未落盘，返回错误"
+                            );
+                            // 状态锁在 drop 时自动释放
+                            drop(state_lock_guard);
+                            // 释放 dream lock
+                            if let Err(e) = self.release_lock().await {
+                                tracing::warn!(error = %e, "[dream] Failed to release lock");
+                            }
+                            // 返回错误而非成功：调用方必须知道 is_consolidating=false 未落盘
+                            return Err(DreamError::Io(e));
+                        }
+                        tracing::warn!(
+                            error = %e,
+                            retry = save_retry_count,
+                            "[dream] 最终状态保存失败，重试中"
+                        );
+                    }
+                }
+            }
+
+            // 状态锁在 _state_lock_guard drop 时自动释放
+            drop(state_lock_guard);
         }
 
         // 释放锁（失败时记录警告但继续）
@@ -411,7 +709,7 @@ impl DreamConsolidator {
             match fs::try_exists(&lock_path).await {
                 Ok(true) => {
                     // 锁文件存在，检查是否过期
-                    match self.check_lock_validity(&lock_path).await {
+                    match check_lock_validity(&lock_path).await {
                         Ok(true) => {
                             // 锁仍然有效，清理临时文件并返回
                             tracing::debug!(attempt, "[dream] Lock is held by another process");
@@ -505,97 +803,6 @@ impl DreamConsolidator {
         // 清理临时文件
         let _ = fs::remove_file(&temp_lock_path).await;
         Err(DreamError::LockAcquired)
-    }
-
-    /// 检查锁的有效性
-    ///
-    /// 返回 Ok(true) 表示锁仍有效（进程存活且未过期）
-    /// 返回 Ok(false) 表示锁已失效（进程已死或过期）
-    async fn check_lock_validity(&self, lock_path: &Path) -> Result<bool, DreamError> {
-        let content = fs::read_to_string(lock_path).await?;
-
-        // 解析 PID:TIMESTAMP
-        let parts: Vec<&str> = content.split(':').collect();
-        if parts.len() != 2 {
-            // 格式错误，锁无效
-            return Ok(false);
-        }
-
-        // 检查时间戳是否过期
-        let timestamp: u64 = parts[1].parse().unwrap_or(0);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let age_hours = (now - timestamp) / 3600;
-
-        if age_hours >= TIME_GATE_THRESHOLD_HOURS {
-            // 锁已过期
-            tracing::debug!(age_hours, "[dream] Lock expired");
-            return Ok(false);
-        }
-
-        // 检查持有锁的进程是否仍在运行
-        let pid: u32 = parts[0].parse().unwrap_or(0);
-        if pid == 0 {
-            return Ok(false);
-        }
-
-        // 跨平台进程存活检查
-        let process_alive = self.is_process_alive(pid);
-
-        Ok(process_alive)
-    }
-
-    /// 检查进程是否存活
-    #[cfg(unix)]
-    fn is_process_alive(&self, pid: u32) -> bool {
-        // Unix: 使用 kill(pid, 0) 检查进程是否存在
-        // ESRCH 表示进程不存在
-        unsafe {
-            let result = libc::kill(pid as i32, 0);
-            result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-        }
-    }
-
-    /// 检查进程是否存活
-    #[cfg(windows)]
-    fn is_process_alive(&self, pid: u32) -> bool {
-        // Windows: 尝试打开进程
-        use winapi::um::handleapi::CloseHandle;
-        use winapi::um::processthreadsapi::GetExitCodeProcess;
-        use winapi::um::processthreadsapi::OpenProcess;
-        use winapi::um::winnt::PROCESS_QUERY_INFORMATION;
-
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
-            if handle.is_null() {
-                return false;
-            }
-
-            let mut exit_code: u32 = 0;
-            let result = GetExitCodeProcess(handle, &mut exit_code);
-            CloseHandle(handle);
-
-            // STILL_ACTIVE (259) 表示进程仍在运行
-            //
-            // 已知限制：如果进程恰好以退出码 259 结束，会被误判为仍在运行。
-            // 这在现实中极其罕见，因为：
-            // 1. 259 不是常见的错误码
-            // 2. 大多数程序使用 0 表示成功，非零值表示错误
-            // 3. 即使发生误判，锁也会在 TIME_GATE_THRESHOLD_HOURS 小时后过期
-            //
-            // 如果需要更精确的检测，可以使用 WaitForSingleObject 等待 0 毫秒，
-            // 但那会增加代码复杂性。
-            result != 0 && exit_code == 259
-        }
-    }
-
-    /// 检查进程是否存活 (非 Unix 非 Windows 平台的保守实现)
-    #[cfg(not(any(unix, windows)))]
-    fn is_process_alive(&self, _pid: u32) -> bool {
-        // 保守策略：假设进程存活
-        true
     }
 
     /// 释放锁
@@ -1119,6 +1326,97 @@ impl DreamConsolidator {
     }
 }
 
+/// 检查锁的有效性（独立函数，供 check_gates 和 acquire_lock 复用）
+///
+/// 返回 Ok(true) 表示锁仍有效（进程存活且未过期）
+/// 返回 Ok(false) 表示锁已失效（进程已死或过期）
+async fn check_lock_validity(lock_path: &Path) -> Result<bool, DreamError> {
+    let content = fs::read_to_string(lock_path).await?;
+
+    // 解析 PID:TIMESTAMP
+    let parts: Vec<&str> = content.split(':').collect();
+    if parts.len() != 2 {
+        // 格式错误，锁无效
+        return Ok(false);
+    }
+
+    // 检查时间戳是否过期
+    let timestamp: u64 = parts[1].parse().unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let age_hours = (now - timestamp) / 3600;
+
+    if age_hours >= TIME_GATE_THRESHOLD_HOURS {
+        // 锁已过期
+        tracing::debug!(age_hours, "[dream] Lock expired");
+        return Ok(false);
+    }
+
+    // 检查持有锁的进程是否仍在运行
+    let pid: u32 = parts[0].parse().unwrap_or(0);
+    if pid == 0 {
+        return Ok(false);
+    }
+
+    // 跨平台进程存活检查
+    let process_alive = is_process_alive(pid);
+
+    Ok(process_alive)
+}
+
+/// 检查进程是否存活（独立函数，供 check_lock_validity 复用）
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    // Unix: 使用 kill(pid, 0) 检查进程是否存在
+    // ESRCH 表示进程不存在
+    unsafe {
+        let result = libc::kill(pid as i32, 0);
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+}
+
+/// 检查进程是否存活（独立函数，供 check_lock_validity 复用）
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    // Windows: 尝试打开进程
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::GetExitCodeProcess;
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::winnt::PROCESS_QUERY_INFORMATION;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+
+        let mut exit_code: u32 = 0;
+        let result = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+
+        // STILL_ACTIVE (259) 表示进程仍在运行
+        //
+        // 已知限制：如果进程恰好以退出码 259 结束，会被误判为仍在运行。
+        // 这在现实中极其罕见，因为：
+        // 1. 259 不是常见的错误码
+        // 2. 大多数程序使用 0 表示成功，非零值表示错误
+        // 3. 即使发生误判，锁也会在 TIME_GATE_THRESHOLD_HOURS 小时后过期
+        //
+        // 如果需要更精确的检测，可以使用 WaitForSingleObject 等待 0 毫秒，
+        // 但那会增加代码复杂性。
+        result != 0 && exit_code == 259
+    }
+}
+
+/// 检查进程是否存活 (非 Unix 非 Windows 平台的保守实现)
+#[cfg(not(any(unix, windows)))]
+fn is_process_alive(_pid: u32) -> bool {
+    // 保守策略：假设进程存活
+    true
+}
+
 /// 梦境错误类型
 #[derive(Debug, thiserror::Error)]
 pub enum DreamError {
@@ -1139,142 +1437,237 @@ pub enum DreamError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+    mod tests {
+        use super::*;
 
-    #[test]
-    fn test_dream_state_default() {
-        let state = DreamState::default();
-        assert!(state.last_consolidation_time.is_none());
-        assert_eq!(state.current_session_count, 0);
-        assert!(!state.is_consolidating);
-    }
+        #[test]
+        fn test_dream_state_default() {
+            let state = DreamState::default();
+            assert!(state.last_consolidation_time.is_none());
+            assert_eq!(state.current_session_count, 0);
+            assert!(!state.is_consolidating);
+            assert!(state.consolidating_started_at.is_none());
+        }
 
-    #[test]
-    fn test_dream_state_increment() {
-        let mut state = DreamState::default();
-        state.increment_session_count();
-        assert_eq!(state.current_session_count, 1);
-    }
+        #[test]
+        fn test_dream_state_increment() {
+            let mut state = DreamState::default();
+            state.increment_session_count();
+            assert_eq!(state.current_session_count, 1);
+        }
 
-    #[test]
-    fn test_check_gates_time_failed() {
-        let state = DreamState {
-            last_consolidation_time: Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            ),
-            last_session_count: 0,
-            current_session_count: 10,
-            consolidation_count: 1,
-            is_consolidating: false,
-        };
+        #[tokio::test]
+        async fn test_check_gates_time_failed() {
+            let mut state = DreamState {
+                last_consolidation_time: Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                ),
+                last_session_count: 0,
+                current_session_count: 10,
+                consolidation_count: 1,
+                is_consolidating: false,
+                consolidating_started_at: None,
+            };
 
-        let result = check_gates(&state, Path::new("/config"), &ConsolidatorConfig::default());
-        assert_eq!(result, GateCheckResult::TimeGateFailed);
-    }
+            let result = check_gates(&mut state, Path::new("/config"), &ConsolidatorConfig::default()).await;
+            assert_eq!(result, GateCheckResult::TimeGateFailed);
+        }
 
-    #[test]
-    fn test_check_gates_session_failed() {
-        let state = DreamState {
-            last_consolidation_time: Some(0), // 很久以前
-            last_session_count: 0,
-            current_session_count: 3, // 少于阈值 5
-            consolidation_count: 1,
-            is_consolidating: false,
-        };
+        #[tokio::test]
+        async fn test_check_gates_session_failed() {
+            let mut state = DreamState {
+                last_consolidation_time: Some(0), // 很久以前
+                last_session_count: 0,
+                current_session_count: 3, // 少于阈值 5
+                consolidation_count: 1,
+                is_consolidating: false,
+                consolidating_started_at: None,
+            };
 
-        let result = check_gates(&state, Path::new("/config"), &ConsolidatorConfig::default());
-        assert_eq!(result, GateCheckResult::SessionGateFailed);
-    }
+            let result = check_gates(&mut state, Path::new("/config"), &ConsolidatorConfig::default()).await;
+            assert_eq!(result, GateCheckResult::SessionGateFailed);
+        }
 
-    #[test]
-    fn test_check_gates_lock_failed() {
-        let state = DreamState {
-            last_consolidation_time: Some(0),
-            last_session_count: 0,
-            current_session_count: 10,
-            consolidation_count: 1,
-            is_consolidating: true, // 正在整合
-        };
+        #[tokio::test]
+        async fn test_check_gates_lock_failed_active() {
+            // is_consolidating=true 且 consolidating_started_at 在阈值内 → 仍为活跃整合
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let mut state = DreamState {
+                last_consolidation_time: Some(0),
+                last_session_count: 0,
+                current_session_count: 10,
+                consolidation_count: 1,
+                is_consolidating: true, // 正在整合
+                consolidating_started_at: Some(now), // 刚开始
+            };
 
-        let result = check_gates(&state, Path::new("/config"), &ConsolidatorConfig::default());
-        assert_eq!(result, GateCheckResult::LockGateFailed);
-    }
+            let result = check_gates(&mut state, Path::new("/config"), &ConsolidatorConfig::default()).await;
+            assert_eq!(result, GateCheckResult::LockGateFailed);
+        }
 
-    #[test]
-    fn test_check_gates_passed() {
-        let state = DreamState {
-            last_consolidation_time: Some(0), // 很久以前
-            last_session_count: 0,
-            current_session_count: 10, // 超过阈值 5
-            consolidation_count: 1,
-            is_consolidating: false,
-        };
+        #[tokio::test]
+        async fn test_check_gates_stale_consolidating_auto_recover() {
+            // is_consolidating=true 但 consolidating_started_at 超过阈值 → 自动清除 stale 标记
+            let stale_time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .saturating_sub(CONSOLIDATING_STALE_THRESHOLD_SECS + 100);
+            let mut state = DreamState {
+                last_consolidation_time: Some(0),
+                last_session_count: 0,
+                current_session_count: 10,
+                consolidation_count: 1,
+                is_consolidating: true,
+                consolidating_started_at: Some(stale_time), // 超时
+            };
 
-        let result = check_gates(&state, Path::new("/config"), &ConsolidatorConfig::default());
-        assert_eq!(result, GateCheckResult::Passed);
-    }
+            let result = check_gates(&mut state, Path::new("/config"), &ConsolidatorConfig::default()).await;
+            // stale 标记被清除后，应继续检查时间和会话门控
+            assert_eq!(result, GateCheckResult::Passed);
+            // 内存中状态已清除
+            assert!(!state.is_consolidating);
+            assert!(state.consolidating_started_at.is_none());
+        }
 
-    // ========== 核心路径测试 ==========
+        #[tokio::test]
+        async fn test_check_gates_passed() {
+            let mut state = DreamState {
+                last_consolidation_time: Some(0), // 很久以前
+                last_session_count: 0,
+                current_session_count: 10, // 超过阈值 5
+                consolidation_count: 1,
+                is_consolidating: false,
+                consolidating_started_at: None,
+            };
 
-    #[test]
-    fn test_gathered_signal_creation() {
-        use std::time::SystemTime;
+            let result = check_gates(&mut state, Path::new("/config"), &ConsolidatorConfig::default()).await;
+            assert_eq!(result, GateCheckResult::Passed);
+        }
 
-        let signal = GatheredSignal {
-            title: "User Preferences".to_string(),
-            content: "User prefers dark mode".to_string(),
-            importance: 8,
-            source_time: SystemTime::now(),
-        };
+        // ========== 核心路径测试 ==========
 
-        assert_eq!(signal.title, "User Preferences");
-        assert_eq!(signal.importance, 8);
-    }
+        #[test]
+        fn test_gathered_signal_creation() {
+            use std::time::SystemTime;
 
-    #[test]
-    fn test_dream_state_serialization() {
-        let state = DreamState {
-            last_consolidation_time: Some(1234567890),
-            last_session_count: 5,
-            current_session_count: 10,
-            consolidation_count: 3,
-            is_consolidating: false,
-        };
+            let signal = GatheredSignal {
+                title: "User Preferences".to_string(),
+                content: "User prefers dark mode".to_string(),
+                importance: 8,
+                source_time: SystemTime::now(),
+            };
 
-        let json = serde_json::to_string(&state).unwrap();
-        let deserialized: DreamState = serde_json::from_str(&json).unwrap();
+            assert_eq!(signal.title, "User Preferences");
+            assert_eq!(signal.importance, 8);
+        }
 
-        assert_eq!(deserialized.last_consolidation_time, Some(1234567890));
-        assert_eq!(deserialized.current_session_count, 10);
-    }
+        #[test]
+        fn test_dream_state_serialization() {
+            let state = DreamState {
+                last_consolidation_time: Some(1234567890),
+                last_session_count: 5,
+                current_session_count: 10,
+                consolidation_count: 3,
+                is_consolidating: false,
+                consolidating_started_at: None,
+            };
 
-    #[test]
-    fn test_gate_check_result_variants() {
-        // 确保所有变体都能正确创建和比较
+            let json = serde_json::to_string(&state).unwrap();
+            let deserialized: DreamState = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(deserialized.last_consolidation_time, Some(1234567890));
+            assert_eq!(deserialized.current_session_count, 10);
+        }
+
+        #[test]
+        fn test_gate_check_result_variants() {
+            // 确保所有变体都能正确创建和比较
+            assert_eq!(
+                GateCheckResult::TimeGateFailed,
+                GateCheckResult::TimeGateFailed
+            );
+            assert_eq!(
+                GateCheckResult::SessionGateFailed,
+                GateCheckResult::SessionGateFailed
+            );
+            assert_eq!(
+                GateCheckResult::LockGateFailed,
+                GateCheckResult::LockGateFailed
+            );
+            assert_eq!(GateCheckResult::Passed, GateCheckResult::Passed);
+        }
+
+        #[test]
+        fn test_dream_config_defaults() {
+            assert_eq!(TIME_GATE_THRESHOLD_HOURS, 24);
+            assert_eq!(SESSION_GATE_THRESHOLD, 5);
+            assert_eq!(SESSION_MEMORY_EXPIRY_DAYS, 7);
+            assert_eq!(MAX_SESSIONS_TO_PROCESS, 10);
+            assert_eq!(CONSOLIDATING_STALE_THRESHOLD_SECS, 3600);
+        }
+
+        /// 测试：DreamState 与 agent 侧 DreamStateData 的 JSON schema 一致性
+        ///
+        /// 验证两个独立定义的结构体序列化/反序列化结果完全一致，
+        /// 防止字段名、类型或 serde 属性不匹配导致跨 crate 数据丢失。
+        /// 长期方案：将共享结构体移至 blockcell-core crate。
+        #[test]
+        fn test_dream_state_schema_consistency_with_agent_side() {
+            use blockcell_agent::dream_state::DreamStateData;
+
+            // 构造一个包含所有字段的完整实例
+            let scheduler_state = DreamState {
+                last_consolidation_time: Some(1234567890),
+                last_session_count: 10,
+                current_session_count: 15,
+                consolidation_count: 3,
+                is_consolidating: true,
+                consolidating_started_at: Some(1234567800),
+            };
+
+            // 序列化 scheduler 侧结构体
+            let scheduler_json = serde_json::to_value(&scheduler_state).unwrap();
+
+            // 用 agent 侧结构体反序列化
+            let agent_state: DreamStateData = serde_json::from_value(scheduler_json.clone()).unwrap();
+
+            // 验证所有字段值一致
+            assert_eq!(agent_state.last_consolidation_time, Some(1234567890u64));
+            assert_eq!(agent_state.last_session_count, 10);
+            assert_eq!(agent_state.current_session_count, 15);
+            assert_eq!(agent_state.consolidation_count, 3);
+            assert!(agent_state.is_consolidating);
+            assert_eq!(agent_state.consolidating_started_at, Some(1234567800u64));
+
+            // 反向：用 agent 侧结构体序列化，scheduler 侧反序列化
+            let agent_json = serde_json::to_value(&agent_state).unwrap();
+            let restored: DreamState = serde_json::from_value(agent_json.clone()).unwrap();
+            assert_eq!(restored.last_consolidation_time, Some(1234567890));
+            assert_eq!(restored.last_session_count, 10);
+            assert_eq!(restored.current_session_count, 15);
+            assert_eq!(restored.consolidation_count, 3);
+            assert!(restored.is_consolidating);
+            assert_eq!(restored.consolidating_started_at, Some(1234567800));
+
+            // 验证 JSON key 集合完全一致
+            let scheduler_keys: std::collections::BTreeSet<String> = scheduler_json
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let agent_keys: std::collections::BTreeSet<String> =
+            agent_json.as_object().unwrap().keys().cloned().collect();
         assert_eq!(
-            GateCheckResult::TimeGateFailed,
-            GateCheckResult::TimeGateFailed
+            scheduler_keys, agent_keys,
+            "scheduler 和 agent 侧 DreamState 的 JSON key 集合不一致"
         );
-        assert_eq!(
-            GateCheckResult::SessionGateFailed,
-            GateCheckResult::SessionGateFailed
-        );
-        assert_eq!(
-            GateCheckResult::LockGateFailed,
-            GateCheckResult::LockGateFailed
-        );
-        assert_eq!(GateCheckResult::Passed, GateCheckResult::Passed);
-    }
-
-    #[test]
-    fn test_dream_config_defaults() {
-        assert_eq!(TIME_GATE_THRESHOLD_HOURS, 24);
-        assert_eq!(SESSION_GATE_THRESHOLD, 5);
-        assert_eq!(SESSION_MEMORY_EXPIRY_DAYS, 7);
-        assert_eq!(MAX_SESSIONS_TO_PROCESS, 10);
     }
 }

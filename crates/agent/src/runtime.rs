@@ -2169,6 +2169,15 @@ pub fn create_evolution_deploy_callback(
     let paths = paths.clone();
 
     Some(Arc::new(move |skill_name: &str| {
+        // 失效 prompt snapshot 文件，确保下一轮 reload_skills() 重新生成
+        if let Err(e) = blockcell_skills::SkillManager::invalidate_prompt_snapshot(&paths) {
+            tracing::warn!(
+                skill = %skill_name,
+                error = %e,
+                "[evolution] Failed to invalidate prompt snapshot after deploy"
+            );
+        }
+
         let boundary = GhostLearningBoundary {
             kind: GhostLearningBoundaryKind::EvolutionSuccess,
             session_key: None,
@@ -2213,6 +2222,15 @@ impl AgentRuntime {
         let paths = self.paths.clone();
 
         let callback: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |skill_name: &str| {
+            // Invalidate prompt snapshot so next skill prompt generation reads fresh content
+            if let Err(e) = blockcell_skills::SkillManager::invalidate_prompt_snapshot(&paths) {
+                tracing::warn!(
+                    skill = %skill_name,
+                    error = %e,
+                    "[evolution] Failed to invalidate prompt snapshot after deploy"
+                );
+            }
+
             if !config.agents.ghost.learning.enabled {
                 return;
             }
@@ -2881,9 +2899,13 @@ impl AgentRuntime {
         // 共享 skill_index_summary Arc, 供后台 Review 完成后刷新
         let skill_index_cache = self.context_builder.skill_index_summary_arc();
         let learning_coordinator = Arc::clone(&self.learning_coordinator);
+        // 继承主 agent 的 abort token，确保用户取消任务时后台 review 也被取消
+        let review_abort_token = self.abort_token.child();
 
         tokio::spawn(async move {
-            let _review_completion_guard = LearningReviewCompletionGuard::new(learning_coordinator);
+            // 用 scope_abort_token 包裹整个 review 逻辑，取消时立即退出
+            scope_abort_token(review_abort_token, async {
+                let _review_completion_guard = LearningReviewCompletionGuard::new(learning_coordinator);
 
             // 构建 Skill 索引（仅在 Skill/Combined 模式下需要）
             let skill_summary = match mode_clone {
@@ -2987,6 +3009,9 @@ impl AgentRuntime {
 
             match crate::forked::run_forked_agent(params).await {
                 Ok(result) => {
+                    if result.truncated {
+                        tracing::warn!(mode = ?mode_clone, "[Nudge] Review 结果被截断，可能丢失部分信息");
+                    }
                     tracing::info!(
                         mode = ?mode_clone,
                         tokens_out = result.total_usage.output_tokens,
@@ -3034,6 +3059,7 @@ impl AgentRuntime {
                     tracing::warn!(mode = ?mode_clone, error = %e, "[Nudge] Review 失败");
                 }
             }
+        }).await;
         });
     }
 
@@ -3185,6 +3211,9 @@ impl AgentRuntime {
 
         match crate::forked::run_forked_agent(params).await {
             Ok(result) => {
+                if result.truncated {
+                    tracing::warn!("[flush] Memory flush 结果被截断");
+                }
                 tracing::info!(
                     tokens_out = result.total_usage.output_tokens,
                     "[flush] Memory flush 完成"
@@ -3458,6 +3487,7 @@ impl AgentRuntime {
         history: &[ChatMessage],
         final_response: &str,
         tool_call_counts: &HashMap<String, u32>,
+        success: bool,
     ) -> Result<Option<String>> {
         if !self.ghost_learning_enabled()
             || matches!(
@@ -3483,7 +3513,7 @@ impl AgentRuntime {
             memory_write_count: 0,
             correction_count: Self::detect_correction_signal_count(&msg.content),
             preference_correction_count: Self::detect_preference_correction_count(&msg.content),
-            success: true,
+            success,
             complexity_score: estimate_turn_complexity_score(&msg.content),
             reusable_lesson: None,
         };
@@ -6630,6 +6660,7 @@ impl AgentRuntime {
             &history,
             &final_response,
             &tool_call_counts,
+            !llm_failed_after_retries,
         ) {
             Ok(episode_id) => episode_id,
             Err(e) => {
@@ -8560,6 +8591,7 @@ fn capture_delegation_end_learning_boundary_with_config(
     task_id: Option<&str>,
     task_goal: &str,
     child_summary: &str,
+    success: bool,
 ) -> Result<Option<String>> {
     let task_goal = task_goal.trim();
     let child_summary = child_summary.trim();
@@ -8598,7 +8630,7 @@ fn capture_delegation_end_learning_boundary_with_config(
         memory_write_count: 0,
         correction_count: 0,
         preference_correction_count: 0,
-        success: true,
+        success,
         complexity_score: estimate_turn_complexity_score(task_goal),
         reusable_lesson: Some(truncate_str(child_summary, 240)),
     };
@@ -8646,6 +8678,7 @@ impl AgentRuntime {
             None,
             task_goal,
             child_summary,
+            true,
         )
     }
 }
@@ -8972,9 +9005,15 @@ impl AgentRuntime {
                     .await
                     .map_err(|e| blockcell_core::Error::Tool(format!("Fork failed: {}", e)))?;
 
-                Ok(result
+                // 如果工具结果被截断，追加提示让用户知道
+                let mut content = result
                     .final_content
-                    .unwrap_or_else(|| "Fork completed with no output".to_string()))
+                    .unwrap_or_else(|| "Fork completed with no output".to_string());
+                if result.truncated {
+                    tracing::warn!("[fork] 工具结果被截断，可能丢失部分信息");
+                    content.push_str("\n\n[注意: 结果因长度限制被截断，可能丢失部分信息]");
+                }
+                Ok(content)
             }),
         ) // scope_agent_context + scope_abort_token
         .await
@@ -9638,20 +9677,22 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
 
         let child_abort_token = current_abort_token().map(|t| t.child()).unwrap_or_default();
 
-        scope_agent_context(identity.clone(), async {
-            info!(
-                agent_id = %identity.agent_id,
-                role = "fork-child",
-                "Executing fork mode"
-            );
+        scope_abort_token(
+            child_abort_token.clone(),
+            scope_agent_context(identity.clone(), async {
+                info!(
+                    agent_id = %identity.agent_id,
+                    role = "fork-child",
+                    "Executing fork mode"
+                );
 
-            let safe_prompt = AgentRuntime::sanitize_fork_prompt(&prompt);
-            let fork_messages = vec![
-                ChatMessage::system(
-                    "You are a forked agent. Execute directly without spawning subagents.",
-                ),
-                ChatMessage::user(&format!(
-                    "<fork_directive>\n\
+                let safe_prompt = AgentRuntime::sanitize_fork_prompt(&prompt);
+                let fork_messages = vec![
+                    ChatMessage::system(
+                        "You are a forked agent. Execute directly without spawning subagents.",
+                    ),
+                    ChatMessage::user(&format!(
+                        "<fork_directive>\n\
                     RULES:\n\
                     1. Do NOT spawn sub-agents; execute directly.\n\
                     2. Do NOT converse; execute and report results.\n\
@@ -9659,70 +9700,77 @@ impl blockcell_tools::RuntimeHandle for LightweightRuntimeHandle {
                     4. Keep report under 500 words.\n\
                     \n\
                     Task: {}",
-                    safe_prompt
-                )),
-            ];
+                        safe_prompt
+                    )),
+                ];
 
-            let cache_safe_params = CacheSafeParams {
-                fork_context_messages: parent_history,
-                ..CacheSafeParams::default()
-            };
-            let overrides = SubagentOverrides {
-                abort_token: Some(child_abort_token),
-                ..Default::default()
-            };
+                let cache_safe_params = CacheSafeParams {
+                    fork_context_messages: parent_history,
+                    ..CacheSafeParams::default()
+                };
+                let overrides = SubagentOverrides {
+                    abort_token: Some(child_abort_token),
+                    ..Default::default()
+                };
 
-            let mut builder = ForkedAgentParams::builder()
-                .provider_pool(self.provider_pool.clone())
-                .prompt_messages(fork_messages)
-                .cache_safe_params(cache_safe_params)
-                .fork_label("fork")
-                .max_turns(10)
-                .agent_type(None)
-                .disallowed_tools(vec!["agent".to_string(), "spawn".to_string()])
-                .one_shot(true)
-                .overrides(overrides);
+                let mut builder = ForkedAgentParams::builder()
+                    .provider_pool(self.provider_pool.clone())
+                    .prompt_messages(fork_messages)
+                    .cache_safe_params(cache_safe_params)
+                    .fork_label("fork")
+                    .max_turns(10)
+                    .agent_type(None)
+                    .disallowed_tools(vec!["agent".to_string(), "spawn".to_string()])
+                    .one_shot(true)
+                    .overrides(overrides);
 
-            // 传递 event_tx 用于转发 fork agent 进度事件到父级
-            if let Some(ref tx) = self.event_tx {
-                builder = builder.event_tx(tx.clone());
-            }
+                // 传递 event_tx 用于转发 fork agent 进度事件到父级
+                if let Some(ref tx) = self.event_tx {
+                    builder = builder.event_tx(tx.clone());
+                }
 
-            // 传递 progress_tx 用于转发工具调用事件到外部渠道
-            if let Some(tx) = self.task_manager.progress_tx() {
-                builder = builder.progress_tx(tx);
-            }
+                // 传递 progress_tx 用于转发工具调用事件到外部渠道
+                if let Some(tx) = self.task_manager.progress_tx() {
+                    builder = builder.progress_tx(tx);
+                }
 
-            // 传递 skill_mutex 和 memory_store，使 fork agent 可以使用技能和记忆工具
-            builder = builder.skill_mutex(Arc::new(self.skill_mutex.clone()));
-            if let Some(ref store) = self.memory_store {
-                builder = builder.memory_store(store.clone());
-            }
-            if let Some(ref store) = self.memory_file_store {
-                builder = builder.memory_file_store(store.clone());
-            }
-            if let Some(ref store) = self.skill_file_store {
-                builder = builder.skill_file_store(store.clone());
-            }
-            builder = builder.skills_dir(self.paths.skills_dir());
+                // 传递 skill_mutex 和 memory_store，使 fork agent 可以使用技能和记忆工具
+                builder = builder.skill_mutex(Arc::new(self.skill_mutex.clone()));
+                if let Some(ref store) = self.memory_store {
+                    builder = builder.memory_store(store.clone());
+                }
+                if let Some(ref store) = self.memory_file_store {
+                    builder = builder.memory_file_store(store.clone());
+                }
+                if let Some(ref store) = self.skill_file_store {
+                    builder = builder.skill_file_store(store.clone());
+                }
+                builder = builder.skills_dir(self.paths.skills_dir());
 
-            // 构建并传递工具 schema，让 LLM 知道可以调用哪些工具
-            let fork_disallowed = vec!["agent".to_string(), "spawn".to_string()];
-            let tool_schemas = crate::forked::build_forked_tool_schemas(&fork_disallowed);
-            builder = builder.tool_schemas(tool_schemas);
+                // 构建并传递工具 schema，让 LLM 知道可以调用哪些工具
+                let fork_disallowed = vec!["agent".to_string(), "spawn".to_string()];
+                let tool_schemas = crate::forked::build_forked_tool_schemas(&fork_disallowed);
+                builder = builder.tool_schemas(tool_schemas);
 
-            let params = builder.build().map_err(|e| {
-                blockcell_core::Error::Tool(format!("ForkedAgentParams build failed: {}", e))
-            })?;
+                let params = builder.build().map_err(|e| {
+                    blockcell_core::Error::Tool(format!("ForkedAgentParams build failed: {}", e))
+                })?;
 
-            let result = run_forked_agent(params)
-                .await
-                .map_err(|e| blockcell_core::Error::Tool(format!("Fork failed: {}", e)))?;
+                let result = run_forked_agent(params)
+                    .await
+                    .map_err(|e| blockcell_core::Error::Tool(format!("Fork failed: {}", e)))?;
 
-            Ok(result
-                .final_content
-                .unwrap_or_else(|| "Fork completed with no output".to_string()))
-        })
+                // 如果工具结果被截断，追加提示让用户知道
+                let mut content = result
+                    .final_content
+                    .unwrap_or_else(|| "Fork completed with no output".to_string());
+                if result.truncated {
+                    tracing::warn!("[fork] 工具结果被截断，可能丢失部分信息");
+                    content.push_str("\n\n[注意: 结果因长度限制被截断，可能丢失部分信息]");
+                }
+                Ok(content)
+            }),
+        )
         .await
     }
 
@@ -10186,6 +10234,7 @@ async fn run_subagent_task(
                 Some(&task_id),
                 &task_str,
                 &result,
+                true,
             ) {
                 warn!(
                     task_id = %task_id,
@@ -10214,6 +10263,24 @@ async fn run_subagent_task(
             let err_msg = format!("{}", e);
             task_manager.set_failed(&task_id, &err_msg).await;
             error!(task_id = %task_id, error = %e, "Subagent failed");
+
+            // 失败的 delegation 也是重要的学习机会
+            if let Err(ghost_err) = capture_delegation_end_learning_boundary_with_config(
+                &learning_config,
+                &learning_paths,
+                &origin_channel,
+                &origin_chat_id,
+                Some(&task_id),
+                &task_str,
+                &err_msg,
+                false,
+            ) {
+                warn!(
+                    task_id = %task_id,
+                    error = %ghost_err,
+                    "Failed to persist delegation-end ghost learning episode (failure case)"
+                );
+            }
 
             let short_id = truncate_str(&task_id, 8);
             let failure_message = format!(
