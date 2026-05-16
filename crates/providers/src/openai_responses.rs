@@ -3,7 +3,7 @@ use blockcell_core::config::ToolCallMode;
 use blockcell_core::types::{ChatMessage, LLMResponse, ToolCallRequest};
 use blockcell_core::{Error, Result};
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -460,7 +460,16 @@ struct ResponsesRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<Value>,
     max_output_tokens: u32,
+    #[serde(serialize_with = "serialize_temperature")]
     temperature: f32,
+}
+
+fn serialize_temperature<S>(temperature: &f32, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let rounded = (*temperature as f64 * 1000.0).round() / 1000.0;
+    serializer.serialize_f64(rounded)
 }
 
 #[async_trait]

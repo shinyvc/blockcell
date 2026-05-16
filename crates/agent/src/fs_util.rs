@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(windows)]
 use tracing::warn;
 
 /// 全局计数器，用于生成唯一的临时文件名
@@ -16,6 +17,7 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
 ///
 /// 使用追加方式而非 `with_extension`，确保对 `.dream_state.json` 等多扩展名文件
 /// 生成 `.dream_state.json.bak.<pid>.<counter>` 而非 `.dream_state.bak.<pid>.<counter>`。
+#[cfg(windows)]
 fn unique_bak_path(path: &Path) -> PathBuf {
     let pid = std::process::id();
     let counter = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);

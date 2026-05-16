@@ -144,7 +144,13 @@ impl PermissionSet {
     }
 
     pub fn is_subset_of(&self, other: &PermissionSet) -> bool {
-        self.permissions.is_subset(&other.permissions)
+        self.permissions
+            .iter()
+            .all(|perm| other.permissions.contains(perm) || other.has_napcat_tool_wildcard(perm))
+    }
+
+    fn has_napcat_tool_wildcard(&self, required: &str) -> bool {
+        required.starts_with("napcat:napcat_") && self.permissions.contains("napcat:tools")
     }
 }
 

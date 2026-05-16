@@ -516,7 +516,6 @@ fn short_task_id(task_id: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blockcell_core::Paths;
 
     #[tokio::test]
     async fn test_tasks_command_no_manager() {

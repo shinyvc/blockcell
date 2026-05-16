@@ -279,6 +279,7 @@ pub fn build_napcat_permissions(tool_name: &str) -> PermissionSet {
 
     // Channel restriction - all napcat tools require this
     perms = perms.with_permission("channel:napcat");
+    perms = perms.with_permission(&format!("napcat:{tool_name}"));
 
     // Risk level permission - determines who can use this tool
     match get_tool_risk_level(tool_name) {
