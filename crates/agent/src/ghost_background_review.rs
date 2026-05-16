@@ -125,9 +125,7 @@ pub async fn run_background_review_for_episode(
     };
 
     let manager = Arc::new(
-        crate::ghost_memory_provider::GhostMemoryProviderManager::with_local_file(
-            paths.clone(),
-        ),
+        crate::ghost_memory_provider::GhostMemoryProviderManager::with_local_file(paths.clone()),
     );
     manager.initialize_all("ghost_background_review", "reviewer");
     let ghost_memory_lifecycle: Option<Arc<dyn GhostMemoryLifecycleOps + Send + Sync>> =

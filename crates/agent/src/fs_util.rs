@@ -20,7 +20,10 @@ fn unique_bak_path(path: &Path) -> PathBuf {
     let pid = std::process::id();
     let counter = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
     // 追加 .bak.<pid>.<counter> 到完整文件名，而非替换扩展名
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
     let bak_name = format!("{file_name}.bak.{pid}.{counter}");
     path.with_file_name(bak_name)
 }
@@ -29,7 +32,10 @@ fn unique_bak_path(path: &Path) -> PathBuf {
 ///
 /// 与 `unique_bak_path` 共用同一命名逻辑，确保查找和生成使用相同的命名格式。
 fn bak_prefix_for(path: &Path) -> String {
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
     format!("{file_name}.bak.")
 }
 
@@ -91,9 +97,9 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
             if let Err(e) = std::fs::rename(path, &bak_path) {
                 // 无法备份 — 清理临时文件并返回错误
                 let _ = std::fs::remove_file(&tmp_path);
-                return Err(std::io::Error::other(
-                    format!("atomic_write: 备份现有文件失败: {e}"),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "atomic_write: 备份现有文件失败: {e}"
+                )));
             }
         }
 

@@ -349,11 +349,7 @@ impl Drop for CapabilityLockGuard {
 /// 获取 `tool_versions/<safe_id>.lock` 文件锁后执行闭包，
 /// 确保同一 capability 的 rollback/create_version/cleanup 互斥。
 /// 获取锁后首先检查并恢复未完成的 rollback journal，保证崩溃安全。
-fn with_capability_lock<F, R>(
-    versions_dir: &Path,
-    capability_id: &str,
-    f: F,
-) -> Result<R>
+fn with_capability_lock<F, R>(versions_dir: &Path, capability_id: &str, f: F) -> Result<R>
 where
     F: FnOnce() -> Result<R>,
 {
@@ -557,7 +553,10 @@ impl CapabilityVersionManager {
     ) -> Result<CapabilityVersion> {
         with_capability_lock(&self.versions_dir, capability_id, || {
             self.create_version_if_new_artifact_unlocked(
-                capability_id, artifact_path, source, changelog,
+                capability_id,
+                artifact_path,
+                source,
+                changelog,
             )
         })
     }
@@ -694,7 +693,9 @@ impl CapabilityVersionManager {
             ext
         ));
         if let Err(e) = fs::copy(&restore_path, &tmp_path) {
-            return Err(Error::Other(format!("rollback: 复制快照到临时文件失败: {e}")));
+            return Err(Error::Other(format!(
+                "rollback: 复制快照到临时文件失败: {e}"
+            )));
         }
 
         // 确保临时文件数据落盘后再替换
@@ -723,7 +724,9 @@ impl CapabilityVersionManager {
 
         // 写入 rollback journal（崩溃恢复用）
         // journal 格式：第一行 active_backup 路径，第二行 active_path 路径
-        let journal_path = self.versions_dir.join(format!("{}.rollback_journal", safe_id));
+        let journal_path = self
+            .versions_dir
+            .join(format!("{}.rollback_journal", safe_id));
         let journal_content = format!(
             "{}\n{}",
             active_backup.to_string_lossy(),
@@ -737,14 +740,16 @@ impl CapabilityVersionManager {
                 }
                 Error::Other(format!("rollback: 创建 rollback journal 失败: {e}"))
             })?;
-            journal_file.write_all(journal_content.as_bytes()).map_err(|e| {
-                let _ = fs::remove_file(&tmp_path);
-                if had_active {
-                    let _ = fs::remove_file(&active_backup);
-                }
-                let _ = fs::remove_file(&journal_path);
-                Error::Other(format!("rollback: 写入 rollback journal 失败: {e}"))
-            })?;
+            journal_file
+                .write_all(journal_content.as_bytes())
+                .map_err(|e| {
+                    let _ = fs::remove_file(&tmp_path);
+                    if had_active {
+                        let _ = fs::remove_file(&active_backup);
+                    }
+                    let _ = fs::remove_file(&journal_path);
+                    Error::Other(format!("rollback: 写入 rollback journal 失败: {e}"))
+                })?;
             let _ = journal_file.sync_all();
         }
 
@@ -823,7 +828,11 @@ impl CapabilityVersionManager {
     }
 
     /// cleanup_old_versions 的内部实现（无锁，由 with_capability_lock 调用）
-    fn cleanup_old_versions_unlocked(&self, capability_id: &str, keep_count: usize) -> Result<usize> {
+    fn cleanup_old_versions_unlocked(
+        &self,
+        capability_id: &str,
+        keep_count: usize,
+    ) -> Result<usize> {
         let mut history = self.get_history_unlocked(capability_id)?;
 
         if history.versions.len() <= keep_count {
@@ -913,7 +922,8 @@ impl CapabilityVersionManager {
                     }
                     // 恢复成功，重新读取并解析
                     let restored_content = fs::read_to_string(&history_file)?;
-                    let history: CapabilityVersionHistory = serde_json::from_str(&restored_content)?;
+                    let history: CapabilityVersionHistory =
+                        serde_json::from_str(&restored_content)?;
                     Ok(history)
                 } else {
                     // 没有备份可恢复，返回解析错误

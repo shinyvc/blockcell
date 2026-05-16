@@ -339,8 +339,8 @@ impl LearningCoordinator {
         // Only reserve a new throttle slot if no memory review is already pending.
         // If existing_memory is true, the caller's memory slot covers this review too.
         if !existing_memory && !self.throttle.try_start_review() {
-                return None;
-            }
+            return None;
+        }
 
         // dedup 只读检查：如果 key 已存在，rollback throttle 并返回
         let dedup_key = if existing_memory {

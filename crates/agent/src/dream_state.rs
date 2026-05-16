@@ -207,10 +207,7 @@ mod tests {
         // 使用 atomic_write 产生备份（Windows 上会自动产生 .bak.* 文件）
         // 在所有平台上，手动创建一个 .bak.<pid>.<counter> 格式的备份文件
         let main_content = std::fs::read_to_string(&main_path).unwrap();
-        let bak_path = tmp.join(format!(
-            ".dream_state.json.bak.{}.0",
-            std::process::id()
-        ));
+        let bak_path = tmp.join(format!(".dream_state.json.bak.{}.0", std::process::id()));
         std::fs::write(&bak_path, &main_content).unwrap();
         // 删除主文件
         std::fs::remove_file(&main_path).unwrap();
