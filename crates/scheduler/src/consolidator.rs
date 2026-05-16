@@ -142,14 +142,12 @@ impl DreamState {
                                     })
                                     .await
                                     .map_err(|e| {
-                                        std::io::Error::new(
-                                            std::io::ErrorKind::Other,
+                                        std::io::Error::other(
                                             e.to_string(),
                                         )
                                     })?
                                     .map_err(|e| {
-                                        std::io::Error::new(
-                                            std::io::ErrorKind::Other,
+                                        std::io::Error::other(
                                             e.to_string(),
                                         )
                                     })?;
@@ -206,8 +204,8 @@ impl DreamState {
             blockcell_agent::fs_util::atomic_write(&path, content.as_bytes())
         })
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        write_result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        write_result.map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(())
     }
 
@@ -222,8 +220,8 @@ impl DreamState {
             blockcell_agent::fs_util::atomic_write(&path, content.as_bytes())
         })
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        write_result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        write_result.map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(())
     }
 

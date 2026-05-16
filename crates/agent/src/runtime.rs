@@ -2157,6 +2157,7 @@ impl AgentRuntime {
 ///
 /// 此函数可被不同运行路径（run_message_task、CLI interactive、gateway、scheduler worker）共享，
 /// 确保所有部署路径都能触发 ghost learning boundary 记录。
+#[allow(clippy::type_complexity)]
 pub fn create_evolution_deploy_callback(
     config: &Config,
     paths: &Paths,
@@ -8583,6 +8584,7 @@ fn persist_ghost_learning_boundary_with_decision(
     Ok(Some(episode_id))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_delegation_end_learning_boundary_with_config(
     config: &Config,
     paths: &Paths,

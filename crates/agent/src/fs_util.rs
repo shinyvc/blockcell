@@ -54,7 +54,7 @@ pub fn find_latest_backup(original_path: &Path) -> Option<PathBuf> {
         let name_str = name.to_str()?;
         if name_str.starts_with(&bak_prefix) {
             let mtime = entry.metadata().ok()?.modified().ok()?;
-            if latest.as_ref().map_or(true, |(_, t)| mtime > *t) {
+            if latest.as_ref().is_none_or(|(_, t)| mtime > *t) {
                 latest = Some((entry.path(), mtime));
             }
         }
@@ -91,8 +91,7 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
             if let Err(e) = std::fs::rename(path, &bak_path) {
                 // 无法备份 — 清理临时文件并返回错误
                 let _ = std::fs::remove_file(&tmp_path);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     format!("atomic_write: 备份现有文件失败: {e}"),
                 ));
             }
