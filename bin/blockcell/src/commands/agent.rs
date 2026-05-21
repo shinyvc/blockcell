@@ -366,6 +366,7 @@ pub async fn run(
     provider: Option<String>,
 ) -> anyhow::Result<()> {
     let root_paths = Paths::new();
+    super::env_file::ensure_and_load_blockcell_env(&root_paths)?;
     let root_config = Config::load_or_default(&root_paths)?;
     let resolved = resolve_agent_context(
         &root_config,

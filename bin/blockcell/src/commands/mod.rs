@@ -6,6 +6,7 @@ pub mod config_cmd;
 pub mod cron;
 pub mod doctor;
 pub mod embedded_skills;
+pub mod env_file;
 pub mod evolve;
 pub mod gateway;
 pub mod knowledge_cmd;
