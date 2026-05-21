@@ -1857,6 +1857,61 @@ fn read_line_with_command_picker(
                             let _ = stdout.flush();
                         }
                     }
+                    KeyCode::Home => {
+                        if cursor_pos > 0 {
+                            cursor_pos = 0;
+                            if let Ok(mut shared) = current_input.lock() {
+                                *shared = (input.clone(), cursor_pos);
+                            }
+                            if showing_picker {
+                                let query =
+                                    extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
+                                visible_count = render_suggestions(
+                                    &all_items,
+                                    query,
+                                    &input,
+                                    selected_index,
+                                    visible_limit,
+                                    prev_visible_limit,
+                                    stdout,
+                                    cursor_pos,
+                                );
+                                prev_visible_limit = visible_limit;
+                            } else {
+                                render_input_line(&input, stdout, cursor_pos);
+                            }
+                            use std::io::Write;
+                            let _ = stdout.flush();
+                        }
+                    }
+                    KeyCode::End => {
+                        let grapheme_len = grapheme_count(&input);
+                        if cursor_pos < grapheme_len {
+                            cursor_pos = grapheme_len;
+                            if let Ok(mut shared) = current_input.lock() {
+                                *shared = (input.clone(), cursor_pos);
+                            }
+                            if showing_picker {
+                                let query =
+                                    extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
+                                visible_count = render_suggestions(
+                                    &all_items,
+                                    query,
+                                    &input,
+                                    selected_index,
+                                    visible_limit,
+                                    prev_visible_limit,
+                                    stdout,
+                                    cursor_pos,
+                                );
+                                prev_visible_limit = visible_limit;
+                            } else {
+                                render_input_line(&input, stdout, cursor_pos);
+                            }
+                            use std::io::Write;
+                            let _ = stdout.flush();
+                        }
+                    }
                     KeyCode::Esc => {
                         if showing_picker {
                             clear_suggestions(prev_visible_limit, &input, stdout, cursor_pos);
