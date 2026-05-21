@@ -123,7 +123,9 @@ impl CdpClient {
         let params_preview = params.to_string();
         let params_preview = if params_preview.len() > 400 {
             let mut end = 400;
-            while end > 0 && !params_preview.is_char_boundary(end) { end -= 1; }
+            while end > 0 && !params_preview.is_char_boundary(end) {
+                end -= 1;
+            }
             format!("{}...", &params_preview[..end])
         } else {
             params_preview

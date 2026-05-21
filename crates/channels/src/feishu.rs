@@ -286,7 +286,9 @@ impl FeishuChannel {
 
         let endpoint_resp: WsEndpointResponse = serde_json::from_str(&body).map_err(|e| {
             let mut end = body.len().min(500);
-            while end > 0 && !body.is_char_boundary(end) { end -= 1; }
+            while end > 0 && !body.is_char_boundary(end) {
+                end -= 1;
+            }
             Error::Channel(format!(
                 "Failed to parse endpoint response: {} | body: {}",
                 e,
@@ -296,7 +298,9 @@ impl FeishuChannel {
 
         if endpoint_resp.code != 0 {
             let mut end = body.len().min(500);
-            while end > 0 && !body.is_char_boundary(end) { end -= 1; }
+            while end > 0 && !body.is_char_boundary(end) {
+                end -= 1;
+            }
             return Err(Error::Channel(format!(
                 "Feishu endpoint error code={} msg={} | body: {}",
                 endpoint_resp.code,
@@ -307,7 +311,9 @@ impl FeishuChannel {
 
         endpoint_resp.data.map(|d| d.url).ok_or_else(|| {
             let mut end = body.len().min(500);
-            while end > 0 && !body.is_char_boundary(end) { end -= 1; }
+            while end > 0 && !body.is_char_boundary(end) {
+                end -= 1;
+            }
             Error::Channel(format!(
                 "No endpoint URL in response | body: {}",
                 &body[..end]
@@ -543,7 +549,9 @@ impl FeishuChannel {
     async fn handle_message(&self, text: &str) -> Result<()> {
         let event: FeishuEvent = serde_json::from_str(text).map_err(|e| {
             let mut end = text.len().min(500);
-            while end > 0 && !text.is_char_boundary(end) { end -= 1; }
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
             warn!(error = %e, raw = %&text[..end], "Failed to parse Feishu event");
             Error::Channel(format!("Failed to parse Feishu event: {}", e))
         })?;
