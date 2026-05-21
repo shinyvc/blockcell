@@ -464,7 +464,10 @@ struct ResponsesRequest {
     temperature: f32,
 }
 
-fn serialize_temperature<S>(temperature: &f32, serializer: S) -> std::result::Result<S::Ok, S::Error>
+fn serialize_temperature<S>(
+    temperature: &f32,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
