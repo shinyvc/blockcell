@@ -363,7 +363,8 @@ impl McpClient {
                     if line.is_empty() {
                         continue;
                     }
-                    debug!(server = %server_name, "MCP ← {}", &line[..line.len().min(200)]);
+                    let truncate_at = line.char_indices().take_while(|(i, _)| *i < 200).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(0);
+                    debug!(server = %server_name, "MCP ← {}", &line[..truncate_at.min(line.len())]);
                     match serde_json::from_str::<JsonRpcResponse>(&line) {
                         Ok(resp) => {
                             if let Some(id) = resp.id {
