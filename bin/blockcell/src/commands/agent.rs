@@ -1802,6 +1802,54 @@ fn read_line_with_command_picker(
                             let _ = stdout.flush();
                         }
                     }
+                    // Delete 键：删除光标后面的字符（向前删除）
+                    KeyCode::Delete => {
+                        let grapheme_len = grapheme_count(&input);
+                        if cursor_pos < grapheme_len {
+                            let byte_idx = grapheme_to_byte_index(&input, cursor_pos);
+                            let next_byte_idx = grapheme_to_byte_index(&input, cursor_pos + 1);
+                            input.drain(byte_idx..next_byte_idx);
+                            if let Ok(mut shared) = current_input.lock() {
+                                *shared = (input.clone(), cursor_pos);
+                            }
+
+                            // 删除后重新检测命令模式，更新命令起始位置
+                            if let Some((pos, query)) = extract_command_query(&input) {
+                                command_start_pos = Some(pos);
+                                showing_picker = true;
+                                selected_index = 0;
+                                visible_limit = 16;
+                                visible_count = render_suggestions(
+                                    &all_items,
+                                    query,
+                                    &input,
+                                    selected_index,
+                                    visible_limit,
+                                    prev_visible_limit,
+                                    stdout,
+                                    cursor_pos,
+                                );
+                                prev_visible_limit = visible_limit;
+                            } else {
+                                if showing_picker && visible_count > 0 {
+                                    clear_suggestions(
+                                        prev_visible_limit,
+                                        &input,
+                                        stdout,
+                                        cursor_pos,
+                                    );
+                                    prev_visible_limit = 0;
+                                }
+                                showing_picker = false;
+                                visible_count = 0;
+                                command_start_pos = None;
+                                render_input_line(&input, stdout, cursor_pos);
+                            }
+
+                            use std::io::Write;
+                            let _ = stdout.flush();
+                        }
+                    }
                     KeyCode::Left => {
                         if cursor_pos > 0 {
                             cursor_pos -= 1;
