@@ -122,7 +122,11 @@ impl CdpClient {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let params_preview = params.to_string();
         let params_preview = if params_preview.len() > 400 {
-            format!("{}...", &params_preview[..400])
+            let mut end = 400;
+            while end > 0 && !params_preview.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...", &params_preview[..end])
         } else {
             params_preview
         };
