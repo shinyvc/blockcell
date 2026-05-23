@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{info, warn};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::memory_store::open_memory_store;
 use super::slash_commands::{CommandContext, CommandResult, SLASH_COMMAND_HANDLER};
@@ -891,10 +892,10 @@ pub async fn run(
         });
         info!("[dream] Dream service started for cross-session knowledge consolidation");
 
-        // 共享当前输入行状态，用于事件处理器在打印后台结果/进度时
-        // 先清除输入行和建议，打印完毕后重新渲染提示
-        let current_input: Arc<std::sync::Mutex<String>> =
-            Arc::new(std::sync::Mutex::new(String::new()));
+        // 共享当前输入行和光标位置状态，用于事件处理器在打印后台结果/进度时
+        // 先清除输入行和建议，打印完毕后重新渲染提示（含光标位置）
+        let current_input: Arc<std::sync::Mutex<(String, usize)>> =
+            Arc::new(std::sync::Mutex::new((String::new(), 0)));
 
         // Spawn event handler for streaming token output
         let event_handler_handle = {
@@ -1492,20 +1493,40 @@ pub async fn run(
     Ok(())
 }
 
+/// 计算字符串在终端中的总显示宽度（列数）。
+/// 使用 unicode-width 库的字符串级宽度计算，正确处理多码点序列。
+fn str_display_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// 计算字符串中的 grapheme cluster 数量。
+fn grapheme_count(s: &str) -> usize {
+    s.graphemes(true).count()
+}
+
+/// 将 grapheme 索引转换为字符串中的字节索引。
+fn grapheme_to_byte_index(s: &str, grapheme_idx: usize) -> usize {
+    s.grapheme_indices(true)
+        .nth(grapheme_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
+}
+
 /// Read a line of input with real-time command picker support.
 /// When user types "/", immediately show command suggestions below the input line.
-/// Supports backspace to delete and escape to cancel picker.
+/// Supports backspace to delete, left/right cursor movement, and escape to cancel picker.
 fn read_line_with_command_picker(
     paths: &Paths,
     stdout: &mut std::io::Stdout,
     _session: &str,
     _stdin_tx: &mpsc::Sender<InboundMessage>,
-    current_input: &std::sync::Mutex<String>,
+    current_input: &std::sync::Mutex<(String, usize)>,
 ) -> String {
     let mut input = String::new();
     // 同步共享输入状态
     if let Ok(mut shared) = current_input.lock() {
-        shared.clear();
+        shared.0.clear();
+        shared.1 = 0;
     }
     let all_items = collect_command_items(paths);
     let mut selected_index: usize = 0;
@@ -1514,6 +1535,7 @@ fn read_line_with_command_picker(
     let mut visible_limit: usize = 16; // Initial items to show
     let mut prev_visible_limit: usize = 0; // Track previous limit for proper clearing
     let mut command_start_pos: Option<usize> = None; // Position of '/' for command
+    let mut cursor_pos: usize = 0; // 光标在输入字符串中的 grapheme 索引
     const LOAD_MORE_COUNT: usize = 10; // Items to load when scrolling to end
 
     // Enable raw mode for character-by-character input
@@ -1559,16 +1581,17 @@ fn read_line_with_command_picker(
                 match key.code {
                     KeyCode::Char(c) => {
                         if c == 'c' && key.modifiers.contains(KeyModifiers::CONTROL) {
-                            // Ctrl+C - exit
                             let _ = terminal::disable_raw_mode();
                             println!();
                             std::process::exit(0);
                         }
 
-                        // Add character to input
-                        input.push(c);
+                        // 在光标位置插入字符
+                        let byte_idx = grapheme_to_byte_index(&input, cursor_pos);
+                        input.insert(byte_idx, c);
+                        cursor_pos = grapheme_count(&input[..byte_idx + c.len_utf8()]);
                         if let Ok(mut shared) = current_input.lock() {
-                            *shared = input.clone();
+                            *shared = (input.clone(), cursor_pos);
                         }
 
                         // Check if we should show suggestions - detect '/' anywhere
@@ -1577,10 +1600,8 @@ fn read_line_with_command_picker(
                                 showing_picker = true;
                             }
                             command_start_pos = Some(pos);
-                            // Always reset selection when typing new characters
                             selected_index = 0;
                             visible_limit = 16;
-                            // Render suggestions with the query part
                             visible_count = render_suggestions(
                                 &all_items,
                                 query,
@@ -1589,25 +1610,19 @@ fn read_line_with_command_picker(
                                 visible_limit,
                                 prev_visible_limit,
                                 stdout,
+                                cursor_pos,
                             );
                             prev_visible_limit = visible_limit;
                         } else if showing_picker {
-                            clear_suggestions(prev_visible_limit, &input, stdout);
+                            clear_suggestions(prev_visible_limit, &input, stdout, cursor_pos);
                             prev_visible_limit = 0;
                             showing_picker = false;
                             visible_count = 0;
                             command_start_pos = None;
                         } else {
-                            // Render input line only
-                            let _ = execute!(
-                                stdout,
-                                Print("\r"),
-                                Clear(ClearType::CurrentLine),
-                                Print(format!("> {}", input))
-                            );
+                            render_input_line(&input, stdout, cursor_pos);
                         }
 
-                        // Flush to ensure output is immediately visible
                         use std::io::Write;
                         let _ = stdout.flush();
                     }
@@ -1619,7 +1634,7 @@ fn read_line_with_command_picker(
 
                             if let Some(item) = filtered.get(selected_index) {
                                 // Clear suggestions first
-                                clear_suggestions(prev_visible_limit, &input, stdout);
+                                clear_suggestions(prev_visible_limit, &input, stdout, cursor_pos);
                                 prev_visible_limit = 0;
                                 // Replace command part with selected item
                                 if let Some(pos) = command_start_pos {
@@ -1627,10 +1642,11 @@ fn read_line_with_command_picker(
                                 } else {
                                     input = format!("/{} ", item.name);
                                 }
+                                cursor_pos = grapheme_count(&input);
                                 if let Ok(mut shared) = current_input.lock() {
-                                    *shared = input.clone();
+                                    *shared = (input.clone(), cursor_pos);
                                 }
-                                render_input_line(&input, stdout);
+                                render_input_line(&input, stdout, cursor_pos);
                                 showing_picker = false;
                                 visible_count = 0;
                                 command_start_pos = None;
@@ -1640,11 +1656,12 @@ fn read_line_with_command_picker(
 
                         // Submit the input
                         if showing_picker {
-                            clear_suggestions(prev_visible_limit, &input, stdout);
+                            clear_suggestions(prev_visible_limit, &input, stdout, cursor_pos);
                         }
                         // 清除共享输入状态，提交后不再需要恢复提示
                         if let Ok(mut shared) = current_input.lock() {
-                            shared.clear();
+                            shared.0.clear();
+                            shared.1 = 0;
                         }
                         let _ = terminal::disable_raw_mode();
                         println!();
@@ -1658,7 +1675,7 @@ fn read_line_with_command_picker(
 
                             if let Some(item) = filtered.get(selected_index) {
                                 // Clear suggestions first
-                                clear_suggestions(prev_visible_limit, &input, stdout);
+                                clear_suggestions(prev_visible_limit, &input, stdout, cursor_pos);
                                 prev_visible_limit = 0;
                                 // Replace command part with selected item
                                 if let Some(pos) = command_start_pos {
@@ -1666,10 +1683,11 @@ fn read_line_with_command_picker(
                                 } else {
                                     input = format!("/{} ", item.name);
                                 }
+                                cursor_pos = grapheme_count(&input);
                                 if let Ok(mut shared) = current_input.lock() {
-                                    *shared = input.clone();
+                                    *shared = (input.clone(), cursor_pos);
                                 }
-                                render_input_line(&input, stdout);
+                                render_input_line(&input, stdout, cursor_pos);
                                 showing_picker = false;
                                 visible_count = 0;
                                 command_start_pos = None;
@@ -1688,6 +1706,7 @@ fn read_line_with_command_picker(
                                 visible_limit,
                                 prev_visible_limit,
                                 stdout,
+                                cursor_pos,
                             );
                             prev_visible_limit = visible_limit;
                         }
@@ -1716,6 +1735,7 @@ fn read_line_with_command_picker(
                                     visible_limit,
                                     prev_visible_limit,
                                     stdout,
+                                    cursor_pos,
                                 );
                                 prev_visible_limit = visible_limit;
                             } else if selected_index < last_displayed_idx {
@@ -1729,25 +1749,28 @@ fn read_line_with_command_picker(
                                     visible_limit,
                                     prev_visible_limit,
                                     stdout,
+                                    cursor_pos,
                                 );
                                 prev_visible_limit = visible_limit;
                             }
                         }
                     }
                     KeyCode::Backspace => {
-                        if !input.is_empty() {
-                            // Remove last character
-                            input.pop();
+                        if cursor_pos > 0 {
+                            cursor_pos -= 1;
+                            let byte_idx = grapheme_to_byte_index(&input, cursor_pos);
+                            let next_byte_idx = grapheme_to_byte_index(&input, cursor_pos + 1);
+                            input.drain(byte_idx..next_byte_idx);
                             if let Ok(mut shared) = current_input.lock() {
-                                *shared = input.clone();
+                                *shared = (input.clone(), cursor_pos);
                             }
 
-                            // Re-show suggestions if still in command mode
-                            if let Some((_, query)) = extract_command_query(&input) {
-                                // Show picker again
+                            // 删除后重新检测命令模式，更新命令起始位置
+                            if let Some((pos, query)) = extract_command_query(&input) {
+                                command_start_pos = Some(pos);
                                 showing_picker = true;
                                 selected_index = 0;
-                                visible_limit = 16; // Reset on new search
+                                visible_limit = 16;
                                 visible_count = render_suggestions(
                                     &all_items,
                                     query,
@@ -1756,33 +1779,195 @@ fn read_line_with_command_picker(
                                     visible_limit,
                                     prev_visible_limit,
                                     stdout,
+                                    cursor_pos,
                                 );
                                 prev_visible_limit = visible_limit;
                             } else {
-                                // Clear suggestions if was showing
                                 if showing_picker && visible_count > 0 {
-                                    clear_suggestions(prev_visible_limit, &input, stdout);
+                                    clear_suggestions(
+                                        prev_visible_limit,
+                                        &input,
+                                        stdout,
+                                        cursor_pos,
+                                    );
                                     prev_visible_limit = 0;
                                 }
                                 showing_picker = false;
                                 visible_count = 0;
                                 command_start_pos = None;
-                                render_input_line(&input, stdout);
+                                render_input_line(&input, stdout, cursor_pos);
                             }
 
-                            // Flush to ensure output is immediately visible
+                            use std::io::Write;
+                            let _ = stdout.flush();
+                        }
+                    }
+                    // Delete 键：删除光标后面的字符（向前删除）
+                    KeyCode::Delete => {
+                        let grapheme_len = grapheme_count(&input);
+                        if cursor_pos < grapheme_len {
+                            let byte_idx = grapheme_to_byte_index(&input, cursor_pos);
+                            let next_byte_idx = grapheme_to_byte_index(&input, cursor_pos + 1);
+                            input.drain(byte_idx..next_byte_idx);
+                            if let Ok(mut shared) = current_input.lock() {
+                                *shared = (input.clone(), cursor_pos);
+                            }
+
+                            // 删除后重新检测命令模式，更新命令起始位置
+                            if let Some((pos, query)) = extract_command_query(&input) {
+                                command_start_pos = Some(pos);
+                                showing_picker = true;
+                                selected_index = 0;
+                                visible_limit = 16;
+                                visible_count = render_suggestions(
+                                    &all_items,
+                                    query,
+                                    &input,
+                                    selected_index,
+                                    visible_limit,
+                                    prev_visible_limit,
+                                    stdout,
+                                    cursor_pos,
+                                );
+                                prev_visible_limit = visible_limit;
+                            } else {
+                                if showing_picker && visible_count > 0 {
+                                    clear_suggestions(
+                                        prev_visible_limit,
+                                        &input,
+                                        stdout,
+                                        cursor_pos,
+                                    );
+                                    prev_visible_limit = 0;
+                                }
+                                showing_picker = false;
+                                visible_count = 0;
+                                command_start_pos = None;
+                                render_input_line(&input, stdout, cursor_pos);
+                            }
+
+                            use std::io::Write;
+                            let _ = stdout.flush();
+                        }
+                    }
+                    KeyCode::Left => {
+                        if cursor_pos > 0 {
+                            cursor_pos -= 1;
+                            if let Ok(mut shared) = current_input.lock() {
+                                *shared = (input.clone(), cursor_pos);
+                            }
+                            if showing_picker {
+                                let query =
+                                    extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
+                                visible_count = render_suggestions(
+                                    &all_items,
+                                    query,
+                                    &input,
+                                    selected_index,
+                                    visible_limit,
+                                    prev_visible_limit,
+                                    stdout,
+                                    cursor_pos,
+                                );
+                                prev_visible_limit = visible_limit;
+                            } else {
+                                render_input_line(&input, stdout, cursor_pos);
+                            }
+                            use std::io::Write;
+                            let _ = stdout.flush();
+                        }
+                    }
+                    KeyCode::Right => {
+                        let grapheme_len = grapheme_count(&input);
+                        if cursor_pos < grapheme_len {
+                            cursor_pos += 1;
+                            if let Ok(mut shared) = current_input.lock() {
+                                *shared = (input.clone(), cursor_pos);
+                            }
+                            if showing_picker {
+                                let query =
+                                    extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
+                                visible_count = render_suggestions(
+                                    &all_items,
+                                    query,
+                                    &input,
+                                    selected_index,
+                                    visible_limit,
+                                    prev_visible_limit,
+                                    stdout,
+                                    cursor_pos,
+                                );
+                                prev_visible_limit = visible_limit;
+                            } else {
+                                render_input_line(&input, stdout, cursor_pos);
+                            }
+                            use std::io::Write;
+                            let _ = stdout.flush();
+                        }
+                    }
+                    KeyCode::Home => {
+                        if cursor_pos > 0 {
+                            cursor_pos = 0;
+                            if let Ok(mut shared) = current_input.lock() {
+                                *shared = (input.clone(), cursor_pos);
+                            }
+                            if showing_picker {
+                                let query =
+                                    extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
+                                visible_count = render_suggestions(
+                                    &all_items,
+                                    query,
+                                    &input,
+                                    selected_index,
+                                    visible_limit,
+                                    prev_visible_limit,
+                                    stdout,
+                                    cursor_pos,
+                                );
+                                prev_visible_limit = visible_limit;
+                            } else {
+                                render_input_line(&input, stdout, cursor_pos);
+                            }
+                            use std::io::Write;
+                            let _ = stdout.flush();
+                        }
+                    }
+                    KeyCode::End => {
+                        let grapheme_len = grapheme_count(&input);
+                        if cursor_pos < grapheme_len {
+                            cursor_pos = grapheme_len;
+                            if let Ok(mut shared) = current_input.lock() {
+                                *shared = (input.clone(), cursor_pos);
+                            }
+                            if showing_picker {
+                                let query =
+                                    extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
+                                visible_count = render_suggestions(
+                                    &all_items,
+                                    query,
+                                    &input,
+                                    selected_index,
+                                    visible_limit,
+                                    prev_visible_limit,
+                                    stdout,
+                                    cursor_pos,
+                                );
+                                prev_visible_limit = visible_limit;
+                            } else {
+                                render_input_line(&input, stdout, cursor_pos);
+                            }
                             use std::io::Write;
                             let _ = stdout.flush();
                         }
                     }
                     KeyCode::Esc => {
                         if showing_picker {
-                            clear_suggestions(prev_visible_limit, &input, stdout);
+                            clear_suggestions(prev_visible_limit, &input, stdout, cursor_pos);
                             prev_visible_limit = 0;
                             showing_picker = false;
                             visible_count = 0;
                             command_start_pos = None;
-                            render_input_line(&input, stdout);
+                            render_input_line(&input, stdout, cursor_pos);
                             use std::io::Write;
                             let _ = stdout.flush();
                         }
@@ -1802,10 +1987,11 @@ fn read_line_with_command_picker(
                         visible_limit,
                         prev_visible_limit,
                         stdout,
+                        cursor_pos,
                     );
                     prev_visible_limit = visible_limit;
                 } else {
-                    render_input_line(&input, stdout);
+                    render_input_line(&input, stdout, cursor_pos);
                 }
             }
             Ok(_) => {
@@ -1846,7 +2032,10 @@ fn short_task_id(task_id: &str, max_chars: usize) -> String {
 
 /// an interrupting output (e.g. background agent result, progress).
 /// After the caller prints its content, it should call `restore_prompt_line`.
-fn clear_prompt_line(_current_input: &std::sync::Mutex<String>, stdout: &mut std::io::Stdout) {
+fn clear_prompt_line(
+    _current_input: &std::sync::Mutex<(String, usize)>,
+    stdout: &mut std::io::Stdout,
+) {
     use std::io::Write;
     // Clear current line and move to start
     let _ = execute!(stdout, Print("\r"), Clear(ClearType::CurrentLine));
@@ -1857,23 +2046,23 @@ fn clear_prompt_line(_current_input: &std::sync::Mutex<String>, stdout: &mut std
     // will be overwritten when we restore the prompt.
 }
 
-/// Restore the prompt line after an interrupting output.
-/// Re-renders "> {input}" so the user can continue typing.
-fn restore_prompt_line(current_input: &std::sync::Mutex<String>, stdout: &mut std::io::Stdout) {
+/// 后台输出后恢复提示行。
+/// 从共享状态中读取输入内容和光标位置，重新渲染并定位光标。
+fn restore_prompt_line(
+    current_input: &std::sync::Mutex<(String, usize)>,
+    stdout: &mut std::io::Stdout,
+) {
+    let guard = current_input.lock().unwrap_or_else(|e| e.into_inner());
+    let (input, cursor_pos) = (guard.0.clone(), guard.1);
+    drop(guard);
+    render_input_line(&input, stdout, cursor_pos);
     use std::io::Write;
-    let input = current_input.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = execute!(
-        stdout,
-        Print("\r"),
-        Clear(ClearType::CurrentLine),
-        Print(format!("> {}", input))
-    );
     let _ = stdout.flush();
 }
 
-/// Render the input line using crossterm commands
-/// Uses \r to overwrite any potential terminal echo (Windows raw mode issue)
-fn render_input_line(input: &str, stdout: &mut std::io::Stdout) {
+/// 使用 crossterm 渲染输入行并定位光标。
+/// `cursor_pos` 是光标在 `input` 中的 grapheme 索引（从 0 开始）。
+fn render_input_line(input: &str, stdout: &mut std::io::Stdout, cursor_pos: usize) {
     use std::io::Write;
     let _ = execute!(
         stdout,
@@ -1881,7 +2070,12 @@ fn render_input_line(input: &str, stdout: &mut std::io::Stdout) {
         Clear(ClearType::CurrentLine),
         Print(format!("> {}", input))
     );
-    // Flush to ensure the output is immediately visible
+    // Move cursor left by the display width of characters after cursor_pos
+    let byte_idx = grapheme_to_byte_index(input, cursor_pos);
+    let after_width = str_display_width(&input[byte_idx..]);
+    if after_width > 0 {
+        let _ = execute!(stdout, cursor::MoveLeft(after_width as u16));
+    }
     let _ = stdout.flush();
 }
 
@@ -1965,6 +2159,7 @@ fn render_suggestions(
     visible_limit: usize,
     prev_lines_to_clear: usize,
     stdout: &mut std::io::Stdout,
+    cursor_pos: usize,
 ) -> usize {
     let filtered = filter_items(all_items, query);
     let total_count = filtered.len();
@@ -1981,13 +2176,8 @@ fn render_suggestions(
     let _ = execute!(stdout, cursor::RestorePosition);
 
     if display_count == 0 {
-        // Just render input line if no suggestions
-        let _ = execute!(
-            stdout,
-            Print("\r"),
-            Clear(ClearType::CurrentLine),
-            Print(format!("> {}", input))
-        );
+        // 无匹配建议时，渲染输入行并正确定位光标
+        render_input_line(input, stdout, cursor_pos);
         return 0;
     }
 
@@ -2060,6 +2250,12 @@ fn render_suggestions(
         Clear(ClearType::CurrentLine),
         Print(format!("> {}", input))
     );
+    // Position cursor correctly
+    let byte_idx = grapheme_to_byte_index(input, cursor_pos);
+    let after_width = str_display_width(&input[byte_idx..]);
+    if after_width > 0 {
+        let _ = execute!(stdout, cursor::MoveLeft(after_width as u16));
+    }
 
     // Flush to ensure output is immediately visible
     use std::io::Write;
@@ -2069,7 +2265,12 @@ fn render_suggestions(
 }
 
 /// Clear the suggestion list
-fn clear_suggestions(visible_limit: usize, input: &str, stdout: &mut std::io::Stdout) {
+fn clear_suggestions(
+    visible_limit: usize,
+    input: &str,
+    stdout: &mut std::io::Stdout,
+    cursor_pos: usize,
+) {
     // Save position, clear all suggestion lines (+1 for potential "show more" line), restore position
     let lines_to_clear = visible_limit + 1;
     let _ = execute!(stdout, cursor::SavePosition);
@@ -2085,6 +2286,12 @@ fn clear_suggestions(visible_limit: usize, input: &str, stdout: &mut std::io::St
         Clear(ClearType::CurrentLine),
         Print(format!("> {}", input))
     );
+    // Position cursor correctly
+    let byte_idx = grapheme_to_byte_index(input, cursor_pos);
+    let after_width = str_display_width(&input[byte_idx..]);
+    if after_width > 0 {
+        let _ = execute!(stdout, cursor::MoveLeft(after_width as u16));
+    }
 
     // Flush to ensure output is immediately visible
     use std::io::Write;
