@@ -221,10 +221,10 @@ impl CapabilityFileLock {
         #[cfg(windows)]
         let alive = {
             // Windows: OpenProcess 检查进程是否仍在运行
-            use winapi::um::handleapi::CloseHandle;
-            use winapi::um::processthreadsapi::GetExitCodeProcess;
-            use winapi::um::processthreadsapi::OpenProcess;
-            use winapi::um::winnt::PROCESS_QUERY_INFORMATION;
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::{
+                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION,
+            };
             unsafe {
                 let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
                 if handle.is_null() {

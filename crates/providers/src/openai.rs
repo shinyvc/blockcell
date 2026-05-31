@@ -125,11 +125,26 @@ impl OpenAIProvider {
     fn sanitize_messages_for_native_tools(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         let mut sanitized = Vec::with_capacity(messages.len());
         let mut i = 0;
+        // 跟踪尚未匹配到 tool 结果的 tool_call ID，支持跨消息匹配
+        let mut outstanding_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         while i < messages.len() {
             let msg = &messages[i];
 
             if msg.role == "tool" {
+                if let Some(tool_call_id) = &msg.tool_call_id {
+                    if outstanding_ids.contains(tool_call_id.as_str()) {
+                        // 匹配到未完成的 tool_call，保留此消息
+                        sanitized.push(msg.clone());
+                        outstanding_ids.remove(tool_call_id.as_str());
+                    } else {
+                        debug!(
+                            tool_call_id = %tool_call_id,
+                            "跳过未匹配的 tool 消息（ID 不在未完成集合中）"
+                        );
+                    }
+                }
                 i += 1;
                 continue;
             }
@@ -137,35 +152,27 @@ impl OpenAIProvider {
             if msg.role == "assistant" {
                 if let Some(tool_calls) = &msg.tool_calls {
                     if !tool_calls.is_empty() {
-                        let expected_ids: std::collections::HashSet<&str> =
-                            tool_calls.iter().map(|tc| tc.id.as_str()).collect();
-                        let mut found_ids = std::collections::HashSet::new();
-                        let mut j = i + 1;
+                        // 将当前 assistant 的 tool_call ID 加入未完成集合
+                        for tc in tool_calls {
+                            outstanding_ids.insert(tc.id.clone());
+                        }
+                        sanitized.push(msg.clone());
 
+                        // 收集紧接着的所有 tool 消息
+                        let mut j = i + 1;
                         while j < messages.len() && messages[j].role == "tool" {
-                            if let Some(id) = messages[j].tool_call_id.as_deref() {
-                                if expected_ids.contains(id) {
-                                    found_ids.insert(id);
+                            if let Some(id) = &messages[j].tool_call_id {
+                                if outstanding_ids.contains(id.as_str()) {
+                                    sanitized.push(messages[j].clone());
+                                    outstanding_ids.remove(id.as_str());
+                                } else {
+                                    warn!(
+                                        tool_call_id = %id,
+                                        "丢弃 tool 消息：ID 与任何未完成的 tool_call 不匹配"
+                                    );
                                 }
                             }
                             j += 1;
-                        }
-
-                        if expected_ids.iter().all(|id| found_ids.contains(id)) {
-                            sanitized.push(msg.clone());
-                            for tool_msg in &messages[(i + 1)..j] {
-                                if let Some(id) = tool_msg.tool_call_id.as_deref() {
-                                    if expected_ids.contains(id) {
-                                        sanitized.push(tool_msg.clone());
-                                    }
-                                }
-                            }
-                        } else {
-                            debug!(
-                                expected = expected_ids.len(),
-                                found = found_ids.len(),
-                                "Dropping incomplete assistant tool-call round before native tool request"
-                            );
                         }
 
                         i = j;
@@ -178,6 +185,14 @@ impl OpenAIProvider {
             i += 1;
         }
 
+        // 最终检查：未匹配的 tool_call 记录警告
+        if !outstanding_ids.is_empty() {
+            warn!(
+                ids = ?outstanding_ids,
+                "以下 tool_call 没有对应的 tool 结果消息"
+            );
+        }
+
         sanitized
     }
 
@@ -187,7 +202,7 @@ impl OpenAIProvider {
         model: &str,
         max_tokens: u32,
         temperature: f32,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_with_proxy(
             api_key,
             api_base,
@@ -216,7 +231,7 @@ impl OpenAIProvider {
         tool_call_mode: ToolCallMode,
         provider_name: &str,
         reasoning_effort: Option<&str>,
-    ) -> Self {
+    ) -> Result<Self> {
         let resolved_base = api_base
             .unwrap_or("https://api.openai.com/v1")
             .trim_end_matches('/')
@@ -227,8 +242,8 @@ impl OpenAIProvider {
             no_proxy,
             &resolved_base,
             Duration::from_secs(120),
-        );
-        Self {
+        )?;
+        Ok(Self {
             client,
             api_key: api_key.to_string(),
             api_base: resolved_base,
@@ -238,7 +253,7 @@ impl OpenAIProvider {
             tool_call_mode: AtomicU8::new(Self::mode_to_u8(tool_call_mode)),
             provider_name: provider_name.to_string(),
             reasoning_effort: reasoning_effort.map(|s| s.to_string()),
-        }
+        })
     }
 
     fn mode_to_u8(mode: ToolCallMode) -> u8 {
@@ -261,40 +276,7 @@ impl OpenAIProvider {
 
     /// Build a text description of tools to inject into the system prompt.
     fn build_tools_prompt(tools: &[Value]) -> String {
-        let mut s = String::new();
-        s.push_str("\n\n## Available Tools\n");
-        s.push_str("You MUST use tools to accomplish tasks. To call a tool, output a `<tool_call>` block with JSON inside.\n");
-        s.push_str("You may call multiple tools in one response. Each call must be a separate `<tool_call>` block.\n\n");
-        s.push_str("Format (you MUST follow this exact format):\n```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param1\": \"value1\"}}\n</tool_call>\n```\n\n");
-        s.push_str("IMPORTANT RULES:\n");
-        s.push_str("- When the user asks you to do something that requires a tool, you MUST output <tool_call> blocks. Do NOT just describe what you would do.\n");
-        s.push_str("- After outputting tool calls, STOP and wait for the results. Do NOT guess or fabricate results.\n");
-        s.push_str("- If you don't need any tool, just respond normally with text.\n");
-        s.push_str("- For web content, use web_fetch. For search, use web_search.\n\n");
-        s.push_str("Tools:\n");
-
-        for tool in tools {
-            if let Some(func) = tool.get("function") {
-                let name = func
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let desc = func
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let params = func.get("parameters").cloned().unwrap_or(Value::Null);
-                s.push_str(&format!("### {}\n", name));
-                s.push_str(&format!("{}\n", desc));
-                if !params.is_null() {
-                    if let Ok(params_str) = serde_json::to_string_pretty(&params) {
-                        s.push_str(&format!("Parameters: {}\n", params_str));
-                    }
-                }
-                s.push('\n');
-            }
-        }
-        s
+        crate::prompt_utils::build_tools_prompt(tools)
     }
 
     /// Parse text-based tool call blocks from the response content.
@@ -1676,11 +1658,12 @@ impl Provider for OpenAIProvider {
                                 if let Ok(chunk) = serde_json::from_str::<StreamResponse>(data) {
                                     if let Some(choice) = chunk.choices.first() {
                                         // 处理文本增量
+                                        // 注意：push_str 在过滤之后执行，确保 accumulated_content 不含工具调用标记
                                         if let Some(content) = &choice.delta.content {
-                                            accumulated_content.push_str(content);
                                             if let Some(delta) =
                                                 text_tool_markup_filter.push(content)
                                             {
+                                                accumulated_content.push_str(&delta);
                                                 let _ =
                                                     tx.send(StreamChunk::TextDelta { delta }).await;
                                             }

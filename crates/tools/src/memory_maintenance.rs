@@ -4,27 +4,12 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use tracing::{debug, info};
 
-use crate::{Tool, ToolContext, ToolSchema};
+use crate::Tool;
+use crate::ToolContext;
+use crate::ToolSchema;
+use crate::memory::looks_like_ghost_maintenance_log;
 
-/// 判断文本是否像 Ghost Agent 维护日志
-///
-/// 用于阻止 Ghost Agent 将自己的维护日志写入记忆存储。
-/// 使用精确匹配模式避免误判用户正常内容（如健康话题、数据 feed 等）。
-fn looks_like_ghost_maintenance_log(text: &str) -> bool {
-    let t = text.to_lowercase();
-    t.contains("ghost agent")
-        || t.contains("memory garden")
-        || t.contains("例行维护")
-        || t.contains("维护任务")
-        || t.contains("记忆整理")
-        || t.contains("文件清理")
-        || t.contains("社区互动")
-        || t.contains("heartbeat check")  // 精确匹配，避免误判健康话题
-        || t.contains("heartbeat report")
-        || t.contains("feed cycle")       // 精确匹配，避免误判数据 feed
-        || t.contains("feed routine")
-}
-
+/// 从记忆存储中清理 Ghost Agent 维护日志。
 fn prune_ghost_maintenance_logs(store: &crate::MemoryStoreHandle, dry_run: bool) -> Result<Value> {
     let query_params = json!({
         "scope": "short_term",
@@ -302,8 +287,8 @@ pub struct MemoryMaintenanceTool;
 impl Tool for MemoryMaintenanceTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "memory_maintenance",
-            description: "Memory maintenance operations for Ghost Agent. Actions: garden (clean short-term memory and maintain long-term facts), cleanup (remove expired/trivial entries), stats (memory health report), compact (merge duplicate entries).",
+            name: "memory_maintenance".to_string(),
+            description: "Memory maintenance operations for Ghost Agent. Actions: garden (clean short-term memory and maintain long-term facts), cleanup (remove expired/trivial entries), stats (memory health report), compact (merge duplicate entries).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -31,7 +31,7 @@ pub struct NapcatGetForwardMsgTool;
 impl Tool for NapcatGetForwardMsgTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_forward_msg",
+            name: "napcat_get_forward_msg".to_string(),
             description: build_description(
                 "[QQ Message] Get the content of a forwarded/merged QQ message. Use this when you receive a forwarded message (合并消息) in QQ - it expands and returns all nested message nodes.",
                 RiskLevel::ReadOnly,
@@ -104,7 +104,7 @@ pub struct NapcatSetMsgEmojiLikeTool;
 impl Tool for NapcatSetMsgEmojiLikeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_msg_emoji_like",
+            name: "napcat_set_msg_emoji_like".to_string(),
             description: build_description(
                 "[QQ Message] Add or remove an emoji reaction to a QQ message. Risk: Medium.",
                 RiskLevel::MediumRisk,
@@ -196,7 +196,7 @@ pub struct NapcatMarkMsgAsReadTool;
 impl Tool for NapcatMarkMsgAsReadTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_mark_msg_as_read",
+            name: "napcat_mark_msg_as_read".to_string(),
             description: build_description(
                 "[QQ Message] Mark a QQ message as read.",
                 RiskLevel::LowRisk,
@@ -268,7 +268,7 @@ pub struct NapcatSetEssenceMsgTool;
 impl Tool for NapcatSetEssenceMsgTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_essence_msg",
+            name: "napcat_set_essence_msg".to_string(),
             description: build_description(
                 "[QQ Group] Set a QQ message as essence (pin as important message in group). Requires admin permissions. Risk: Medium.",
                 RiskLevel::MediumRisk,
@@ -336,7 +336,7 @@ pub struct NapcatDeleteEssenceMsgTool;
 impl Tool for NapcatDeleteEssenceMsgTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_delete_essence_msg",
+            name: "napcat_delete_essence_msg".to_string(),
             description: build_description(
                 "[QQ Group] Remove a QQ message from essence (unpin important message). Requires admin permissions. Risk: Medium.",
                 RiskLevel::MediumRisk,
@@ -404,7 +404,7 @@ pub struct NapcatGetEssenceMsgListTool;
 impl Tool for NapcatGetEssenceMsgListTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_essence_msg_list",
+            name: "napcat_get_essence_msg_list".to_string(),
             description: build_description(
                 "[QQ Group] Get the list of essence messages in a QQ group.",
                 RiskLevel::ReadOnly,
@@ -485,7 +485,7 @@ pub struct NapcatGetGroupAtAllRemainTool;
 impl Tool for NapcatGetGroupAtAllRemainTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_group_at_all_remain",
+            name: "napcat_get_group_at_all_remain".to_string(),
             description: build_description(
                 "[QQ Group] Get the remaining count of @all mentions for the bot in a QQ group.",
                 RiskLevel::ReadOnly,
@@ -559,7 +559,7 @@ pub struct NapcatGetImageTool;
 impl Tool for NapcatGetImageTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_image",
+            name: "napcat_get_image".to_string(),
             description: build_description(
                 "[QQ Image] Get image metadata from QQ image message. Returns URL, size, and other info. Note: Images are auto-downloaded during message preprocessing (controlled by auto_download_media config).",
                 RiskLevel::ReadOnly,
@@ -671,7 +671,7 @@ pub struct NapcatGetRecordTool;
 impl Tool for NapcatGetRecordTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_record",
+            name: "napcat_get_record".to_string(),
             description: build_description(
                 "[QQ Voice] Get voice record metadata from QQ voice message. Returns URL, size, and other info. Note: Voice files are auto-downloaded during message preprocessing (controlled by auto_download_media config).",
                 RiskLevel::ReadOnly,
@@ -793,7 +793,7 @@ pub struct NapcatGetVideoTool;
 impl Tool for NapcatGetVideoTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_video",
+            name: "napcat_get_video".to_string(),
             description: build_description(
                 "[QQ Video] Get video metadata from QQ video message. Returns URL, size, and other info. Note: Videos are auto-downloaded during message preprocessing (controlled by auto_download_media config).",
                 RiskLevel::ReadOnly,
@@ -890,7 +890,7 @@ pub struct NapcatDownloadFileTool;
 impl Tool for NapcatDownloadFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_download_file",
+            name: "napcat_download_file".to_string(),
             description: build_description(
                 "[QQ Download] Download files from QQ chat to local workspace. Use this when user sends a file in QQ. The file will be saved to downloads/YYYY-MM-DD_chat_id/ directory. Supports multi-threaded download.",
                 RiskLevel::MediumRisk,

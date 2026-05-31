@@ -14,10 +14,10 @@ pub struct SessionRecallTool;
 impl Tool for SessionRecallTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "session_recall",
+            name: "session_recall".to_string(),
             description: "从当前会话缓存中取回之前返回的完整列表/表格内容。\
                 当历史消息中出现 [已缓存N条结果，ID: ref:XXXXXX] 时，使用此工具获取完整内容。\
-                场景：用户询问某个列表的第N条、要求展示完整结果、引用之前搜索/查询的数据。",
+                场景：用户询问某个列表的第N条、要求展示完整结果、引用之前搜索/查询的数据。".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

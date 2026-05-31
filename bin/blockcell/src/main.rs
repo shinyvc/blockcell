@@ -270,7 +270,6 @@ enum ToolsCommands {
     },
 }
 
-#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum McpCommands {
     /// List MCP servers
@@ -281,52 +280,7 @@ enum McpCommands {
         name: String,
     },
     /// Add an MCP server from template or raw config
-    Add {
-        /// Template name (github/sqlite/filesystem/postgres/puppeteer) or logical name for `--raw`
-        template_or_name: String,
-        /// Use raw command/args/env instead of template generation
-        #[arg(long)]
-        raw: bool,
-        /// Explicit server name override
-        #[arg(long)]
-        name: Option<String>,
-        /// Raw command executable
-        #[arg(long)]
-        command: Option<String>,
-        /// Repeatable raw argument
-        #[arg(long = "arg")]
-        args: Vec<String>,
-        /// Repeatable environment variable entry KEY=VALUE
-        #[arg(long = "env")]
-        env: Vec<String>,
-        /// Working directory
-        #[arg(long)]
-        cwd: Option<String>,
-        /// SQLite template database path
-        #[arg(long)]
-        db_path: Option<String>,
-        /// Filesystem template root path (repeatable)
-        #[arg(long = "path")]
-        filesystem_paths: Vec<String>,
-        /// Postgres template DSN
-        #[arg(long)]
-        dsn: Option<String>,
-        /// Overwrite existing file if present
-        #[arg(long)]
-        force: bool,
-        /// Create disabled
-        #[arg(long)]
-        disabled: bool,
-        /// Disable auto-start
-        #[arg(long)]
-        no_auto_start: bool,
-        /// Startup timeout override
-        #[arg(long)]
-        startup_timeout_secs: Option<u64>,
-        /// Call timeout override
-        #[arg(long)]
-        call_timeout_secs: Option<u64>,
-    },
+    Add(Box<McpAddArgs>),
     /// Remove an MCP server
     Remove {
         /// MCP server name
@@ -347,6 +301,55 @@ enum McpCommands {
         /// Optional server name; edits mcp.d/<name>.json if present
         name: Option<String>,
     },
+}
+
+/// 添加 MCP 服务器的参数
+#[derive(clap::Args)]
+struct McpAddArgs {
+    /// Template name (github/sqlite/filesystem/postgres/puppeteer) or logical name for `--raw`
+    pub template_or_name: String,
+    /// Use raw command/args/env instead of template generation
+    #[arg(long)]
+    pub raw: bool,
+    /// Explicit server name override
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Raw command executable
+    #[arg(long)]
+    pub command: Option<String>,
+    /// Repeatable raw argument
+    #[arg(long = "arg")]
+    pub args: Vec<String>,
+    /// Repeatable environment variable entry KEY=VALUE
+    #[arg(long = "env")]
+    pub env: Vec<String>,
+    /// Working directory
+    #[arg(long)]
+    pub cwd: Option<String>,
+    /// SQLite template database path
+    #[arg(long)]
+    pub db_path: Option<String>,
+    /// Filesystem template root path (repeatable)
+    #[arg(long = "path")]
+    pub filesystem_paths: Vec<String>,
+    /// Postgres template DSN
+    #[arg(long)]
+    pub dsn: Option<String>,
+    /// Overwrite existing file if present
+    #[arg(long)]
+    pub force: bool,
+    /// Create disabled
+    #[arg(long)]
+    pub disabled: bool,
+    /// Disable auto-start
+    #[arg(long)]
+    pub no_auto_start: bool,
+    /// Startup timeout override
+    #[arg(long)]
+    pub startup_timeout_secs: Option<u64>,
+    /// Call timeout override
+    #[arg(long)]
+    pub call_timeout_secs: Option<u64>,
 }
 
 // ── P0: Run ─────────────────────────────────────────────────────────────────
@@ -896,39 +899,23 @@ async fn main() -> anyhow::Result<()> {
             McpCommands::Show { name } => {
                 commands::mcp::show(&name).await?;
             }
-            McpCommands::Add {
-                template_or_name,
-                raw,
-                name,
-                command,
-                args,
-                env,
-                cwd,
-                db_path,
-                filesystem_paths,
-                dsn,
-                force,
-                disabled,
-                no_auto_start,
-                startup_timeout_secs,
-                call_timeout_secs,
-            } => {
+            McpCommands::Add(args) => {
                 commands::mcp::add(
-                    &template_or_name,
-                    raw,
-                    name,
-                    command,
-                    args,
-                    env,
-                    cwd,
-                    db_path,
-                    filesystem_paths,
-                    dsn,
-                    force,
-                    disabled,
-                    no_auto_start,
-                    startup_timeout_secs,
-                    call_timeout_secs,
+                    &args.template_or_name,
+                    args.raw,
+                    args.name,
+                    args.command,
+                    args.args,
+                    args.env,
+                    args.cwd,
+                    args.db_path,
+                    args.filesystem_paths,
+                    args.dsn,
+                    args.force,
+                    args.disabled,
+                    args.no_auto_start,
+                    args.startup_timeout_secs,
+                    args.call_timeout_secs,
                 )
                 .await?;
             }

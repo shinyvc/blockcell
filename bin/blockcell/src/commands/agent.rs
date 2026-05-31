@@ -1305,16 +1305,21 @@ pub async fn run(
         let session_clear_flag_clone = session_clear_flag.clone();
         let response_cache_for_stdin = response_cache.clone();
         let stdin_current_input = current_input.clone();
+        // 创建关闭标志，用于 Ctrl+C 时优雅退出
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let stdin_shutdown_flag = shutdown_flag.clone();
 
         let stdin_handle = tokio::task::spawn_blocking(move || {
             let mut stdout = std::io::stdout();
-            // Create a small tokio runtime for blocking task manager queries
-            let local_rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create local runtime for stdin");
+            // 获取当前运行时句柄，用于在阻塞线程中执行异步命令
+            let handle = tokio::runtime::Handle::current();
 
             loop {
+                // 检查是否收到关闭信号
+                if stdin_shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 // Note: prompt is printed inside read_line_with_command_picker
                 // to avoid double printing after raw mode is enabled
 
@@ -1325,6 +1330,7 @@ pub async fn run(
                     &session_clone,
                     &stdin_tx,
                     &stdin_current_input,
+                    &stdin_shutdown_flag,
                 );
 
                 // Check if a confirmation request arrived
@@ -1368,7 +1374,7 @@ pub async fn run(
                     }));
 
                     // 同步执行命令处理器
-                    let result = local_rt.block_on(SLASH_COMMAND_HANDLER.try_handle(&input, &ctx));
+                    let result = handle.block_on(SLASH_COMMAND_HANDLER.try_handle(&input, &ctx));
 
                     match result {
                         CommandResult::Handled(response) => {
@@ -1521,6 +1527,7 @@ fn read_line_with_command_picker(
     _session: &str,
     _stdin_tx: &mpsc::Sender<InboundMessage>,
     current_input: &std::sync::Mutex<(String, usize)>,
+    shutdown_flag: &std::sync::atomic::AtomicBool,
 ) -> String {
     let mut input = String::new();
     // 同步共享输入状态
@@ -1583,7 +1590,8 @@ fn read_line_with_command_picker(
                         if c == 'c' && key.modifiers.contains(KeyModifiers::CONTROL) {
                             let _ = terminal::disable_raw_mode();
                             println!();
-                            std::process::exit(0);
+                            shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                            return String::new();
                         }
 
                         // 在光标位置插入字符

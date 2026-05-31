@@ -16,3 +16,4 @@ base64 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
 md5 = { workspace = true }
+semver = { workspace = true }

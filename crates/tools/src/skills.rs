@@ -71,8 +71,8 @@ fn get_skill_file_store(ctx: &ToolContext) -> Result<&crate::SkillFileStoreHandl
 impl Tool for SkillViewTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "skill_view",
-            description: "View a workspace skill's content (SKILL.md, SKILL.rhai, SKILL.py, or metadata-only fallback), meta.yaml, and supporting file list.",
+            name: "skill_view".to_string(),
+            description: "View a workspace skill's content (SKILL.md, SKILL.rhai, SKILL.py, or metadata-only fallback), meta.yaml, and supporting file list.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -102,8 +102,8 @@ impl Tool for SkillViewTool {
 impl Tool for SkillManageTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "skill_manage",
-            description: "Create, patch, delete, or update supporting files for workspace skills. Use for reusable procedures learned from successful work.",
+            name: "skill_manage".to_string(),
+            description: "Create, patch, delete, or update supporting files for workspace skills. Use for reusable procedures learned from successful work.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -197,8 +197,8 @@ fn require_string<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
 impl Tool for ListSkillsTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "list_skills",
-            description: "List installed skills available to the assistant, including workspace learned skills and built-in skills. Use when the user asks what reusable skills or learned procedures are available.",
+            name: "list_skills".to_string(),
+            description: "List installed skills available to the assistant, including workspace learned skills and built-in skills. Use when the user asks what reusable skills or learned procedures are available.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -13,8 +13,8 @@ pub struct SystemInfoTool;
 impl Tool for SystemInfoTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "system_info",
-            description: "Probe system hardware, software, network, and available tools. Use this to discover what the agent can do on this machine.",
+            name: "system_info".to_string(),
+            description: "Probe system hardware, software, network, and available tools. Use this to discover what the agent can do on this machine.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -417,8 +417,8 @@ pub struct CapabilityEvolveTool;
 impl Tool for CapabilityEvolveTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "capability_evolve",
-            description: "Manage dynamically evolved tools. You MUST provide `action`. action='list': no extra params. action='request': requires `capability_id` and `description`, optional `provider_type`. action='status': requires `capability_id`. action='execute': requires `capability_id` and usually `input` containing the evolved tool's JSON input.",
+            name: "capability_evolve".to_string(),
+            description: "Manage dynamically evolved tools. You MUST provide `action`. action='list': no extra params. action='request': requires `capability_id` and `description`, optional `provider_type`. action='status': requires `capability_id`. action='execute': requires `capability_id` and usually `input` containing the evolved tool's JSON input.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

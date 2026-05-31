@@ -26,7 +26,7 @@ pub struct NapcatGetGroupListTool;
 impl Tool for NapcatGetGroupListTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_group_list",
+            name: "napcat_get_group_list".to_string(),
             description: build_description(
                 "[QQ Group] Get the list of QQ groups the bot has joined. Returns all groups with their names and group IDs.",
                 RiskLevel::ReadOnly,
@@ -82,7 +82,7 @@ pub struct NapcatGetGroupInfoTool;
 impl Tool for NapcatGetGroupInfoTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_group_info",
+            name: "napcat_get_group_info".to_string(),
             description: build_description(
                 "[QQ Group] Get detailed info about a QQ group (name, member count, admin list, etc.).",
                 RiskLevel::ReadOnly,
@@ -158,7 +158,7 @@ pub struct NapcatGetGroupMemberListTool;
 impl Tool for NapcatGetGroupMemberListTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_group_member_list",
+            name: "napcat_get_group_member_list".to_string(),
             description: build_description(
                 "[QQ Group] Get the list of members in a specific QQ group.",
                 RiskLevel::ReadOnly,
@@ -225,7 +225,7 @@ pub struct NapcatGetGroupMemberInfoTool;
 impl Tool for NapcatGetGroupMemberInfoTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_group_member_info",
+            name: "napcat_get_group_member_info".to_string(),
             description: build_description(
                 "[QQ Group] Get detailed information about a specific QQ group member.",
                 RiskLevel::ReadOnly,
@@ -354,7 +354,7 @@ pub struct NapcatSetGroupKickTool;
 impl Tool for NapcatSetGroupKickTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_group_kick",
+            name: "napcat_set_group_kick".to_string(),
             description: build_description(
                 "[QQ Group] Kick (remove) a member from a QQ group. This is a high-risk operation. Requires admin permissions.",
                 RiskLevel::HighRisk,
@@ -443,7 +443,7 @@ pub struct NapcatSetGroupBanTool;
 impl Tool for NapcatSetGroupBanTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_group_ban",
+            name: "napcat_set_group_ban".to_string(),
             description: build_description(
                 "[QQ Group] Ban (mute) a member in a QQ group. Set duration to 0 to unban. Requires admin permissions.",
                 RiskLevel::MediumRisk,
@@ -539,7 +539,7 @@ pub struct NapcatSetGroupWholeBanTool;
 impl Tool for NapcatSetGroupWholeBanTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_group_whole_ban",
+            name: "napcat_set_group_whole_ban".to_string(),
             description: build_description(
                 "[QQ Group] Enable or disable whole-group mute (mute all members). Requires admin permissions.",
                 RiskLevel::MediumRisk,
@@ -619,7 +619,7 @@ pub struct NapcatSetGroupAdminTool;
 impl Tool for NapcatSetGroupAdminTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_group_admin",
+            name: "napcat_set_group_admin".to_string(),
             description: build_description(
                 "[QQ Group] Set or remove a member as QQ group admin. Requires owner permissions.",
                 RiskLevel::MediumRisk,
@@ -719,7 +719,7 @@ pub struct NapcatSetGroupCardTool;
 impl Tool for NapcatSetGroupCardTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_group_card",
+            name: "napcat_set_group_card".to_string(),
             description: build_description(
                 "[QQ Group] Set a member's group card (nickname in QQ group).",
                 RiskLevel::LowRisk,
@@ -803,7 +803,7 @@ pub struct NapcatSetGroupNameTool;
 impl Tool for NapcatSetGroupNameTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_group_name",
+            name: "napcat_set_group_name".to_string(),
             description: build_description(
                 "[QQ Group] Set the QQ group name. Requires admin permissions.",
                 RiskLevel::MediumRisk,
@@ -880,7 +880,7 @@ pub struct NapcatSetGroupSpecialTitleTool;
 impl Tool for NapcatSetGroupSpecialTitleTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_group_special_title",
+            name: "napcat_set_group_special_title".to_string(),
             description: build_description(
                 "[QQ Group] Set a member's special title in QQ group. Requires admin permissions.",
                 RiskLevel::MediumRisk,
@@ -974,7 +974,7 @@ pub struct NapcatSetGroupLeaveTool;
 impl Tool for NapcatSetGroupLeaveTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_group_leave",
+            name: "napcat_set_group_leave".to_string(),
             description: build_description(
                 "[QQ Group] Make the bot leave a QQ group. High risk operation.",
                 RiskLevel::HighRisk,

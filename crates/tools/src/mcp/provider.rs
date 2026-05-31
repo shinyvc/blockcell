@@ -18,10 +18,10 @@ fn summarize_json(value: &Value, max_len: usize) -> String {
 /// A single MCP tool exposed as a local `Tool` implementation.
 /// The qualified tool name uses `<server>__<tool>` format.
 pub struct McpToolWrapper {
-    /// Qualified name, leaked once at construction time.
-    schema_name: &'static str,
-    /// Description, leaked once at construction time.
-    schema_desc: &'static str,
+    /// Qualified name.
+    schema_name: String,
+    /// Description.
+    schema_desc: String,
     /// Original (unqualified) tool name used when calling the MCP server.
     mcp_tool_name: String,
     input_schema: Value,
@@ -31,12 +31,10 @@ pub struct McpToolWrapper {
 impl McpToolWrapper {
     pub fn new(server_name: &str, tool: McpTool, client: Arc<McpClient>) -> Self {
         let qualified = format!("{}__{}", server_name, tool.name);
-        let schema_name: &'static str = Box::leak(qualified.into_boxed_str());
         let desc = tool.description.unwrap_or_default();
-        let schema_desc: &'static str = Box::leak(desc.into_boxed_str());
         Self {
-            schema_name,
-            schema_desc,
+            schema_name: qualified,
+            schema_desc: desc,
             mcp_tool_name: tool.name,
             input_schema: tool.input_schema,
             client,
@@ -48,8 +46,8 @@ impl McpToolWrapper {
 impl Tool for McpToolWrapper {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: self.schema_name,
-            description: self.schema_desc,
+            name: self.schema_name.clone(),
+            description: self.schema_desc.clone(),
             parameters: self.input_schema.clone(),
         }
     }

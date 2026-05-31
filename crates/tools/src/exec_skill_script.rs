@@ -3,12 +3,18 @@ use blockcell_core::{Error, Result};
 use blockcell_skills::dispatcher::{SkillDispatchResult, SkillDispatcher};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use crate::exec_local::{
     resolve_script_path, validate_relative_skill_path, validate_runner, ExecLocalTool,
 };
 use crate::registry::ToolRegistry;
 use crate::{Tool, ToolContext, ToolSchema};
+
+/// 默认的 ToolRegistry 单例，避免每次 exec_skill_script 调用都重新创建
+static DEFAULT_TOOL_REGISTRY: LazyLock<ToolRegistry> = LazyLock::new(|| {
+    ToolRegistry::with_defaults()
+});
 
 pub struct ExecSkillScriptTool;
 
@@ -82,8 +88,8 @@ fn normalize_rhai_result(
 impl Tool for ExecSkillScriptTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "exec_skill_script",
-            description: "Execute a skill-local script asset. `.rhai` runs in-process; other paths run like exec_local. The `path` must be RELATIVE (e.g. `scripts/run.py`), never absolute. If the skill manual shows `{baseDir}/scripts/...`, strip the `{baseDir}/` prefix.",
+            name: "exec_skill_script".to_string(),
+            description: "Execute a skill-local script asset. `.rhai` runs in-process; other paths run like exec_local. The `path` must be RELATIVE (e.g. `scripts/run.py`), never absolute. If the skill manual shows `{baseDir}/scripts/...`, strip the `{baseDir}/` prefix.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -198,7 +204,7 @@ impl Tool for ExecSkillScriptTool {
                 }
 
                 let handle = tokio::runtime::Handle::current();
-                let registry = ToolRegistry::with_defaults();
+                let registry = &*DEFAULT_TOOL_REGISTRY;
                 let rhai_ctx = ctx.clone();
                 let dispatcher = SkillDispatcher::new();
                 let result = tokio::task::spawn_blocking(move || {

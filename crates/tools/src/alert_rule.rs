@@ -129,7 +129,7 @@ pub struct AlertRuleTool;
 impl Tool for AlertRuleTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "alert_rule",
+            name: "alert_rule".to_string(),
             description: "Create and manage conditional alert rules for monitoring metrics. \
                 Rules periodically evaluate a data source (via tool call), extract a metric value, \
                 compare against a threshold, and trigger notifications when conditions are met. \
@@ -138,7 +138,7 @@ impl Tool for AlertRuleTool {
                 cross_above (value crosses above threshold), cross_below (value crosses below threshold). \
                 Actions: 'create' (new rule), 'list' (all rules), 'get' (single rule), \
                 'update' (modify rule), 'delete' (remove rule), 'evaluate' (manually check a rule now), \
-                'history' (trigger history).",
+                'history' (trigger history).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

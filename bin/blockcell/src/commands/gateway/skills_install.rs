@@ -12,7 +12,7 @@ pub(super) async fn handle_skill_delete(
     if !skill_dir.exists() {
         return Json(serde_json::json!({ "status": "not_found", "skill": skill_name }));
     }
-    match std::fs::remove_dir_all(&skill_dir) {
+    match tokio::fs::remove_dir_all(&skill_dir).await {
         Ok(_) => Json(serde_json::json!({ "status": "deleted", "skill": skill_name })),
         Err(e) => Json(serde_json::json!({ "status": "error", "message": e.to_string() })),
     }
@@ -141,48 +141,56 @@ pub(super) async fn handle_hub_skill_install(
 
     let skill_dir = skills_dir.join(&skill_name);
     if skill_dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&skill_dir) {
+        if let Err(e) = tokio::fs::remove_dir_all(&skill_dir).await {
             return Json(serde_json::json!({ "status": "error", "message": e.to_string() }));
         }
     }
-    if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+    if let Err(e) = tokio::fs::create_dir_all(&skill_dir).await {
         return Json(serde_json::json!({ "status": "error", "message": e.to_string() }));
     }
 
-    let cursor = std::io::Cursor::new(&bytes);
-    match zip::ZipArchive::new(cursor) {
-        Ok(mut archive) => {
-            for i in 0..archive.len() {
-                if let Ok(mut file) = archive.by_index(i) {
-                    let out_path = if let Some(enclosed) = file.enclosed_name() {
-                        let components: Vec<_> = enclosed.components().collect();
-                        if components.len() > 1 {
-                            skill_dir.join(components[1..].iter().collect::<std::path::PathBuf>())
+    // 将 zip 解压的阻塞 I/O 移至 spawn_blocking
+    let skill_dir_clone = skill_dir.clone();
+    let bytes_clone = bytes.to_vec();
+    let extract_result: Result<(), String> = tokio::task::spawn_blocking(move || {
+        let cursor = std::io::Cursor::new(&bytes_clone);
+        match zip::ZipArchive::new(cursor) {
+            Ok(mut archive) => {
+                for i in 0..archive.len() {
+                    if let Ok(mut file) = archive.by_index(i) {
+                        let out_path = if let Some(enclosed) = file.enclosed_name() {
+                            let components: Vec<_> = enclosed.components().collect();
+                            if components.len() > 1 {
+                                skill_dir_clone.join(components[1..].iter().collect::<std::path::PathBuf>())
+                            } else {
+                                skill_dir_clone.join(enclosed)
+                            }
                         } else {
-                            skill_dir.join(enclosed)
-                        }
-                    } else {
-                        continue;
-                    };
-                    if file.is_dir() {
-                        std::fs::create_dir_all(&out_path).ok();
-                    } else {
-                        if let Some(p) = out_path.parent() {
-                            std::fs::create_dir_all(p).ok();
-                        }
-                        if let Ok(mut outfile) = std::fs::File::create(&out_path) {
-                            std::io::copy(&mut file, &mut outfile).ok();
+                            continue;
+                        };
+                        if file.is_dir() {
+                            std::fs::create_dir_all(&out_path).ok();
+                        } else {
+                            if let Some(p) = out_path.parent() {
+                                std::fs::create_dir_all(p).ok();
+                            }
+                            if let Ok(mut outfile) = std::fs::File::create(&out_path) {
+                                std::io::copy(&mut file, &mut outfile).ok();
+                            }
                         }
                     }
                 }
             }
-        }
-        Err(_) => {
-            // Not a zip — write as-is (e.g. tar.gz or raw file); for now just write raw bytes
-            if let Err(e) = std::fs::write(skill_dir.join("raw.bin"), &bytes) {
-                return Json(serde_json::json!({ "status": "error", "message": e.to_string() }));
+            Err(_) => {
+                std::fs::write(skill_dir_clone.join("raw.bin"), &bytes_clone)
+                    .map_err(|e| e.to_string())?;
             }
         }
+        Ok(())
+    }).await.unwrap_or(Err("spawn_blocking failed".to_string()));
+
+    if let Err(e) = extract_result {
+        return Json(serde_json::json!({ "status": "error", "message": e }));
     }
 
     Json(serde_json::json!({
@@ -862,7 +870,7 @@ pub(super) async fn handle_skill_install_external(
     if skill_dir.exists() {
         let staging_root = state.paths.import_staging_skills_dir();
         if ensure_within_dir(&staging_root, &skill_dir) {
-            std::fs::remove_dir_all(&skill_dir).ok();
+            tokio::fs::remove_dir_all(&skill_dir).await.ok();
         } else {
             return Json(serde_json::json!({
                 "status": "error",
@@ -870,7 +878,7 @@ pub(super) async fn handle_skill_install_external(
             }));
         }
     }
-    if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+    if let Err(e) = tokio::fs::create_dir_all(&skill_dir).await {
         return Json(
             serde_json::json!({ "status": "error", "message": format!("Cannot create skill dir: {}", e) }),
         );
@@ -890,9 +898,9 @@ pub(super) async fn handle_skill_install_external(
         };
         let out_path = skill_dir.join(rel);
         if let Some(parent) = out_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = tokio::fs::create_dir_all(parent).await;
         }
-        std::fs::write(out_path, &df.content).ok();
+        tokio::fs::write(out_path, &df.content).await.ok();
     }
 
     // Generate meta.yaml so blockcell's SkillManager can recognize the skill
@@ -908,7 +916,7 @@ pub(super) async fn handle_skill_install_external(
             "tools": [],
         });
         if let Ok(meta_content) = serde_yaml::to_string(&meta_value) {
-            std::fs::write(skill_dir.join("meta.yaml"), meta_content).ok();
+            tokio::fs::write(skill_dir.join("meta.yaml"), meta_content).await.ok();
         }
     }
 

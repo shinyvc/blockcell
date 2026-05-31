@@ -105,8 +105,8 @@ pub struct HttpRequestTool;
 impl Tool for HttpRequestTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "http_request",
-            description: "Make HTTP requests to REST APIs. Supports all HTTP methods, custom headers, authentication (API key, Bearer token, Basic auth), JSON/form bodies, and file downloads.",
+            name: "http_request".to_string(),
+            description: "Make HTTP requests to REST APIs. Supports all HTTP methods, custom headers, authentication (API key, Bearer token, Basic auth), JSON/form bodies, and file downloads.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

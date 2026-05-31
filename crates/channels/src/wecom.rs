@@ -18,6 +18,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
 
+// 所有 std::sync::Mutex 均为短时锁定且不在 .await 间持有锁，因此安全。
+// 详细审计见：LONGCONN_REGISTRY、CHAT_REQID_REGISTRY、SEEN_MSG_IDS 的 lock() 调用点
+// 均未跨越 .await 点。token_cache 则直接使用 tokio::sync::Mutex。
+
 /// Global msg_id dedup set — prevents the same WeCom message from being processed twice.
 /// WeCom sometimes delivers the same webhook twice (retry on timeout) or echoes bot-sent
 /// messages back as callbacks. We keep the last 512 msg_ids in a ring-buffer style set.

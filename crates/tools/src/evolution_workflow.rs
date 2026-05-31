@@ -23,8 +23,8 @@ impl Default for EvolutionWorkflowTool {
 impl Tool for EvolutionWorkflowTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "evolution_workflow",
-            description: "Manage core evolution workflows: list, inspect, cancel, retry, or unblock capability evolution workflows",
+            name: "evolution_workflow".to_string(),
+            description: "Manage core evolution workflows: list, inspect, cancel, retry, or unblock capability evolution workflows".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

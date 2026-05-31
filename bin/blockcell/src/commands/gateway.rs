@@ -53,7 +53,7 @@ use axum::{
 };
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use super::memory_store::open_memory_store;
 
@@ -2178,6 +2178,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     info!("Shutdown signal received, draining tasks...");
 
     let _ = shutdown_tx.send(());
+    drop(confirm_tx);
     drop(inbound_tx);
     // Drop local services that still hold inbound_tx clones so runtime can observe
     // channel closure and exit promptly.
@@ -2253,14 +2254,35 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     Ok(())
 }
 
+/// 构建 API CORS 层。
+///
+/// 如果配置了 `gateway.allowed_origins`，使用配置的源列表；
+/// 否则回退到宽松策略（适用于本地/信任网络环境）。
 fn build_api_cors_layer(config: &Config) -> CorsLayer {
-    let _ = config;
-    CorsLayer::permissive().allow_credentials(false)
+    let origins = &config.gateway.allowed_origins;
+    if origins.is_empty() {
+        // 未配置 allowed_origins，使用宽松策略减少用户配置负担
+        CorsLayer::permissive().allow_credentials(false)
+    } else {
+        // 使用配置的 allowed_origins 列表
+        // axum::http 重导出了 http crate 的类型
+        let origin_list: Vec<axum::http::HeaderValue> = origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origin_list))
+            .allow_credentials(false)
+    }
 }
 
+/// 构建 WebUI CORS 层。
+///
+/// 如果配置了 `gateway.allowed_origins`，使用配置的源列表；
+/// 否则回退到宽松策略（WebUI 通常在同机或内网访问）。
 fn build_webui_cors_layer(config: &Config) -> CorsLayer {
-    let _ = config;
-    CorsLayer::permissive().allow_credentials(false)
+    // WebUI 与 API 共用相同的 CORS 策略
+    build_api_cors_layer(config)
 }
 
 #[cfg(test)]

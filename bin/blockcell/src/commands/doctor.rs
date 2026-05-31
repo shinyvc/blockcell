@@ -477,9 +477,17 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     // Chrome
-    let chrome_paths = [
+    let chrome_paths: &[&str] = &[
+        // macOS
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        // Windows
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        // Linux
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
     ];
     let chrome_found = chrome_paths
         .iter()

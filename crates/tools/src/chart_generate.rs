@@ -15,8 +15,8 @@ pub struct ChartGenerateTool;
 impl Tool for ChartGenerateTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "chart_generate",
-            description: "Generate charts and data visualizations. You MUST provide `action`. action='info': no extra params. action='generate': requires `chart_type`; requires `data` unless `chart_type='custom'`; optional `title`, `x_label`, `y_label`, `output_path`, `style`, `backend`, and `custom_script`.",
+            name: "chart_generate".to_string(),
+            description: "Generate charts and data visualizations. You MUST provide `action`. action='info': no extra params. action='generate': requires `chart_type`; requires `data` unless `chart_type='custom'`; optional `title`, `x_label`, `y_label`, `output_path`, `style`, `backend`, and `custom_script`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -37,6 +37,9 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart", "st
 clap = { version = "4.4", features = ["derive"] }
 clap_complete = "4.4"
 
+# Semver
+semver = "1.0"
+
 # Logging/Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

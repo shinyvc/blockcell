@@ -11,8 +11,8 @@ pub struct EmailTool;
 impl Tool for EmailTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "email",
-            description: "Email via SMTP/IMAP. You MUST provide `action`. action='send': requires mail account credentials plus `from`, `to`, `subject`, and at least one of `body` or `html_body`; optional `cc` and `attachments`. action='list': requires IMAP credentials, optional `folder` and `limit`. action='read': requires IMAP credentials and `uid`, optional `folder` and `save_attachments_to`. action='search': requires IMAP credentials and `query`, optional `folder`.",
+            name: "email".to_string(),
+            description: "Email via SMTP/IMAP. You MUST provide `action`. action='send': requires mail account credentials plus `from`, `to`, `subject`, and at least one of `body` or `html_body`; optional `cc` and `attachments`. action='list': requires IMAP credentials, optional `folder` and `limit`. action='read': requires IMAP credentials and `uid`, optional `folder` and `save_attachments_to`. action='search': requires IMAP credentials and `query`, optional `folder`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

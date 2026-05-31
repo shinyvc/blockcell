@@ -76,12 +76,12 @@ pub struct PathPolicyFileConfig {
 
     /// Whether the session-level directory cache is used to avoid re-confirming
     /// the same directory. Only applies to `confirm` outcomes.
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub cache_confirmed_dirs: bool,
 
     /// When `true`, a built-in list of sensitive system paths (e.g. `~/.ssh`, `/etc`)
     /// is always denied, even if no explicit rule covers them.
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::default_true")]
     pub builtin_protected_paths: bool,
 
     /// User-defined rules, evaluated in priority order (deny > allow > confirm).
@@ -95,10 +95,6 @@ fn default_version() -> u32 {
 fn default_policy_confirm() -> PolicyAction {
     PolicyAction::Confirm
 }
-fn default_true() -> bool {
-    true
-}
-
 impl Default for PathPolicyFileConfig {
     fn default() -> Self {
         Self {

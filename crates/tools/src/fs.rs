@@ -25,8 +25,8 @@ pub struct ReadFileTool;
 impl Tool for ReadFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "read_file",
-            description: "Read the contents of a local file. REQUIRED: always provide string parameter `path`; do not call this tool with `{}`. `path` may be an absolute path, `~/...`, or a workspace-relative file path such as `xhs_feeds.json` or `notes/todo.md`. Supports text files and Office documents (.xlsx, .xls, .docx, .pptx) — binary Office files are automatically parsed and returned as readable text/markdown.",
+            name: "read_file".to_string(),
+            description: "Read the contents of a local file. REQUIRED: always provide string parameter `path`; do not call this tool with `{}`. `path` may be an absolute path, `~/...`, or a workspace-relative file path such as `xhs_feeds.json` or `notes/todo.md`. Supports text files and Office documents (.xlsx, .xls, .docx, .pptx) — binary Office files are automatically parsed and returned as readable text/markdown.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -99,8 +99,8 @@ pub struct WriteFileTool;
 impl Tool for WriteFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "write_file",
-            description: "Write content to a local file, creating parent directories if needed. REQUIRED: always provide both string parameters `path` and `content`; do not call this tool with `{}` and do not omit either field. `path` may be absolute, `~/...`, or workspace-relative such as `generated/out.html`.",
+            name: "write_file".to_string(),
+            description: "Write content to a local file, creating parent directories if needed. REQUIRED: always provide both string parameters `path` and `content`; do not call this tool with `{}` and do not omit either field. `path` may be absolute, `~/...`, or workspace-relative such as `generated/out.html`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -164,8 +164,8 @@ pub struct EditFileTool;
 impl Tool for EditFileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "edit_file",
-            description: "Edit a local file by replacing `old_text` with `new_text`. REQUIRED: always provide `path`, `old_text`, and `new_text`; do not call this tool with `{}`. IMPORTANT: before calling this tool, read the target file and copy the exact existing text into `old_text` verbatim. `old_text` must match the file content exactly, including whitespace, indentation, and line breaks, and it must appear only once. Prefer a longer unique contiguous snippet rather than a short fragment.",
+            name: "edit_file".to_string(),
+            description: "Edit a local file by replacing `old_text` with `new_text`. REQUIRED: always provide `path`, `old_text`, and `new_text`; do not call this tool with `{}`. IMPORTANT: before calling this tool, read the target file and copy the exact existing text into `old_text` verbatim. `old_text` must match the file content exactly, including whitespace, indentation, and line breaks, and it must appear only once. Prefer a longer unique contiguous snippet rather than a short fragment.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -255,8 +255,8 @@ pub struct ListDirTool;
 impl Tool for ListDirTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "list_dir",
-            description: "List contents of a directory. REQUIRED: always provide string parameter `path`; do not call this tool with `{}` and do not assume an implicit current directory. Use `{\"path\":\".\"}` for the current workspace directory, or pass an absolute / `~/...` / workspace-relative directory path explicitly.",
+            name: "list_dir".to_string(),
+            description: "List contents of a directory. REQUIRED: always provide string parameter `path`; do not call this tool with `{}` and do not assume an implicit current directory. Use `{\"path\":\".\"}` for the current workspace directory, or pass an absolute / `~/...` / workspace-relative directory path explicitly.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

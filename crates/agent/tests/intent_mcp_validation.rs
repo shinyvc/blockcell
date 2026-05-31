@@ -78,8 +78,8 @@ fn intent_validation_rejects_unknown_mcp_tool_when_server_tools_are_loaded() {
     impl blockcell_tools::Tool for FakeGithubTool {
         fn schema(&self) -> blockcell_tools::ToolSchema {
             blockcell_tools::ToolSchema {
-                name: "github__search_repositories",
-                description: "fake",
+                name: "github__search_repositories".to_string(),
+                description: "fake".to_string(),
                 parameters: serde_json::json!({"type":"object"}),
             }
         }

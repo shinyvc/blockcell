@@ -10,12 +10,12 @@ pub struct SpawnTool;
 impl Tool for SpawnTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "spawn",
+            name: "spawn".to_string(),
             description: "Spawn a background sub-agent to execute a skill or long-running task. \
                 **Preferred usage**: set `skill_name` to run a named skill (e.g. stock_analysis, crypto_tracker) — \
                 the sub-agent will route that skill through the unified skill kernel. \
                 Use `task` (text description) only when no matching skill exists. \
-                DO NOT use spawn if you can answer the user directly — only for async workloads that should not block the current reply.",
+                DO NOT use spawn if you can answer the user directly — only for async workloads that should not block the current reply.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

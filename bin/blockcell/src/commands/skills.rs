@@ -304,22 +304,25 @@ pub async fn list(all: bool, enabled_only: bool) -> anyhow::Result<()> {
     let records_dir = paths.workspace().join("evolution_records");
     let skills_dir = paths.skills_dir();
 
-    // Load all evolution records
-    let mut records: Vec<EvolutionRecord> = Vec::new();
-    if records_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&records_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "json") {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        if let Ok(record) = serde_json::from_str::<EvolutionRecord>(&content) {
-                            records.push(record);
+    // 将阻塞 I/O 移至 spawn_blocking，避免阻塞 Tokio 工作线程
+    let mut records: Vec<EvolutionRecord> = tokio::task::spawn_blocking(move || {
+        let mut records = Vec::new();
+        if records_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&records_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|e| e == "json") {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if let Ok(record) = serde_json::from_str::<EvolutionRecord>(&content) {
+                                records.push(record);
+                            }
                         }
                     }
                 }
             }
         }
-    }
+        records
+    }).await.unwrap_or_default();
     records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
     // Categorize: deduplicate by skill_name (keep latest record per skill)
@@ -350,28 +353,27 @@ pub async fn list(all: bool, enabled_only: bool) -> anyhow::Result<()> {
         }
     }
 
-    // Collect available skills from workspace/skills/ only.
-    // (Builtin skills are extracted to workspace on first run/onboard.)
-    let mut available_skills: Vec<(String, std::path::PathBuf)> = Vec::new();
-    if skills_dir.exists() && skills_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&skills_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir()
-                    && (p.join("SKILL.rhai").exists()
-                        || p.join("SKILL.py").exists()
-                        || p.join("SKILL.md").exists())
-                {
-                    let name = p
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    available_skills.push((name, p));
+    // 将阻塞 I/O 移至 spawn_blocking，收集可用 skills
+    let skills_dir_clone = skills_dir.clone();
+    let mut available_skills: Vec<(String, std::path::PathBuf)> = tokio::task::spawn_blocking(move || {
+        let mut skills = Vec::new();
+        if skills_dir_clone.exists() && skills_dir_clone.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&skills_dir_clone) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir()
+                        && (p.join("SKILL.rhai").exists()
+                            || p.join("SKILL.py").exists()
+                            || p.join("SKILL.md").exists())
+                    {
+                        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                        skills.push((name, p));
+                    }
                 }
             }
         }
-    }
+        skills
+    }).await.unwrap_or_default();
     available_skills.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Filter by enabled if requested (skills with .disabled marker are excluded)
@@ -480,7 +482,7 @@ pub async fn show(name: &str) -> anyhow::Result<()> {
     if meta_path.exists() {
         println!();
         println!("  meta.yaml:");
-        let content = std::fs::read_to_string(&meta_path).unwrap_or_default();
+        let content = tokio::fs::read_to_string(&meta_path).await.unwrap_or_default();
         for line in content.lines().take(30) {
             println!("    {}", line);
         }
@@ -499,25 +501,29 @@ pub async fn show(name: &str) -> anyhow::Result<()> {
         println!("  Control Plane: SKILL.md ✓");
     }
 
-    // Show evolution records for this skill
+    // 将阻塞 I/O 移至 spawn_blocking，加载进化记录
     let records_dir = paths.workspace().join("evolution_records");
-    let mut records: Vec<EvolutionRecord> = Vec::new();
-    if records_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&records_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().is_some_and(|e| e == "json") {
-                    if let Ok(content) = std::fs::read_to_string(&p) {
-                        if let Ok(r) = serde_json::from_str::<EvolutionRecord>(&content) {
-                            if r.skill_name == name {
-                                records.push(r);
+    let name_clone = name.to_string();
+    let mut records: Vec<EvolutionRecord> = tokio::task::spawn_blocking(move || {
+        let mut records = Vec::new();
+        if records_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&records_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().is_some_and(|e| e == "json") {
+                        if let Ok(content) = std::fs::read_to_string(&p) {
+                            if let Ok(r) = serde_json::from_str::<EvolutionRecord>(&content) {
+                                if r.skill_name == name_clone {
+                                    records.push(r);
+                                }
                             }
                         }
                     }
                 }
             }
         }
-    }
+        records
+    }).await.unwrap_or_default();
     records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     if !records.is_empty() {
         println!();
@@ -549,13 +555,13 @@ pub async fn set_enabled(name: &str, enable: bool) -> anyhow::Result<()> {
     let marker = skill_path.join(".disabled");
     if enable {
         if marker.exists() {
-            std::fs::remove_file(&marker)?;
+            tokio::fs::remove_file(&marker).await?;
             println!("✅ Skill '{}' enabled.", name);
         } else {
             println!("  Skill '{}' is already enabled.", name);
         }
     } else if !marker.exists() {
-        std::fs::write(&marker, "")?;
+        tokio::fs::write(&marker, "").await?;
         println!("⏸  Skill '{}' disabled.", name);
     } else {
         println!("  Skill '{}' is already disabled.", name);

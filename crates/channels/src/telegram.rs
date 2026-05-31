@@ -684,13 +684,7 @@ async fn do_send_message(
     // 400 with "can't parse entities" → retry as plain text
     if status.as_u16() == 400 && body.contains("parse") {
         warn!("Telegram MarkdownV2 parse error, retrying as plain text");
-        let plain_request = SendMessageRequest {
-            chat_id: chat_id.to_string(),
-            text: text.to_string(),
-            parse_mode: String::new(),
-            reply_to_message_id: None,
-        };
-        // Send without parse_mode by using a plain JSON body
+        // 直接使用 serde_json 构建请求体，避免构造未使用的 SendMessageRequest 结构体
         let mut plain_body = serde_json::json!({
             "chat_id": chat_id,
             "text": text,
@@ -711,7 +705,6 @@ async fn do_send_message(
                 err
             )));
         }
-        let _ = plain_request; // suppress unused warning (fields used for serde only)
         return Ok(());
     }
 

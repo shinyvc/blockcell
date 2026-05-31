@@ -405,8 +405,8 @@ impl ToolContext {
 }
 
 pub struct ToolSchema {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub parameters: Value,
 }
 

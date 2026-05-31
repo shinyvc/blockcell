@@ -10,8 +10,8 @@ pub struct ToggleManageTool;
 impl Tool for ToggleManageTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "toggle_manage",
-            description: "Manage enable/disable state of skills and tools. You MUST provide `action`. action='list': no extra params, returns current toggle states. action='set': requires `category`, `name`, and `enabled`. `category` must be 'skills' or 'tools'. This tool does NOT execute the skill/tool itself.",
+            name: "toggle_manage".to_string(),
+            description: "Manage enable/disable state of skills and tools. You MUST provide `action`. action='list': no extra params, returns current toggle states. action='set': requires `category`, `name`, and `enabled`. `category` must be 'skills' or 'tools'. This tool does NOT execute the skill/tool itself.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

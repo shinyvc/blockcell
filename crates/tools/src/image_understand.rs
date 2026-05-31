@@ -15,8 +15,8 @@ pub struct ImageUnderstandTool;
 impl Tool for ImageUnderstandTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "image_understand",
-            description: "Analyze images using multimodal vision models. You MUST provide `action`. action='describe': requires `path`, optional `provider`, `model`, `detail`, `max_tokens`. action='analyze'|'extract': requires `path`; `prompt` is recommended and usually needed for precise results; optional `provider`, `model`, `detail`, `max_tokens`. action='compare': requires `paths`, optional `prompt`, `provider`, `model`, `detail`, `max_tokens`.",
+            name: "image_understand".to_string(),
+            description: "Analyze images using multimodal vision models. You MUST provide `action`. action='describe': requires `path`, optional `provider`, `model`, `detail`, `max_tokens`. action='analyze'|'extract': requires `path`; `prompt` is recommended and usually needed for precise results; optional `provider`, `model`, `detail`, `max_tokens`. action='compare': requires `paths`, optional `prompt`, `provider`, `model`, `detail`, `max_tokens`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -8,15 +8,15 @@
 //! - DeepSeek, Claude, and other OpenAI-compatible models
 
 use blockcell_core::types::ChatMessage;
-use once_cell::sync::Lazy;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 /// Global tiktoken encoder using cl100k_base (GPT-3.5-turbo, GPT-4).
 ///
 /// This is initialized once and reused across all token counting operations.
 /// If initialization fails (e.g., network issues downloading vocabulary),
 /// we fall back to conservative estimation.
-static TIKTOKEN_ENCODER: Lazy<Option<Arc<tiktoken_rs::CoreBPE>>> = Lazy::new(|| {
+static TIKTOKEN_ENCODER: LazyLock<Option<Arc<tiktoken_rs::CoreBPE>>> = LazyLock::new(|| {
     match tiktoken_rs::cl100k_base() {
         Ok(encoder) => {
             tracing::debug!("[token] tiktoken encoder initialized successfully");
@@ -65,7 +65,7 @@ fn estimate_tokens_fallback(text: &str) -> usize {
             if ch.is_ascii_whitespace() || ch.is_ascii_punctuation() {
                 if ascii_word_chars > 0 {
                     // ~1.3 tokens per English word, round up
-                    tokens += 1 + ascii_word_chars / 4;
+                    tokens += 1 + ascii_word_chars / blockcell_core::CHARS_PER_TOKEN;
                     ascii_word_chars = 0;
                 }
                 // whitespace/punctuation: ~0.25 tokens each, batch them
@@ -76,7 +76,7 @@ fn estimate_tokens_fallback(text: &str) -> usize {
         } else {
             // Flush pending ASCII word
             if ascii_word_chars > 0 {
-                tokens += 1 + ascii_word_chars / 4;
+                tokens += 1 + ascii_word_chars / blockcell_core::CHARS_PER_TOKEN;
                 ascii_word_chars = 0;
             }
             // CJK and other multi-byte: ~1 token per character
@@ -86,7 +86,7 @@ fn estimate_tokens_fallback(text: &str) -> usize {
 
     // Flush trailing ASCII word
     if ascii_word_chars > 0 {
-        tokens += 1 + ascii_word_chars / 4;
+        tokens += 1 + ascii_word_chars / blockcell_core::CHARS_PER_TOKEN;
     }
 
     // Add per-message overhead (role markers, formatting)

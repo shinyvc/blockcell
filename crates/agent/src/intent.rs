@@ -93,6 +93,10 @@ struct IntentRule {
     /// 来自配置文件的动态否定词
     negative_dyn: Vec<String>,
     priority: u8,
+    /// 预小写的关键词（静态 + 动态合并），避免每次匹配重复 to_lowercase() 分配
+    keywords_lower: Vec<String>,
+    /// 预小写的否定词（静态 + 动态合并），避免每次匹配重复 to_lowercase() 分配
+    negative_lower: Vec<String>,
 }
 
 impl Default for IntentRule {
@@ -105,6 +109,8 @@ impl Default for IntentRule {
             negative: vec![],
             negative_dyn: vec![],
             priority: 0,
+            keywords_lower: vec![],
+            negative_lower: vec![],
         }
     }
 }
@@ -143,6 +149,8 @@ impl IntentClassifier {
                 negative: vec![],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
                 priority: 10,
             },
             // ── Finance (priority 65) ──
@@ -162,6 +170,8 @@ impl IntentClassifier {
                 negative: vec![],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
                 priority: 65,
             },
             // ── Blockchain (priority 65) ──
@@ -180,6 +190,8 @@ impl IntentClassifier {
                 negative: vec![],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
                 priority: 65,
             },
             // ── FileOps (priority 55) - 通用文件操作，优先级低于专用类别 ──
@@ -211,6 +223,8 @@ impl IntentClassifier {
                 ],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
                 priority: 55,
             },
             // ── WebSearch (priority 55) ──
@@ -230,6 +244,8 @@ impl IntentClassifier {
                 ],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
                 priority: 55,
             },
             // ── DataAnalysis (priority 60) ──
@@ -251,6 +267,8 @@ impl IntentClassifier {
                 negative: vec![],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
                 priority: 60,
             },
             // ── Communication (priority 60) ──
@@ -270,6 +288,8 @@ impl IntentClassifier {
                 ],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
                 priority: 60,
             },
             // ── SystemControl (priority 65) - 系统控制优先级高于通用 FileOps ──
@@ -289,6 +309,8 @@ impl IntentClassifier {
                 negative: vec![],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
                 priority: 65,
             },
             // ── Organization (priority 55) ──
@@ -307,6 +329,8 @@ impl IntentClassifier {
                 negative: vec![],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
                 priority: 55,
             },
             // ── IoT (priority 65) - 设备控制优先级高于通用 FileOps ──
@@ -326,6 +350,8 @@ impl IntentClassifier {
                 negative: vec![],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
                 priority: 65,
             },
             // ── Media (priority 65) - 媒体处理优先级高于通用 FileOps ──
@@ -351,6 +377,8 @@ impl IntentClassifier {
                 ],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
                 priority: 65,
             },
             // ── DevOps (priority 65) - 运维优先级高于通用 FileOps ──
@@ -373,6 +401,8 @@ impl IntentClassifier {
                 ],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
                 priority: 65,
             },
             // ── Lifestyle (priority 50) ──
@@ -391,11 +421,22 @@ impl IntentClassifier {
                 negative: vec![],
                 keywords_dyn: vec![],
                 negative_dyn: vec![],
+                keywords_lower: vec![],
+                negative_lower: vec![],
                 priority: 50,
             },
         ];
 
-        Self { rules }
+        // 预小写关键词和否定词，避免每次匹配时重复 to_lowercase() 分配
+        let mut classifier = Self { rules };
+        for rule in &mut classifier.rules {
+            rule.keywords_lower = rule.keywords.iter().map(|s| s.to_lowercase()).collect();
+            rule.keywords_lower.extend(rule.keywords_dyn.iter().cloned());
+            rule.negative_lower = rule.negative.iter().map(|s| s.to_lowercase()).collect();
+            rule.negative_lower.extend(rule.negative_dyn.iter().cloned());
+        }
+
+        classifier
     }
 
     /// 在内置规则基础上，叠加来自配置文件的自定义规则，返回新的分类器实例。
@@ -445,10 +486,12 @@ impl IntentClassifier {
             classifier.rules.push(IntentRule {
                 category,
                 keywords: vec![],
-                keywords_dyn,
+                keywords_dyn: keywords_dyn.clone(),
                 patterns,
                 negative: vec![],
-                negative_dyn,
+                negative_dyn: negative_dyn.clone(),
+                keywords_lower: keywords_dyn, // keywords_dyn 已在上面预小写
+                negative_lower: negative_dyn, // negative_dyn 已在上面预小写
                 priority: rule_cfg.priority,
             });
         }
@@ -492,14 +535,9 @@ impl IntentClassifier {
     }
 
     fn rule_matches(&self, rule: &IntentRule, input: &str, input_lower: &str) -> bool {
-        // Check negative keywords first (static + pre-lowercased dynamic)
-        for neg in rule
-            .negative
-            .iter()
-            .copied()
-            .chain(rule.negative_dyn.iter().map(String::as_str))
-        {
-            if input_lower.contains(&neg.to_lowercase()) {
+        // 使用预小写的否定词列表（构造时已预处理），避免每次匹配重复 to_lowercase() 分配
+        for neg in &rule.negative_lower {
+            if input_lower.contains(neg.as_str()) {
                 return false;
             }
         }
@@ -511,13 +549,8 @@ impl IntentClassifier {
             }
         }
 
-        // Check keywords (static + pre-lowercased dynamic — avoid double-lowercasing)
-        for keyword in &rule.keywords {
-            if input_lower.contains(&keyword.to_lowercase()) {
-                return true;
-            }
-        }
-        for keyword in rule.keywords_dyn.iter() {
+        // 使用预小写的关键词列表（构造时已预处理），避免每次匹配重复 to_lowercase() 分配
+        for keyword in &rule.keywords_lower {
             if input_lower.contains(keyword.as_str()) {
                 return true;
             }

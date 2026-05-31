@@ -131,10 +131,7 @@ impl CheckpointManager {
                 Ok(json) => match serde_json::from_str::<TaskCheckpoint>(&json) {
                     Ok(cp) if !cp.completed => {
                         result.push(cp);
-                        if result.len() >= MAX_FIND_UNFINISHED {
-                            result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                            result.truncate(MAX_FIND_UNFINISHED);
-                        }
+                        // 不在循环内排序截断，循环结束后统一处理
                     }
                     Ok(_) => {} // 已完成的 checkpoint，跳过
                     Err(e) => {
@@ -155,8 +152,9 @@ impl CheckpointManager {
             }
         }
 
-        // 按创建时间降序排列（最新的在前）
+        // 按创建时间降序排列（最新的在前），保留最多 MAX_FIND_UNFINISHED 条
         result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        result.truncate(MAX_FIND_UNFINISHED);
         result
     }
 

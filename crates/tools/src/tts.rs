@@ -18,8 +18,8 @@ pub struct TtsTool;
 impl Tool for TtsTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "tts",
-            description: "Convert text to speech audio. You MUST provide `action`. action='info': no extra params. action='list_voices': optional `language` and `backend`. action='speak': requires `text`, optional `output_path`, `voice`, `backend`, `speed`, and `format`.",
+            name: "tts".to_string(),
+            description: "Convert text to speech audio. You MUST provide `action`. action='info': no extra params. action='list_voices': optional `language` and `backend`. action='speak': requires `text`, optional `output_path`, `voice`, `backend`, `speed`, and `format`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

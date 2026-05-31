@@ -42,8 +42,8 @@ pub struct SkillManageTool;
 impl Tool for SkillManageTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "skill_manage",
-            description: "Manage skills (create, patch, view, delete). Skills are your procedural memory — reusable approaches for recurring task types.\n\nCreate when: complex task succeeded (5+ tool calls), errors overcome, user-corrected approach worked, or non-trivial workflow discovered.\nPatch when: instructions stale/wrong, missing steps or pitfalls found during use. If you used a skill and hit issues not covered by it, patch it immediately — don't wait to be asked.\nView when: you need to load a skill's full content before following its steps.\nDelete when: skill is obsolete or user requests removal.\n\nAfter difficult/iterative tasks, offer to save as a skill. Skip for simple one-offs.",
+            name: "skill_manage".to_string(),
+            description: "Manage skills (create, patch, view, delete). Skills are your procedural memory — reusable approaches for recurring task types.\n\nCreate when: complex task succeeded (5+ tool calls), errors overcome, user-corrected approach worked, or non-trivial workflow discovered.\nPatch when: instructions stale/wrong, missing steps or pitfalls found during use. If you used a skill and hit issues not covered by it, patch it immediately — don't wait to be asked.\nView when: you need to load a skill's full content before following its steps.\nDelete when: skill is obsolete or user requests removal.\n\nAfter difficult/iterative tasks, offer to save as a skill. Skip for simple one-offs.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

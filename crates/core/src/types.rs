@@ -344,9 +344,18 @@ pub fn sanitize_thinking_mode_messages(
 }
 
 /// 判断模型是否为 DeepSeek thinking 模型（需要 reasoning_content 回传）。
+///
+/// 维护说明：当新的 thinking 模型发布时，请将模型名称添加到下面的数组中。
+/// 模型命名规则：使用 model.to_ascii_lowercase() 匹配，请添加小写前缀。
+const THINKING_MODEL_PREFIXES: &[&str] = &[
+    "deepseek-v4",
+    "deepseek-reasoner",
+    "deepseek-r1",
+];
+
 pub fn is_thinking_model(model: &str) -> bool {
     let lower = model.to_ascii_lowercase();
-    lower.contains("deepseek-v4")
-        || lower.contains("deepseek-reasoner")
-        || lower.contains("deepseek-r1")
+    THINKING_MODEL_PREFIXES
+        .iter()
+        .any(|prefix| lower.contains(prefix))
 }

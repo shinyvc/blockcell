@@ -187,7 +187,8 @@ fn generate_file_summary(content: &str, max_tokens: usize) -> String {
     // 粗略估算: 1 token ≈ 4 字符
     let max_chars = max_tokens * 4;
     let preview = content.chars().take(max_chars).collect::<String>();
-    if content.len() > max_chars {
+    // 使用 chars().count() 而非 len()，因为 max_chars 是字符数而非字节数
+    if content.chars().count() > max_chars {
         format!(
             "{}\n[... content truncated at {} tokens ...]",
             preview, max_tokens
@@ -200,7 +201,8 @@ fn generate_file_summary(content: &str, max_tokens: usize) -> String {
 /// 生成技能摘要（前 500 字符）
 fn generate_skill_summary(content: &str) -> String {
     let preview = content.chars().take(500).collect::<String>();
-    if content.len() > 500 {
+    // 使用 chars().count() 而非 len()，因为 500 是字符数而非字节数
+    if content.chars().count() > 500 {
         format!("{}\n[... skill content truncated ...]", preview)
     } else {
         preview

@@ -486,7 +486,7 @@ fn collect_skill_search_entries_filtered_recursive(
 pub(super) async fn handle_skills(State(state): State<GatewayState>) -> impl IntoResponse {
     // Load disabled toggles once for all skills
     let toggles_path = state.paths.toggles_file();
-    let disabled_skills: std::collections::HashSet<String> = std::fs::read_to_string(&toggles_path)
+    let disabled_skills: std::collections::HashSet<String> = tokio::fs::read_to_string(&toggles_path).await
         .ok()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
         .and_then(|v| v.get("skills").and_then(|s| s.as_object()).cloned())
@@ -665,7 +665,7 @@ pub(super) async fn handle_evolution(State(state): State<GatewayState>) -> impl 
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(content) = tokio::fs::read_to_string(&path).await {
                     if let Ok(mut record) = serde_json::from_str::<serde_json::Value>(&content) {
                         // Strip heavy fields not needed for the list view
                         if let Some(patch) = record.get_mut("patch").and_then(|p| p.as_object_mut())
@@ -719,7 +719,7 @@ pub(super) async fn handle_evolution_detail(
     let records_dir = state.paths.workspace().join("evolution_records");
     let path = records_dir.join(format!("{}.json", evolution_id));
     if path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(content) = tokio::fs::read_to_string(&path).await {
             if let Ok(record) = serde_json::from_str::<serde_json::Value>(&content) {
                 return Json(serde_json::json!({ "record": record, "kind": "skill" }));
             }
@@ -730,7 +730,7 @@ pub(super) async fn handle_evolution_detail(
     let cap_records_dir = state.paths.workspace().join("tool_evolution_records");
     let cap_path = cap_records_dir.join(format!("{}.json", evolution_id));
     if cap_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&cap_path) {
+        if let Ok(content) = tokio::fs::read_to_string(&cap_path).await {
             if let Ok(record) = serde_json::from_str::<serde_json::Value>(&content) {
                 return Json(serde_json::json!({ "record": record, "kind": "tool_evolution" }));
             }
@@ -751,7 +751,7 @@ pub(super) async fn handle_evolution_tool_evolutions(
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(content) = tokio::fs::read_to_string(&path).await {
                     if let Ok(record) = serde_json::from_str::<serde_json::Value>(&content) {
                         records.push(record);
                     }
@@ -823,14 +823,15 @@ pub(super) async fn handle_persona_list(State(state): State<GatewayState>) -> im
 
     for name in PERSONA_FILES {
         let path = workspace.join(name);
-        let content = if path.exists() {
-            std::fs::read_to_string(&path).unwrap_or_default()
+        let exists = tokio::fs::try_exists(&path).await.unwrap_or(false);
+        let content = if exists {
+            tokio::fs::read_to_string(&path).await.unwrap_or_default()
         } else {
             String::new()
         };
         files.push(serde_json::json!({
             "name": name,
-            "exists": path.exists(),
+            "exists": exists,
             "content": content,
             "size": content.len(),
         }));
@@ -860,15 +861,16 @@ pub(super) async fn handle_persona_read(
         return Json(serde_json::json!({ "error": "Invalid file name" }));
     }
     let path = state.paths.workspace().join(&params.name);
-    let content = if path.exists() {
-        std::fs::read_to_string(&path).unwrap_or_default()
+    let exists = tokio::fs::try_exists(&path).await.unwrap_or(false);
+    let content = if exists {
+        tokio::fs::read_to_string(&path).await.unwrap_or_default()
     } else {
         String::new()
     };
     Json(serde_json::json!({
         "name": params.name,
         "content": content,
-        "exists": path.exists(),
+        "exists": exists,
     }))
 }
 
@@ -882,7 +884,7 @@ pub(super) async fn handle_persona_write(
         return Json(serde_json::json!({ "status": "error", "message": "Invalid file name" }));
     }
     let path = state.paths.workspace().join(&req.name);
-    match std::fs::write(&path, &req.content) {
+    match tokio::fs::write(&path, &req.content).await {
         Ok(_) => {
             Json(serde_json::json!({ "status": "ok", "name": req.name, "size": req.content.len() }))
         }
@@ -908,37 +910,36 @@ pub(super) async fn handle_evolution_trigger(
         .await
     {
         Ok(evolution_id) => {
-            // Auto-disable the skill while it evolves so the old broken version won't run
+            // 使用 tokio::fs 异步 I/O 避免阻塞工作线程
             let toggles_path = state.paths.toggles_file();
-            if let Ok(content) = std::fs::read_to_string(&toggles_path) {
+            if let Ok(content) = tokio::fs::read_to_string(&toggles_path).await {
                 if let Ok(mut store) = serde_json::from_str::<serde_json::Value>(&content) {
                     let skill_enabled = store
                         .get("skills")
                         .and_then(|s| s.get(&req.skill_name))
                         .and_then(|v| v.as_bool())
-                        .unwrap_or(true); // absent = enabled
+                        .unwrap_or(true);
                     if skill_enabled {
                         if store.get("skills").is_none() {
                             store["skills"] = serde_json::json!({});
                         }
                         store["skills"][&req.skill_name] = serde_json::json!(false);
-                        let _ = std::fs::write(
+                        let _ = tokio::fs::write(
                             &toggles_path,
                             serde_json::to_string_pretty(&store).unwrap_or_default(),
-                        );
+                        ).await;
                     }
                 }
             } else {
-                // toggles file doesn't exist yet — create it with the skill disabled
                 let store =
                     serde_json::json!({ "skills": { &req.skill_name: false }, "tools": {} });
                 if let Some(parent) = toggles_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                    let _ = tokio::fs::create_dir_all(parent).await;
                 }
-                let _ = std::fs::write(
+                let _ = tokio::fs::write(
                     &toggles_path,
                     serde_json::to_string_pretty(&store).unwrap_or_default(),
-                );
+                ).await;
             }
 
             // Broadcast WS event so WebUI refreshes immediately without waiting for 10s poll
@@ -970,7 +971,7 @@ pub(super) async fn handle_evolution_resume(
     let path = records_dir.join(format!("{}.json", evolution_id));
 
     if path.exists() {
-        let record_data = match std::fs::read_to_string(&path) {
+        let record_data = match tokio::fs::read_to_string(&path).await {
             Ok(data) => data,
             Err(e) => {
                 return Json(
@@ -1019,7 +1020,7 @@ pub(super) async fn handle_evolution_resume(
         }
 
         // Save updated record
-        if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()) {
+        if let Err(e) = tokio::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).await {
             return Json(serde_json::json!({ "error": format!("Failed to save record: {}", e) }));
         }
 
@@ -1053,7 +1054,7 @@ pub(super) async fn handle_evolution_stop(
 
     if path.exists() {
         // Read the record to check status and get skill_name
-        let record_data = match std::fs::read_to_string(&path) {
+        let record_data = match tokio::fs::read_to_string(&path).await {
             Ok(data) => data,
             Err(e) => {
                 return Json(
@@ -1114,7 +1115,7 @@ pub(super) async fn handle_evolution_stop(
         }
 
         // Save updated record
-        if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()) {
+        if let Err(e) = tokio::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).await {
             return Json(serde_json::json!({ "error": format!("Failed to save record: {}", e) }));
         }
 
@@ -1153,7 +1154,7 @@ pub(super) async fn handle_evolution_delete(
     let path = records_dir.join(format!("{}.json", evolution_id));
     if path.exists() {
         // Read skill_name before deleting so we can clean up EvolutionService state
-        let skill_name = std::fs::read_to_string(&path)
+        let skill_name = tokio::fs::read_to_string(&path).await
             .ok()
             .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
             .and_then(|v| {
@@ -1162,7 +1163,7 @@ pub(super) async fn handle_evolution_delete(
                     .map(|s| s.to_string())
             });
 
-        return match std::fs::remove_file(&path) {
+        return match tokio::fs::remove_file(&path).await {
             Ok(_) => {
                 // Clean up in-memory EvolutionService state so the skill can be re-triggered
                 if let Some(ref sn) = skill_name {
@@ -1187,7 +1188,7 @@ pub(super) async fn handle_evolution_delete(
     let cap_records_dir = state.paths.workspace().join("tool_evolution_records");
     let cap_path = cap_records_dir.join(format!("{}.json", evolution_id));
     if cap_path.exists() {
-        return match std::fs::remove_file(&cap_path) {
+        return match tokio::fs::remove_file(&cap_path).await {
             Ok(_) => {
                 let _ = state.ws_broadcast.send(
                     serde_json::json!({
@@ -1430,7 +1431,7 @@ pub(super) async fn handle_evolution_versions(
         }));
     }
 
-    match std::fs::read_to_string(&history_file) {
+    match tokio::fs::read_to_string(&history_file).await {
         Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
             Ok(history) => Json(history),
             Err(_) => Json(serde_json::json!({
@@ -1467,7 +1468,7 @@ pub(super) async fn handle_evolution_tool_versions(
         }));
     }
 
-    match std::fs::read_to_string(&history_file) {
+    match tokio::fs::read_to_string(&history_file).await {
         Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
             Ok(history) => Json(history),
             Err(_) => Json(serde_json::json!({
@@ -1500,7 +1501,7 @@ pub(super) async fn handle_evolution_summary(
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 skill_total += 1;
-                if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(content) = tokio::fs::read_to_string(&path).await {
                     if let Ok(record) = serde_json::from_str::<serde_json::Value>(&content) {
                         let status = record.get("status").and_then(|s| s.as_str()).unwrap_or("");
                         match status {
@@ -1527,7 +1528,7 @@ pub(super) async fn handle_evolution_summary(
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 cap_total += 1;
-                if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(content) = tokio::fs::read_to_string(&path).await {
                     if let Ok(record) = serde_json::from_str::<serde_json::Value>(&content) {
                         let status = record.get("status").and_then(|s| s.as_str()).unwrap_or("");
                         match status {

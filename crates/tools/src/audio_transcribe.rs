@@ -17,8 +17,8 @@ pub struct AudioTranscribeTool;
 impl Tool for AudioTranscribeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "audio_transcribe",
-            description: "Transcribe audio/video files. You MUST provide `action`. action='info': no extra params. action='transcribe': requires `path`, optional `output_path`, `language`, `model`, `backend`, and `format`. action='extract_audio': requires `path`, optional `output_path` and `format`.",
+            name: "audio_transcribe".to_string(),
+            description: "Transcribe audio/video files. You MUST provide `action`. action='info': no extra params. action='transcribe': requires `path`, optional `output_path`, `language`, `model`, `backend`, and `format`. action='extract_audio': requires `path`, optional `output_path` and `format`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 /// agent_id: agent to query; empty string or "default" uses the default agent path.
 pub async fn list(show_all: bool, agent_id: &str) -> anyhow::Result<()> {
     let paths = Paths::new().for_agent(agent_id);
+    // 只读列表操作，不需要接收消息，因此丢弃 rx
     let (tx, _rx) = mpsc::channel(1);
     let service = CronService::new(paths, tx);
     service.load().await?;

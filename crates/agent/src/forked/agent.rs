@@ -15,7 +15,7 @@ use super::{
 };
 use crate::memory_event;
 #[allow(deprecated)]
-use crate::skill_mutex::SkillMutex;
+pub(crate) use blockcell_tools::SkillMutexHandle;
 use blockcell_core::types::ChatMessage;
 use blockcell_core::UsageMetrics;
 use blockcell_providers::ProviderPool;
@@ -115,7 +115,7 @@ pub struct ForkedAgentParams {
     /// External skills directories (builtin_skills_dir etc., for skill search)
     pub external_skills_dirs: Vec<PathBuf>,
     /// Skill mutex (shared with parent agent to prevent concurrent skill modifications)
-    pub skill_mutex: Option<Arc<SkillMutex>>,
+    pub skill_mutex: Option<SkillMutexHandle>,
     /// 允许的工具列表 (None = 全部工具)
     pub tools: Option<Vec<String>>,
     /// 模型覆盖 (None = inherit from parent)
@@ -215,7 +215,7 @@ impl ForkedAgentParams {
 
     /// 设置 skill_mutex（共享父代理的 SkillMutex，防止并发修改）
     #[allow(deprecated)]
-    pub fn with_skill_mutex(mut self, mutex: Arc<SkillMutex>) -> Self {
+    pub fn with_skill_mutex(mut self, mutex: SkillMutexHandle) -> Self {
         self.skill_mutex = Some(mutex);
         self
     }
@@ -323,7 +323,7 @@ pub struct ForkedAgentParamsBuilder {
     skill_file_store: Option<SkillFileStoreHandle>,
     skills_dir: Option<PathBuf>,
     external_skills_dirs: Vec<PathBuf>,
-    skill_mutex: Option<Arc<SkillMutex>>,
+    skill_mutex: Option<SkillMutexHandle>,
     /// 允许的工具列表
     tools: Option<Vec<String>>,
     /// 模型覆盖
@@ -496,7 +496,7 @@ impl ForkedAgentParamsBuilder {
 
     /// 设置 skill_mutex（共享父代理的 SkillMutex，防止并发修改）
     #[allow(deprecated)]
-    pub fn skill_mutex(mut self, mutex: Arc<SkillMutex>) -> Self {
+    pub fn skill_mutex(mut self, mutex: SkillMutexHandle) -> Self {
         self.skill_mutex = Some(mutex);
         self
     }
@@ -977,7 +977,7 @@ async fn execute_forked_tool(
     skill_file_store: &Option<SkillFileStoreHandle>,
     skills_dir: &Option<PathBuf>,
     external_skills_dirs: &[PathBuf],
-    skill_mutex: &Option<Arc<SkillMutex>>,
+    skill_mutex: &Option<SkillMutexHandle>,
     working_dir: &Option<PathBuf>,
 ) -> Result<String, ForkedAgentError> {
     // Check disallowed tools list
@@ -1012,10 +1012,10 @@ async fn execute_forked_tool(
                 if let Some(ref mutex) = skill_mutex {
                     // 直接获取写锁（acquire 内部已包含活跃检查）
                     // 不再先调用 can_modify() 再 acquire()，避免 TOCTOU 竞态
-                    match mutex.acquire(name) {
-                        Ok(guard) => Some(guard),
-                        Err(e) => {
-                            tracing::warn!(skill = %name, error = %e, "SkillMutex acquire failed, rejecting write");
+                    match mutex.try_acquire(name) {
+                        Some(guard) => Some(guard),
+                        None => {
+                            tracing::warn!(skill = %name, "SkillMutex acquire failed (skill is active), rejecting write");
                             return Ok(json!({
                                 "success": false,
                                 "message": format!("Skill '{}' is currently being modified. Please try again later.", name)

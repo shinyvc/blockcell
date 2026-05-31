@@ -50,8 +50,8 @@ impl Tool for NetworkMonitorTool {
         props.insert("concurrent".into(), json!({"type": "integer", "description": "(port_scan) Max concurrent connections. Default: 50"}));
 
         ToolSchema {
-            name: "network_monitor",
-            description: "Network diagnostics. You MUST provide `action`. action='ping'|'traceroute'|'dns_lookup'|'whois'|'http_check'|'ssl_check': requires `host`, plus action-specific optional fields like `count`, `timeout`, `record_type`, or `url`. action='port_scan': requires `host`, optional `ports`, `port_range`, and `concurrent`. action='bandwidth': optional `url`. Use action-specific fields only with the matching action.",
+            name: "network_monitor".to_string(),
+            description: "Network diagnostics. You MUST provide `action`. action='ping'|'traceroute'|'dns_lookup'|'whois'|'http_check'|'ssl_check': requires `host`, plus action-specific optional fields like `count`, `timeout`, `record_type`, or `url`. action='port_scan': requires `host`, optional `ports`, `port_range`, and `concurrent`. action='bandwidth': optional `url`. Use action-specific fields only with the matching action.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": Value::Object(props),

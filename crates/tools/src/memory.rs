@@ -33,7 +33,12 @@ fn get_memory_file_store(ctx: &ToolContext) -> Result<&crate::MemoryFileStoreHan
         .ok_or_else(|| Error::Tool("Memory file store not available".to_string()))
 }
 
-fn looks_like_ghost_maintenance_log(text: &str) -> bool {
+/// 判断文本是否像 Ghost Agent 维护日志
+///
+/// 用于阻止 Ghost Agent 将自己的维护日志写入记忆存储。
+/// 使用精确匹配模式避免误判用户正常内容（如健康话题、数据 feed 等）。
+/// 此函数为 pub(crate) 供 memory_maintenance 模块复用。
+pub(crate) fn looks_like_ghost_maintenance_log(text: &str) -> bool {
     let t = text.to_lowercase();
     t.contains("ghost agent")
         || t.contains("memory garden")
@@ -52,8 +57,8 @@ fn looks_like_ghost_maintenance_log(text: &str) -> bool {
 impl Tool for MemoryManageTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "memory_manage",
-            description: "Save durable learning directly to USER.md or MEMORY.md. Use for stable user preferences, durable constraints, project facts, environment facts, and reusable non-procedural lessons. Do not save task logs or temporary state.",
+            name: "memory_manage".to_string(),
+            description: "Save durable learning directly to USER.md or MEMORY.md. Use for stable user preferences, durable constraints, project facts, environment facts, and reusable non-procedural lessons. Do not save task logs or temporary state.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -220,8 +225,8 @@ impl Tool for MemoryManageTool {
 impl Tool for MemoryQueryTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "memory_query",
-            description: "Search and retrieve memory items using full-text search with structured filters. Use this to recall facts, preferences, past decisions, project context, or any previously stored information. Supports filtering by scope (long_term/short_term), type, tags, and time range. Results are ranked by relevance, importance, and recency.",
+            name: "memory_query".to_string(),
+            description: "Search and retrieve memory items using full-text search with structured filters. Use this to recall facts, preferences, past decisions, project context, or any previously stored information. Supports filtering by scope (long_term/short_term), type, tags, and time range. Results are ranked by relevance, importance, and recency.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -316,8 +321,8 @@ impl Tool for MemoryQueryTool {
 impl Tool for MemoryUpsertTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "memory_upsert",
-            description: "Save or update a memory item. Supports structured metadata (type, scope, tags, importance) and dedup_key for automatic merge/update of existing items. Use scope='long_term' for persistent facts/preferences, scope='short_term' for session notes and temporary context.",
+            name: "memory_upsert".to_string(),
+            description: "Save or update a memory item. Supports structured metadata (type, scope, tags, importance) and dedup_key for automatic merge/update of existing items. Use scope='long_term' for persistent facts/preferences, scope='short_term' for session notes and temporary context.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -493,8 +498,8 @@ impl Tool for MemoryUpsertTool {
 impl Tool for MemoryForgetTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "memory_forget",
-            description: "Delete or restore memory items. Supports single item deletion by ID, batch deletion by filters (scope, type, tags, time), and restoration of soft-deleted items.",
+            name: "memory_forget".to_string(),
+            description: "Delete or restore memory items. Supports single item deletion by ID, batch deletion by filters (scope, type, tags, time), and restoration of soft-deleted items.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

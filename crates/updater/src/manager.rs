@@ -282,11 +282,18 @@ impl UpdateManager {
         Self::parse_version(candidate) > Self::parse_version(base)
     }
 
+    /// 解析版本字符串。使用 semver 语义进行比较，正确处理 pre-release 标签。
+    /// 如果 semver 解析失败（如格式不规则），回退到旧的逐段数字比较。
     fn parse_version(v: &str) -> Vec<u64> {
-        v.trim_start_matches('v')
+        let cleaned = v.trim_start_matches('v');
+        // 优先尝试 semver 解析
+        if let Ok(semver) = semver::Version::parse(cleaned) {
+            return vec![semver.major, semver.minor, semver.patch];
+        }
+        // 回退：逐段取数字部分，忽略预发标识符如 -beta.1
+        cleaned
             .split('.')
             .filter_map(|s| {
-                // 只取数字部分，忽略预发标识符如 -beta.1
                 s.split(|c: char| !c.is_ascii_digit())
                     .next()
                     .and_then(|n| n.parse::<u64>().ok())

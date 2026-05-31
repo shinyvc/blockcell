@@ -1383,10 +1383,10 @@ fn is_process_alive(pid: u32) -> bool {
 #[cfg(windows)]
 fn is_process_alive(pid: u32) -> bool {
     // Windows: 尝试打开进程
-    use winapi::um::handleapi::CloseHandle;
-    use winapi::um::processthreadsapi::GetExitCodeProcess;
-    use winapi::um::processthreadsapi::OpenProcess;
-    use winapi::um::winnt::PROCESS_QUERY_INFORMATION;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION,
+    };
 
     // SAFETY: 以下 Windows API 调用的安全性说明：
     // - OpenProcess: 使用 PROCESS_QUERY_INFORMATION 权限打开已命名进程，

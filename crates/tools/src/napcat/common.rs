@@ -329,12 +329,10 @@ pub fn get_sender_id(ctx: &crate::ToolContext) -> String {
 }
 
 /// Build tool description with NapCatQQ channel restriction note.
-/// Returns a static string to satisfy ToolSchema requirements.
-/// Note: Risk level info should be embedded in base_description for static lifetime.
-pub fn build_description(base_description: &'static str, _risk_level: RiskLevel) -> &'static str {
+pub fn build_description(base_description: &'static str, _risk_level: RiskLevel) -> String {
     // Risk level is already included in the base_description passed by callers
     // This function exists for API consistency and future extensibility
-    base_description
+    base_description.to_string()
 }
 
 /// Check if WebSocket API is available for making calls.

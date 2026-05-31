@@ -162,7 +162,7 @@ pub fn create_provider_with_tool_mode(
             provider_proxy,
             global_proxy,
             no_proxy,
-        )) as Box<dyn Provider>),
+        )?) as Box<dyn Provider>),
         "gemini" => Ok(Box::new(GeminiProvider::new_with_proxy(
             &resolved_cfg.api_key,
             resolved_cfg.api_base.as_deref(),
@@ -172,7 +172,7 @@ pub fn create_provider_with_tool_mode(
             provider_proxy,
             global_proxy,
             no_proxy,
-        )) as Box<dyn Provider>),
+        )?) as Box<dyn Provider>),
         "ollama" => {
             let api_base = resolved_cfg
                 .api_base
@@ -186,7 +186,7 @@ pub fn create_provider_with_tool_mode(
                 provider_proxy,
                 global_proxy,
                 no_proxy,
-            )) as Box<dyn Provider>)
+            )?) as Box<dyn Provider>)
         }
         _ => {
             // 对于自定义 provider 名（非内置），用 api_type 决定使用哪种协议实现
@@ -200,7 +200,7 @@ pub fn create_provider_with_tool_mode(
                     provider_proxy,
                     global_proxy,
                     no_proxy,
-                )) as Box<dyn Provider>),
+                )?) as Box<dyn Provider>),
                 "gemini" => Ok(Box::new(GeminiProvider::new_with_proxy(
                     &resolved_cfg.api_key,
                     resolved_cfg.api_base.as_deref(),
@@ -210,7 +210,7 @@ pub fn create_provider_with_tool_mode(
                     provider_proxy,
                     global_proxy,
                     no_proxy,
-                )) as Box<dyn Provider>),
+                )?) as Box<dyn Provider>),
                 "ollama" => {
                     let api_base = resolved_cfg
                         .api_base
@@ -224,7 +224,7 @@ pub fn create_provider_with_tool_mode(
                         provider_proxy,
                         global_proxy,
                         no_proxy,
-                    )) as Box<dyn Provider>)
+                    )?) as Box<dyn Provider>)
                 }
                 "openai_responses" => {
                     let api_base = resolved_cfg
@@ -241,7 +241,7 @@ pub fn create_provider_with_tool_mode(
                         global_proxy,
                         no_proxy,
                         tool_call_mode.unwrap_or(ToolCallMode::Native),
-                    )) as Box<dyn Provider>)
+                    )?) as Box<dyn Provider>)
                 }
                 _ => {
                     // 默认：OpenAI 兼容（openrouter, openai, deepseek, groq, zhipu, vllm, kimi 等）
@@ -261,7 +261,7 @@ pub fn create_provider_with_tool_mode(
                         tool_call_mode.unwrap_or(ToolCallMode::Native),
                         effective_provider,
                         reasoning_effort,
-                    )) as Box<dyn Provider>)
+                    )?) as Box<dyn Provider>)
                 }
             }
         }

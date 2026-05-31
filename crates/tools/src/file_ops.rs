@@ -23,8 +23,8 @@ pub struct FileOpsTool;
 impl Tool for FileOpsTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "file_ops",
-            description: "Multi-action file utility. You MUST provide `action`. action='delete': requires `path`, optional `recursive` for directories. action='rename'|'move'|'copy': requires `path` and `destination`. action='compress': requires `destination` and either `path` or `paths`, optional `format`. action='decompress': requires `path`, optional `destination`. action='read_pdf': requires `path`. action='file_info': requires `path`.",
+            name: "file_ops".to_string(),
+            description: "Multi-action file utility. You MUST provide `action`. action='delete': requires `path`, optional `recursive` for directories. action='rename'|'move'|'copy': requires `path` and `destination`. action='compress': requires `destination` and either `path` or `paths`, optional `format`. action='decompress': requires `path`, optional `destination`. action='read_pdf': requires `path`. action='file_info': requires `path`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

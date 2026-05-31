@@ -165,11 +165,11 @@ pub struct StreamSubscribeTool;
 impl Tool for StreamSubscribeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "stream_subscribe",
+            name: "stream_subscribe".to_string(),
             description: "Subscribe to real-time data streams via WebSocket or SSE (Server-Sent Events). \
                 Manage persistent connections for live market data, blockchain events, news feeds, etc. \
                 Actions: 'subscribe' (create new stream), 'unsubscribe' (close stream), 'read' (get buffered messages), \
-                'send' (send message to WebSocket), 'list' (list active streams), 'status' (get stream status).",
+                'send' (send message to WebSocket), 'list' (list active streams), 'status' (get stream status).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

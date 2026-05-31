@@ -38,13 +38,13 @@ pub struct AgentTool;
 impl Tool for AgentTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "agent",
+            name: "agent".to_string(),
             description: "Launch a new agent to handle complex, multi-step tasks autonomously. \
 Available built-in types: explore (codebase exploration), plan (implementation planning), \
 verification (testing/validation), viper (production code), general (complex tasks). \
 Custom types may also be available from ~/.blockcell/workspace/agents/ or .blockcell/agents/. \
 Omit subagent_type for fork mode (inherits parent context, shares prompt cache, synchronous). \
-Specify subagent_type for typed agents (background execution, returns task_id).",
+Specify subagent_type for typed agents (background execution, returns task_id).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

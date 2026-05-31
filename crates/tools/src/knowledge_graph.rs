@@ -48,8 +48,8 @@ impl Tool for KnowledgeGraphTool {
         props.insert("bidirectional".into(), json!({"type": "boolean", "description": "(add_relation) If true, creates relation in both directions. Default: false"}));
 
         ToolSchema {
-            name: "knowledge_graph",
-            description: "SQLite-backed knowledge graph. You MUST provide `action`. entity actions: `add_entity` requires `entity_type` and `name`; `get_entity`|`delete_entity` require `entity_id`; `update_entity` requires `entity_id` plus fields to change; `search_entities`/`query` usually require `query`; `merge_entity` requires identifying entity fields. relation actions: `add_relation` requires `source_id`, `target_id`, and `relation_type`; `get_relations` usually requires `entity_id`; `delete_relation` requires `relation_id`. graph actions: `find_path` requires `source_id` and `target_id`; `subgraph` requires `entity_id`; `stats` needs no extra params; `export` optional `format`. Optional `graph_name` selects the graph database.",
+            name: "knowledge_graph".to_string(),
+            description: "SQLite-backed knowledge graph. You MUST provide `action`. entity actions: `add_entity` requires `entity_type` and `name`; `get_entity`|`delete_entity` require `entity_id`; `update_entity` requires `entity_id` plus fields to change; `search_entities`/`query` usually require `query`; `merge_entity` requires identifying entity fields. relation actions: `add_relation` requires `source_id`, `target_id`, and `relation_type`; `get_relations` usually requires `entity_id`; `delete_relation` requires `relation_id`. graph actions: `find_path` requires `source_id` and `target_id`; `subgraph` requires `entity_id`; `stats` needs no extra params; `export` optional `format`. Optional `graph_name` selects the graph database.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": Value::Object(props),

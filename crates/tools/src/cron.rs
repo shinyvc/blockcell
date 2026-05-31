@@ -326,8 +326,8 @@ fn save_store(paths: &Paths, store: &JobStore) -> Result<()> {
 impl Tool for CronTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "cron",
-            description: "Manage scheduled tasks (cron jobs). You MUST provide `action`. action='add': requires `name` + `message` and exactly one schedule field from `delay_seconds`, `at_ms`, `every_seconds`, or `cron_expr`; optional `delete_after_run`, `mode`, and `skill_name`. action='list': no extra params. action='remove': requires `job_id`.",
+            name: "cron".to_string(),
+            description: "Manage scheduled tasks (cron jobs). You MUST provide `action`. action='add': requires `name` + `message` and exactly one schedule field from `delay_seconds`, `at_ms`, `every_seconds`, or `cron_expr`; optional `delete_after_run`, `mode`, and `skill_name`. action='list': no extra params. action='remove': requires `job_id`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

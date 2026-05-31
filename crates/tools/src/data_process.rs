@@ -23,8 +23,8 @@ pub struct DataProcessTool;
 impl Tool for DataProcessTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "data_process",
-            description: "Structured data processing. You MUST provide `action`. action='read_csv': requires `path`, optional `delimiter`, `has_header`, `limit`. action='write_csv': requires `path` and `data`, optional `delimiter`. action='query': requires `data`, optional `columns`, `filter`, `sort_by`, `sort_order`, `limit`, `output_path`. action='stats': requires `data`; usually also `agg_func` and `agg_column`, optional `group_by`, `percentile_value`, `correlation_column`, `output_path`. action='transform': requires `data` and `transform_ops`, optional `output_path`.",
+            name: "data_process".to_string(),
+            description: "Structured data processing. You MUST provide `action`. action='read_csv': requires `path`, optional `delimiter`, `has_header`, `limit`. action='write_csv': requires `path` and `data`, optional `delimiter`. action='query': requires `data`, optional `columns`, `filter`, `sort_by`, `sort_order`, `limit`, `output_path`. action='stats': requires `data`; usually also `agg_func` and `agg_column`, optional `group_by`, `percentile_value`, `correlation_column`, `output_path`. action='transform': requires `data` and `transform_ops`, optional `output_path`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
