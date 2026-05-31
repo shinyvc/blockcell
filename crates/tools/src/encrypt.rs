@@ -485,20 +485,16 @@ async fn action_hash_file(params: &Value) -> Result<Value> {
                 format!("{:x}", hasher.finalize())
             }
             "sha1" => {
-                // SHA-1 已不再安全，改用 SHA-256 并给出警告
-                tracing::warn!("SHA-1 算法已不再安全，将使用 SHA-256 替代");
-                use sha2::Digest;
-                let mut hasher = sha2::Sha256::new();
-                hasher.update(&data);
-                format!("{:x}", hasher.finalize())
+                // SHA-1 已不再安全，明确拒绝，避免静默替换导致校验失败
+                return Err(format!(
+                    "SHA-1 算法已不再安全且不被支持。请使用 sha256 或 sha512"
+                ));
             }
             "md5" => {
-                // MD5 已不再安全，改用 SHA-256 并给出警告
-                tracing::warn!("MD5 算法已不再安全，将使用 SHA-256 替代");
-                use sha2::Digest;
-                let mut hasher = sha2::Sha256::new();
-                hasher.update(&data);
-                format!("{:x}", hasher.finalize())
+                // MD5 已不再安全，明确拒绝，避免静默替换导致校验失败
+                return Err(format!(
+                    "MD5 算法已不再安全且不被支持。请使用 sha256 或 sha512"
+                ));
             }
             _ => return Err(format!("未知哈希算法: {}", algo_for_block)),
         };

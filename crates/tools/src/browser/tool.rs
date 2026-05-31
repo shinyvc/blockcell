@@ -280,8 +280,13 @@ use super::session::BrowserSession;
 // ─── Action implementations ───────────────────────────────────────────
 
 /// 等待页面加载完成。订阅 Page.loadEventFired 事件，超时后回退到固定等待。
-async fn wait_for_page_load(cdp: &super::cdp::CdpClient) {
-    let mut rx = cdp.subscribe_event("Page.loadEventFired").await;
+/// 订阅 Page.loadEventFired 事件（应在导航前调用，避免竞态）
+async fn subscribe_page_load(cdp: &super::cdp::CdpClient) -> tokio::sync::mpsc::Receiver<serde_json::Value> {
+    cdp.subscribe_event("Page.loadEventFired").await
+}
+
+/// 等待 Page.loadEventFired 事件（使用预先订阅的 receiver）
+async fn wait_for_page_load_event(mut rx: tokio::sync::mpsc::Receiver<serde_json::Value>) {
     let timeout = std::time::Duration::from_secs(30);
     match tokio::time::timeout(timeout, rx.recv()).await {
         Ok(Some(_)) => {
@@ -295,8 +300,6 @@ async fn wait_for_page_load(cdp: &super::cdp::CdpClient) {
             tracing::warn!(
                 "Page.loadEventFired timed out after 30s, falling back to fixed wait"
             );
-            // 临时回退：CDP 事件订阅在某些页面（如 about:blank）上不会触发，
-            // 后续应替换为基于 frameStoppedLoading 的更可靠等待机制
             tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
         }
     }
@@ -346,6 +349,8 @@ async fn action_navigate(session: &mut BrowserSession, params: &Value) -> Result
             .await
             .map_err(cdp_err)?;
 
+        // 先订阅 load 事件，再发起导航，避免快速页面漏掉事件
+        let load_rx = subscribe_page_load(&session.cdp).await;
         let nav_result = session.cdp.navigate(url).await.map_err(cdp_err)?;
         // 检查 Page.navigate 返回的 errorText 字段
         if let Some(error_text) = nav_result.get("errorText").and_then(|v| v.as_str()) {
@@ -355,7 +360,7 @@ async fn action_navigate(session: &mut BrowserSession, params: &Value) -> Result
         }
         session.current_url = Some(url.to_string());
 
-        wait_for_page_load(&session.cdp).await;
+        wait_for_page_load_event(load_rx).await;
         let snap = take_snapshot(session, true).await?;
 
         tracing::info!(
@@ -376,6 +381,8 @@ async fn action_navigate(session: &mut BrowserSession, params: &Value) -> Result
         }));
     }
 
+    // 先订阅 load 事件，再发起导航，避免快速页面（about:blank/data: URL）漏掉事件
+    let load_rx = subscribe_page_load(&session.cdp).await;
     let nav_result = session.cdp.navigate(url).await.map_err(cdp_err)?;
     // 检查 Page.navigate 返回的 errorText 字段
     if let Some(error_text) = nav_result.get("errorText").and_then(|v| v.as_str()) {
@@ -385,8 +392,8 @@ async fn action_navigate(session: &mut BrowserSession, params: &Value) -> Result
     }
     session.current_url = Some(url.to_string());
 
-    // 等待页面加载（基于 CDP 事件，超时后回退到固定等待）
-    wait_for_page_load(&session.cdp).await;
+    // 等待页面加载（使用预先订阅的 receiver，超时后回退到固定等待）
+    wait_for_page_load_event(load_rx).await;
 
     // Auto-snapshot after navigation
     let snap = take_snapshot(session, true).await?;

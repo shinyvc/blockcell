@@ -125,26 +125,12 @@ impl OpenAIProvider {
     fn sanitize_messages_for_native_tools(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         let mut sanitized = Vec::with_capacity(messages.len());
         let mut i = 0;
-        // 跟踪尚未匹配到 tool 结果的 tool_call ID，支持跨消息匹配
-        let mut outstanding_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
 
         while i < messages.len() {
             let msg = &messages[i];
 
+            // 孤立的 tool 消息（没有前置 assistant tool_calls 轮次）直接跳过
             if msg.role == "tool" {
-                if let Some(tool_call_id) = &msg.tool_call_id {
-                    if outstanding_ids.contains(tool_call_id.as_str()) {
-                        // 匹配到未完成的 tool_call，保留此消息
-                        sanitized.push(msg.clone());
-                        outstanding_ids.remove(tool_call_id.as_str());
-                    } else {
-                        debug!(
-                            tool_call_id = %tool_call_id,
-                            "跳过未匹配的 tool 消息（ID 不在未完成集合中）"
-                        );
-                    }
-                }
                 i += 1;
                 continue;
             }
@@ -152,27 +138,44 @@ impl OpenAIProvider {
             if msg.role == "assistant" {
                 if let Some(tool_calls) = &msg.tool_calls {
                     if !tool_calls.is_empty() {
-                        // 将当前 assistant 的 tool_call ID 加入未完成集合
-                        for tc in tool_calls {
-                            outstanding_ids.insert(tc.id.clone());
-                        }
-                        sanitized.push(msg.clone());
+                        // 保存 tool_call ID 用于验证
+                        let round_ids: std::collections::HashSet<String> = tool_calls
+                            .iter()
+                            .map(|tc| tc.id.clone())
+                            .collect();
+                        let id_count = round_ids.len();
 
-                        // 收集紧接着的所有 tool 消息
+                        // 临时缓冲：先收集后续 tool 消息，验证完整后再 push
+                        let mut temp_tool_msgs: Vec<&ChatMessage> = Vec::new();
+                        let mut matched_count = 0usize;
                         let mut j = i + 1;
                         while j < messages.len() && messages[j].role == "tool" {
                             if let Some(id) = &messages[j].tool_call_id {
-                                if outstanding_ids.contains(id.as_str()) {
-                                    sanitized.push(messages[j].clone());
-                                    outstanding_ids.remove(id.as_str());
+                                if round_ids.contains(id.as_str()) {
+                                    matched_count += 1;
+                                    temp_tool_msgs.push(&messages[j]);
                                 } else {
                                     warn!(
                                         tool_call_id = %id,
-                                        "丢弃 tool 消息：ID 与任何未完成的 tool_call 不匹配"
+                                        "丢弃 tool 消息：ID 与当前轮的 tool_call 不匹配"
                                     );
                                 }
                             }
                             j += 1;
+                        }
+
+                        // 只有所有 tool_call 都有对应的 tool 结果时，才保留完整轮次
+                        if matched_count == id_count {
+                            sanitized.push(msg.clone());
+                            for tm in temp_tool_msgs {
+                                sanitized.push(tm.clone());
+                            }
+                        } else {
+                            warn!(
+                                tool_call_count = id_count,
+                                matched = matched_count,
+                                "跳过不完整的 tool round：不是所有 tool_call 都有对应的结果"
+                            );
                         }
 
                         i = j;
@@ -183,14 +186,6 @@ impl OpenAIProvider {
 
             sanitized.push(msg.clone());
             i += 1;
-        }
-
-        // 最终检查：未匹配的 tool_call 记录警告
-        if !outstanding_ids.is_empty() {
-            warn!(
-                ids = ?outstanding_ids,
-                "以下 tool_call 没有对应的 tool 结果消息"
-            );
         }
 
         sanitized
@@ -1329,6 +1324,7 @@ struct StreamFunctionCall {
 fn finalize_stream_response(
     mode: ToolCallMode,
     tools_available: bool,
+    raw_content_for_parsing: String,
     accumulated_content: String,
     accumulated_reasoning: String,
     mut tool_calls: Vec<ToolCallRequest>,
@@ -1337,17 +1333,21 @@ fn finalize_stream_response(
 ) -> LLMResponse {
     let mut content = accumulated_content;
 
+    // 使用 raw_content 解析文本工具调用（包含 <tool_call> 标记）
+    // filtered_content 已过滤掉工具标记，只用于对用户展示
     if tools_available
         && !matches!(mode, ToolCallMode::None)
         && tool_calls.is_empty()
-        && !content.is_empty()
+        && !raw_content_for_parsing.is_empty()
     {
-        let (remaining_text, parsed_calls) = OpenAIProvider::parse_text_tool_calls(&content);
+        let (remaining_text, parsed_calls) =
+            OpenAIProvider::parse_text_tool_calls(&raw_content_for_parsing);
         if !parsed_calls.is_empty() {
             info!(
                 count = parsed_calls.len(),
-                "Parsed text-based tool calls from streaming response"
+                "Parsed text-based tool calls from streaming response (raw content)"
             );
+            // 使用 remaining_text 作为展示内容（已剥离工具调用标记）
             content = remaining_text;
             tool_calls = parsed_calls;
         }
@@ -1612,6 +1612,9 @@ impl Provider for OpenAIProvider {
             let mut stream = response.bytes_stream();
             let mut buffer = String::new();
             let mut tool_calls: HashMap<usize, ToolCallAccumulator> = HashMap::new();
+            // raw_content 保留完整内容（含 <tool_call> 标记），用于文本工具调用解析
+            // accumulated_content 保存过滤后的内容，用于最终响应对用户展示
+            let mut raw_content = String::new();
             let mut accumulated_content = String::new();
             let mut accumulated_reasoning = String::new();
             let mut finish_reason = "stop".to_string();
@@ -1644,6 +1647,7 @@ impl Provider for OpenAIProvider {
                                     let response = finalize_stream_response(
                                         mode,
                                         tools_available,
+                                        raw_content,
                                         accumulated_content,
                                         accumulated_reasoning,
                                         final_tool_calls,
@@ -1658,8 +1662,10 @@ impl Provider for OpenAIProvider {
                                 if let Ok(chunk) = serde_json::from_str::<StreamResponse>(data) {
                                     if let Some(choice) = chunk.choices.first() {
                                         // 处理文本增量
-                                        // 注意：push_str 在过滤之后执行，确保 accumulated_content 不含工具调用标记
+                                        // raw_content 保留完整内容（含工具调用标记），用于后续 parse_text_tool_calls
+                                        // filtered_content 只用于对用户流式展示
                                         if let Some(content) = &choice.delta.content {
+                                            raw_content.push_str(content);
                                             if let Some(delta) =
                                                 text_tool_markup_filter.push(content)
                                             {
@@ -1751,6 +1757,7 @@ impl Provider for OpenAIProvider {
             let response = finalize_stream_response(
                 mode,
                 tools_available,
+                raw_content,
                 accumulated_content,
                 accumulated_reasoning,
                 final_tool_calls,
@@ -2113,11 +2120,14 @@ ls -la
 
     #[test]
     fn test_finalize_stream_response_parses_text_mode_tool_call_blocks() {
+        // raw_content_for_parsing 包含 <tool_call> 标记，accumulated_content 已过滤
+        let raw_text = "我来帮您查看上一级目录。\n<tool_call>\n<function=list_dir>\n<parameter=path>/Users/apple/.blockcell</parameter>\n</function>\n</tool_call>".to_string();
         let response = finalize_stream_response(
             ToolCallMode::Text,
             true,
-            "我来帮您查看上一级目录。\n<tool_call>\n<function=list_dir>\n<parameter=path>/Users/apple/.blockcell</parameter>\n</function>\n</tool_call>".to_string(),
-            String::new(),
+            raw_text,
+            String::new(), // accumulated_content（对用户展示的过滤后文本）
+            String::new(), // accumulated_reasoning
             vec![],
             "stop".to_string(),
             Value::Null,
@@ -2138,11 +2148,14 @@ ls -la
 
     #[test]
     fn test_finalize_stream_response_parses_dsml_tool_call_blocks() {
+        // raw_content_for_parsing 包含 DSML 工具调用标记
+        let raw_text = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"list_dir\"><｜DSML｜parameter name=\"path\" string=\"true\">/tmp</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>".to_string();
         let response = finalize_stream_response(
             ToolCallMode::Text,
             true,
-            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"list_dir\"><｜DSML｜parameter name=\"path\" string=\"true\">/tmp</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>".to_string(),
-            String::new(),
+            raw_text,
+            String::new(), // accumulated_content（对用户展示的过滤后文本）
+            String::new(), // accumulated_reasoning
             vec![],
             "stop".to_string(),
             Value::Null,
