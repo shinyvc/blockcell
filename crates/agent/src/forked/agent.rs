@@ -1002,25 +1002,36 @@ async fn execute_forked_tool(
 
     // SkillMutex 检查: 写入操作前获取互斥锁
     // 注意: _skill_guard 必须在整个 match 块中存活, 才能保护操作期间不被并发修改
+    //
+    // 重要: 当 skill_file_store 可用时, SkillFileStore 内部已有 WriteGuard 保护
+    // (create/edit/patch/delete/write_file/remove_file 都会调用 acquire_write_guard),
+    // 不需要在此预获取 skill_mutex, 否则同一 WriteTarget 被重复获取会导致自我冲突
     let _skill_guard = if tool_name == "skill_manage" {
-        let is_write_action = matches!(
-            input.get("action").and_then(|v| v.as_str()).unwrap_or(""),
-            "create" | "patch" | "edit" | "delete" | "write_file" | "remove_file"
-        );
-        if is_write_action {
-            if let Some(name) = input.get("name").and_then(|v| v.as_str()) {
-                if let Some(ref mutex) = skill_mutex {
-                    // 直接获取写锁（acquire 内部已包含活跃检查）
-                    // 不再先调用 can_modify() 再 acquire()，避免 TOCTOU 竞态
-                    match mutex.try_acquire(name) {
-                        Some(guard) => Some(guard),
-                        None => {
-                            tracing::warn!(skill = %name, "SkillMutex acquire failed (skill is active), rejecting write");
-                            return Ok(json!({
-                                "success": false,
-                                "message": format!("Skill '{}' is currently being modified. Please try again later.", name)
-                            }).to_string());
+        // SkillFileStore 路径: 内部已自带 write guard, 跳过预获取避免自我冲突
+        if skill_file_store.is_some() {
+            None
+        } else {
+            let is_write_action = matches!(
+                input.get("action").and_then(|v| v.as_str()).unwrap_or(""),
+                "create" | "patch" | "edit" | "delete" | "write_file" | "remove_file"
+            );
+            if is_write_action {
+                if let Some(name) = input.get("name").and_then(|v| v.as_str()) {
+                    if let Some(ref mutex) = skill_mutex {
+                        // 直接获取写锁（acquire 内部已包含活跃检查）
+                        // 不再先调用 can_modify() 再 acquire()，避免 TOCTOU 竞态
+                        match mutex.try_acquire(name) {
+                            Some(guard) => Some(guard),
+                            None => {
+                                tracing::warn!(skill = %name, "SkillMutex acquire failed (skill is active), rejecting write");
+                                return Ok(json!({
+                                    "success": false,
+                                    "message": format!("Skill '{}' is currently being modified. Please try again later.", name)
+                                }).to_string());
+                            }
                         }
+                    } else {
+                        None
                     }
                 } else {
                     None
@@ -1028,8 +1039,6 @@ async fn execute_forked_tool(
             } else {
                 None
             }
-        } else {
-            None
         }
     } else {
         None

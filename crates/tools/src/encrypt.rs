@@ -11,7 +11,7 @@ use crate::{Tool, ToolContext, ToolSchema};
 /// - **encrypt_file** / **decrypt_file**: AES-256-GCM file encryption/decryption
 /// - **generate_password**: Cryptographically secure password generation
 /// - **generate_key**: Generate encryption keys (AES-256, random bytes)
-/// - **hash_file**: Compute file hash (SHA-256, SHA-512, MD5)
+/// - **hash_file**: Compute file hash (SHA-256, SHA-512)
 /// - **hash_text**: Compute text hash
 /// - **encode** / **decode**: Base64 / hex encoding/decoding
 /// - **checksum_verify**: Verify file against expected checksum
@@ -35,7 +35,7 @@ impl Tool for EncryptTool {
             json!({"type": "string", "description": "(generate_password) Characters to exclude"}),
         );
         props.insert("count".into(), json!({"type": "integer", "description": "(generate_password) Number of passwords to generate. Default: 1"}));
-        props.insert("hash_algorithm".into(), json!({"type": "string", "enum": ["sha256", "sha512", "md5", "sha1"], "description": "(hash_file/hash_text/checksum_verify) Hash algorithm. Default: sha256"}));
+        props.insert("hash_algorithm".into(), json!({"type": "string", "enum": ["sha256", "sha512"], "description": "(hash_file/hash_text/checksum_verify) Hash algorithm. Default: sha256"}));
         props.insert(
             "text".into(),
             json!({"type": "string", "description": "(hash_text/encode/decode) Input text"}),
@@ -464,24 +464,30 @@ async fn action_hash_file(params: &Value) -> Result<Value> {
     let path_for_block = path.clone();
     let algo_for_block = algo.clone();
 
-    // 使用 spawn_blocking 在后台线程读取文件并计算哈希
+    // 使用 spawn_blocking 在后台线程分块读取文件并计算哈希
+    // 用 BufReader 分块处理，避免大文件一次性读入内存造成 OOM
     let (hash, file_size) = tokio::task::spawn_blocking(move || {
-        let data = std::fs::read(&path_for_block)
-            .map_err(|e| format!("读取文件失败: {}", e))?;
-
-        let file_size = data.len();
+        let file = std::fs::File::open(&path_for_block)
+            .map_err(|e| format!("打开文件失败: {}", e))?;
+        let file_size = file
+            .metadata()
+            .map_err(|e| format!("获取文件大小失败: {}", e))?
+            .len();
+        let mut reader = std::io::BufReader::with_capacity(64 * 1024, file); // 64KB 缓冲区
 
         let hash = match algo_for_block.as_str() {
             "sha256" => {
                 use sha2::Digest;
                 let mut hasher = sha2::Sha256::new();
-                hasher.update(&data);
+                std::io::copy(&mut reader, &mut hasher)
+                    .map_err(|e| format!("读取文件失败: {}", e))?;
                 format!("{:x}", hasher.finalize())
             }
             "sha512" => {
                 use sha2::Digest;
                 let mut hasher = sha2::Sha512::new();
-                hasher.update(&data);
+                std::io::copy(&mut reader, &mut hasher)
+                    .map_err(|e| format!("读取文件失败: {}", e))?;
                 format!("{:x}", hasher.finalize())
             }
             "sha1" => {
@@ -499,7 +505,7 @@ async fn action_hash_file(params: &Value) -> Result<Value> {
             _ => return Err(format!("未知哈希算法: {}", algo_for_block)),
         };
 
-        Ok::<_, String>((hash, file_size as u64))
+        Ok::<_, String>((hash, file_size))
     })
     .await
     .map_err(|e| Error::Tool(format!("后台任务出错: {}", e)))?
@@ -535,10 +541,17 @@ fn action_hash_text(params: &Value) -> Result<Value> {
             hasher.update(text.as_bytes());
             format!("{:x}", hasher.finalize())
         }
+        "sha1" => {
+            // SHA-1 已不再安全，明确拒绝，避免静默替换导致校验失败
+            return Err(Error::Tool(
+                "SHA-1 算法已不再安全且不被支持。请使用 sha256 或 sha512".into(),
+            ));
+        }
         "md5" => {
-            // Use command-line md5 since we don't have md5 crate
-            // Compute via sha2 approach won't work for md5, use a simple fallback
-            return Err(Error::Tool("md5 for text is not supported directly. Use hash_file with a temp file or sha256 instead.".into()));
+            // MD5 已不再安全，明确拒绝，避免静默替换导致校验失败
+            return Err(Error::Tool(
+                "MD5 算法已不再安全且不被支持。请使用 sha256 或 sha512".into(),
+            ));
         }
         _ => return Err(Error::Tool(format!("Unknown hash algorithm: {}", algo))),
     };
