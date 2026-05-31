@@ -18,15 +18,15 @@ url = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
-dirs = "5.0"
+dirs = { workspace = true }
 prost = "0.13"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
-sha2 = "0.10"
-base64 = "0.22"
-md5 = "0.7"
-hex = "0.4"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+md5 = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [features]
 default = ["telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark", "weixin", "napcat"]

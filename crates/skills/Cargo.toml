@@ -14,9 +14,9 @@ rhai = { workspace = true }
 which = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
-md5 = "0.7"
-tar = "0.4"
-flate2 = "1.0"
+md5 = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
 shellexpand = "3"
 uuid = { workspace = true }
 

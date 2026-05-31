@@ -54,6 +54,9 @@ impl RateLimiter {
             self.tokens -= 1.0;
             None
         } else {
+            if self.refill_rate <= 0.0 {
+                return Some(Duration::from_secs(1)); // 回退默认等待时间
+            }
             let needed = 1.0 - self.tokens;
             let wait_secs = needed / self.refill_rate;
             Some(Duration::from_secs_f64(wait_secs))

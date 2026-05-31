@@ -17,7 +17,7 @@ fn shared_client() -> Client {
     Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .expect("Failed to build reqwest client")
+        .unwrap_or_else(|_| Client::new())
 }
 
 #[derive(Debug, Deserialize)]

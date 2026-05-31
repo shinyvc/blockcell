@@ -46,4 +46,5 @@ once_cell = { workspace = true }
 urlencoding = { workspace = true }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
+rand = { workspace = true }
 thiserror = { workspace = true }

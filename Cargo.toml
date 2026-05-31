@@ -18,7 +18,7 @@ version = "0.1.6"
 edition = "2021"
 authors = ["blockcell"]
 license = "MIT"
-rust-version = "1.75"
+rust-version = "1.82"
 
 [workspace.dependencies]
 # Async runtime
@@ -68,6 +68,9 @@ iana-time-zone = "0.1"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 sha2 = "0.10"
 base64 = "0.22"
+rand = "0.8"
+md5 = "0.7"
+hex = "0.4"
 
 # UUID
 uuid = { version = "1.6", features = ["v4", "serde"] }

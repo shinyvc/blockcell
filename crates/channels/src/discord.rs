@@ -102,7 +102,7 @@ impl DiscordChannel {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .expect("Failed to create HTTP client");
+            .unwrap_or_else(|_| Client::new());
 
         let media_dir = std::env::var("BLOCKCELL_WORKSPACE")
             .map(PathBuf::from)
