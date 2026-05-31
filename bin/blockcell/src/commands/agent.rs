@@ -366,9 +366,11 @@ pub async fn run(
     model: Option<String>,
     provider: Option<String>,
 ) -> anyhow::Result<()> {
-    let root_paths = Paths::new();
+    let mut root_paths = Paths::new();
     super::env_file::ensure_and_load_blockcell_env(&root_paths)?;
     let root_config = Config::load_or_default(&root_paths)?;
+    root_paths.apply_workspace_config(&root_config.agents.defaults.workspace);
+
     let resolved = resolve_agent_context(
         &root_config,
         &root_paths,
@@ -379,6 +381,11 @@ pub async fn run(
     let session = resolved.session;
     let paths = resolved.paths;
     paths.ensure_dirs()?;
+
+    // 同步 BLOCKCELL_WORKSPACE 环境变量，供 channel listener 等模块读取 media 目录。
+    // 必须在 resolve_agent_context 之后设置：命名 agent（如 --agent ops）的 workspace
+    // 与 root_paths 不同，媒体文件应下载到该 agent 自己的 workspace/media。
+    let _ = std::env::set_var("BLOCKCELL_WORKSPACE", paths.workspace());
     let mut config = resolved.config;
     let mcp_manager = Arc::new(McpManager::load(&root_paths).await?);
     let provider_pool = build_pool_with_overrides(&mut config, model, provider)?;

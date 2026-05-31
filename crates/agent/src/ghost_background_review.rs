@@ -587,6 +587,7 @@ fn review_tool_context_with_stores(
 ) -> Result<ToolContext> {
     Ok(ToolContext {
         workspace: paths.workspace(),
+        base: paths.base.clone(),
         builtin_skills_dir: Some(paths.builtin_skills_dir()),
         active_skill_dir: None,
         session_key: "ghost_background_review".to_string(),

@@ -300,7 +300,7 @@ async fn run_skill_fixtures(
 
 /// List all skill evolution records.
 pub async fn list(all: bool, enabled_only: bool) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let records_dir = paths.workspace().join("evolution_records");
     let skills_dir = paths.skills_dir();
 
@@ -454,7 +454,7 @@ pub async fn list(all: bool, enabled_only: bool) -> anyhow::Result<()> {
 
 /// Show details for a specific skill.
 pub async fn show(name: &str) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let skills_dir = paths.skills_dir();
     let skill_path = skills_dir.join(name);
 
@@ -544,7 +544,7 @@ pub async fn show(name: &str) -> anyhow::Result<()> {
 
 /// Enable or disable a skill by creating/removing a .disabled marker.
 pub async fn set_enabled(name: &str, enable: bool) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let skill_path = paths.skills_dir().join(name);
 
     if !skill_path.exists() || !skill_path.is_dir() {
@@ -571,7 +571,7 @@ pub async fn set_enabled(name: &str, enable: bool) -> anyhow::Result<()> {
 
 /// Hot-reload: report skill count (actual reload happens at agent startup).
 pub async fn reload() -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let skills_dir = paths.skills_dir();
 
     // Re-extract builtin skills (skips existing files)
@@ -615,7 +615,7 @@ pub async fn reload() -> anyhow::Result<()> {
 
 /// Clear all evolution records.
 pub async fn clear() -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let records_dir = paths.workspace().join("evolution_records");
     let mut count = 0;
 
@@ -642,7 +642,7 @@ pub async fn clear() -> anyhow::Result<()> {
 
 /// Delete evolution records for a specific skill.
 pub async fn forget(skill_name: &str) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let records_dir = paths.workspace().join("evolution_records");
     let mut count = 0;
 
@@ -678,7 +678,7 @@ pub async fn forget(skill_name: &str) -> anyhow::Result<()> {
 
 /// Learn a new skill by sending a request to the agent.
 pub async fn learn(description: &str) -> anyhow::Result<()> {
-    let paths = Paths::new();
+    let paths = Paths::new_configured();
     let config = Config::load_or_default(&paths)?;
 
     // Create provider pool using shared multi-provider dispatch
@@ -732,7 +732,7 @@ pub async fn learn(description: &str) -> anyhow::Result<()> {
 
 /// Install a skill from the Community Hub.
 pub async fn install(name: &str, version: Option<String>) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let config = Config::load_or_default(&paths)?;
 
     // Resolve Hub URL

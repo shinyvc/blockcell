@@ -2082,7 +2082,7 @@ impl AgentRuntime {
         let agent_type_registry = {
             let workspace = paths.workspace();
             let loader =
-                crate::agent_loader::AgentDefinitionLoader::new(&paths.base, Some(&workspace));
+                crate::agent_loader::AgentDefinitionLoader::new(&paths.base, Some(&workspace), Some(&workspace));
             loader.load_all()
         };
 
@@ -5988,6 +5988,7 @@ impl AgentRuntime {
 
         let ctx = blockcell_tools::ToolContext {
             workspace: self.paths.workspace(),
+            base: self.paths.base.clone(),
             builtin_skills_dir: Some(self.paths.builtin_skills_dir()),
             active_skill_dir,
             session_key: msg.session_key(),
@@ -6569,6 +6570,7 @@ impl AgentRuntime {
 
                 let ctx = blockcell_tools::ToolContext {
                     workspace: paths.workspace(),
+                    base: paths.base.clone(),
                     builtin_skills_dir: Some(paths.builtin_skills_dir()),
                     active_skill_dir: None,
                     session_key: session_key.clone(),
@@ -10039,6 +10041,7 @@ mod tests {
 
         let ctx = ToolContext {
             workspace: PathBuf::from("/tmp/workspace"),
+            base: PathBuf::from("/tmp/blockcell"),
             builtin_skills_dir: None,
             active_skill_dir: None,
             session_key: "cli:test".to_string(),

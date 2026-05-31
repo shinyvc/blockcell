@@ -80,14 +80,27 @@ pub struct SlackChannel {
     config: Config,
     client: Client,
     inbound_tx: mpsc::Sender<InboundMessage>,
+    /// 媒体文件下载目录，在 new() 中从 BLOCKCELL_WORKSPACE 环境变量解析并缓存
+    media_dir: PathBuf,
 }
 
 impl SlackChannel {
     pub fn new(config: Config, inbound_tx: mpsc::Sender<InboundMessage>) -> Self {
+        // 从 BLOCKCELL_WORKSPACE 环境变量读取 media 目录，支持自定义 workspace
+        let media_dir = std::env::var("BLOCKCELL_WORKSPACE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .map(|h| h.join(".blockcell").join("workspace"))
+                    .unwrap_or_else(|| std::path::PathBuf::from(".blockcell/workspace"))
+            })
+            .join("media");
+        let _ = std::fs::create_dir_all(&media_dir);
         Self {
             config,
             client: shared_client(),
             inbound_tx,
+            media_dir,
         }
     }
 
@@ -293,10 +306,9 @@ impl SlackChannel {
             )));
         }
 
-        let media_dir = dirs::home_dir()
-            .map(|h| h.join(".blockcell").join("workspace").join("media"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".blockcell/workspace/media"));
-        tokio::fs::create_dir_all(&media_dir)
+        // 使用构造时缓存的 media_dir，避免并发环境下环境变量竞争
+        let media_dir = &self.media_dir;
+        tokio::fs::create_dir_all(media_dir)
             .await
             .map_err(|e| Error::Channel(format!("Failed to create media dir: {}", e)))?;
 

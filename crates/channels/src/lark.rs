@@ -273,6 +273,16 @@ pub async fn process_webhook(
     raw_body: &str,
     inbound_tx: Option<&mpsc::Sender<InboundMessage>>,
 ) -> Result<String> {
+    // 在请求入口处一次性解析 media_dir，避免并发环境下环境变量竞争
+    let media_dir = std::env::var("BLOCKCELL_WORKSPACE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .map(|h| h.join(".blockcell").join("workspace"))
+                .unwrap_or_else(|| PathBuf::from(".blockcell/workspace"))
+        })
+        .join("media");
+
     let body: WebhookBody = serde_json::from_str(raw_body)
         .map_err(|e| Error::Channel(format!("Lark webhook JSON parse error: {}", e)))?;
 
@@ -370,7 +380,7 @@ pub async fn process_webhook(
                 serde_json::from_str(&message.content).unwrap_or(ImageContent { image_key: None });
             let paths = if let Some(key) = content.image_key {
                 info!(image_key = %key, "Lark webhook: received image");
-                match download_lark_resource(config, &key, "image", "jpg").await {
+                match download_lark_resource(config, &media_dir, &key, "image", "jpg").await {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e, "Lark: failed to download image");
@@ -394,7 +404,7 @@ pub async fn process_webhook(
             let duration_ms = content.duration.unwrap_or(0);
             let paths = if let Some(key) = content.file_key {
                 info!(file_key = %key, "Lark webhook: received audio");
-                match download_lark_resource(config, &key, "file", "opus").await {
+                match download_lark_resource(config, &media_dir, &key, "file", "opus").await {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e, "Lark: failed to download audio");
@@ -420,7 +430,7 @@ pub async fn process_webhook(
             let ext = file_name.rsplit('.').next().unwrap_or("bin").to_string();
             let paths = if let Some(key) = content.file_key {
                 info!(file_key = %key, file_name = %file_name, "Lark webhook: received file");
-                match download_lark_resource(config, &key, "file", &ext).await {
+                match download_lark_resource(config, &media_dir, &key, "file", &ext).await {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e, "Lark: failed to download file");
@@ -446,7 +456,7 @@ pub async fn process_webhook(
             let file_name = content.file_name.clone().unwrap_or_default();
             let paths = if let Some(key) = content.file_key {
                 info!(file_key = %key, "Lark webhook: received video");
-                match download_lark_resource(&resolved_config, &key, "file", "mp4").await {
+                match download_lark_resource(&resolved_config, &media_dir, &key, "file", "mp4").await {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e, "Lark: failed to download video");
@@ -467,7 +477,7 @@ pub async fn process_webhook(
             let content: StickerContent =
                 serde_json::from_str(&message.content).unwrap_or(StickerContent { file_key: None });
             let paths = if let Some(key) = content.file_key {
-                match download_lark_resource(&resolved_config, &key, "image", "png").await {
+                match download_lark_resource(&resolved_config, &media_dir, &key, "image", "png").await {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e, "Lark: failed to download sticker");
@@ -562,6 +572,7 @@ pub async fn process_webhook(
 /// Saves to `~/.blockcell/media/lark_{key}.{ext}` and returns the local path.
 async fn download_lark_resource(
     config: &Config,
+    media_dir: &Path,
     resource_key: &str,
     resource_type: &str,
     ext: &str,
@@ -594,10 +605,8 @@ async fn download_lark_resource(
         )));
     }
 
-    let media_dir = dirs::home_dir()
-        .map(|h| h.join(".blockcell").join("workspace").join("media"))
-        .unwrap_or_else(|| PathBuf::from(".blockcell/workspace/media"));
-    tokio::fs::create_dir_all(&media_dir)
+    // 使用调用方传入的 media_dir，避免并发环境下环境变量竞争
+    tokio::fs::create_dir_all(media_dir)
         .await
         .map_err(|e| Error::Channel(format!("Failed to create media dir: {}", e)))?;
 

@@ -77,6 +77,9 @@ The self-evolution pipeline is fixed to the full validation flow:
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub base: PathBuf,
+    /// Override for workspace directory, sourced from config `agents.defaults.workspace`.
+    /// When set, `workspace()` returns this path instead of `base/workspace`.
+    workspace_override: Option<PathBuf>,
 }
 
 impl Paths {
@@ -84,11 +87,50 @@ impl Paths {
         let base = dirs::home_dir()
             .map(|h| h.join(".blockcell"))
             .unwrap_or_else(|| PathBuf::from(".blockcell"));
-        Self { base }
+        Self { base, workspace_override: None }
     }
 
     pub fn with_base(base: PathBuf) -> Self {
-        Self { base }
+        Self { base, workspace_override: None }
+    }
+
+    /// 从已知的 base 和 workspace 路径创建 Paths。
+    /// 适用于工具执行上下文，其中 base 和 workspace 可能因配置而不同。
+    pub fn with_base_and_workspace(base: PathBuf, workspace: PathBuf) -> Self {
+        Self { base, workspace_override: Some(workspace) }
+    }
+
+    /// 创建 Paths 并从已存在的 config.json5 读取 workspace 配置。
+    /// 仅读取已存在的配置文件，不会创建默认配置。
+    /// 适用于 status, doctor, cron, logs, memory 等辅助命令。
+    ///
+    /// 前置条件：调用方应确保 .env 已加载（main.rs 会在命令分发前统一加载），
+    /// 否则 config 中的 `${ENV_VAR}` 无法正确展开。
+    pub fn new_configured() -> Self {
+        let mut paths = Self::new();
+        let config_path = paths.config_file();
+        // 仅在配置文件已存在时读取，避免触发默认配置创建
+        if config_path.exists() {
+            if let Ok(config) = crate::Config::load(&config_path) {
+                paths.apply_workspace_config(&config.agents.defaults.workspace);
+            }
+        }
+        paths
+    }
+
+    /// Apply workspace override from config, expanding `~` to home directory.
+    /// Call this after loading config at runtime entry points.
+    pub fn apply_workspace_config(&mut self, workspace: &str) {
+        let expanded = if workspace.starts_with('~') {
+            if let Some(home) = dirs::home_dir() {
+                workspace.replacen('~', home.to_str().unwrap_or(""), 1)
+            } else {
+                workspace.to_string()
+            }
+        } else {
+            workspace.to_string()
+        };
+        self.workspace_override = Some(PathBuf::from(expanded));
     }
 
     pub fn config_file(&self) -> PathBuf {
@@ -116,13 +158,18 @@ impl Paths {
         if agent_id.is_empty() || agent_id == "default" {
             return self.clone();
         }
+        // 命名 agent 使用独立的工作空间（base/agents/<id>/workspace），
+        // 不继承根级别的 workspace_override。
         Self {
             base: self.base.join("agents").join(agent_id),
+            workspace_override: None,
         }
     }
 
     pub fn workspace(&self) -> PathBuf {
-        self.base.join("workspace")
+        self.workspace_override
+            .clone()
+            .unwrap_or_else(|| self.base.join("workspace"))
     }
 
     /// Path to logs directory (under workspace)

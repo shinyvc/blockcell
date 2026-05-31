@@ -849,6 +849,7 @@ mod tests {
     fn test_resolve_path() {
         let ctx = ToolContext {
             workspace: std::path::PathBuf::from("/tmp/workspace"),
+            base: std::path::PathBuf::from("/tmp/blockcell"),
             builtin_skills_dir: None,
             active_skill_dir: None,
             session_key: String::new(),

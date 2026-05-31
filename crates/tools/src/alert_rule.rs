@@ -293,14 +293,20 @@ impl Tool for AlertRuleTool {
 
         match action {
             "evaluate" => {
-                let paths = Paths::new();
+                // 使用 ctx.base + ctx.workspace 重建完整的 Paths，
+                // 确保 alert 规则存储在配置的 workspace 下（而非默认路径）。
+                let paths = Paths::with_base_and_workspace(ctx.base.clone(), ctx.workspace.clone());
                 action_evaluate(&paths, &ctx, &params).await
             }
             _ => {
                 let p = params.clone();
                 let a = action.to_string();
+                let base = ctx.base.clone();
+                let workspace = ctx.workspace.clone();
                 tokio::task::spawn_blocking(move || {
-                    let paths = Paths::new();
+                    // 使用 ctx.base + ctx.workspace 重建完整的 Paths，
+                    // 确保 alert 规则存储在配置的 workspace 下（而非默认路径）。
+                    let paths = Paths::with_base_and_workspace(base, workspace);
                     match a.as_str() {
                         "create" => action_create(&paths, &p),
                         "list" => action_list(&paths),

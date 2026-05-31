@@ -38,7 +38,7 @@ impl LLMProvider for OpenAILLMAdapter {
 ///
 /// Usage: blockcell evolve run "add web page translation"
 pub async fn run(description: &str, watch: bool) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let config = Config::load_or_default(&paths)?;
     let skills_dir = paths.skills_dir();
 
@@ -168,7 +168,7 @@ pub async fn run(description: &str, watch: bool) -> anyhow::Result<()> {
 
 /// Watch an evolution's progress by polling its record file.
 pub async fn watch(evolution_id: Option<String>) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
 
     if let Some(evo_id) = evolution_id {
         // Watch a specific evolution
@@ -184,7 +184,7 @@ pub async fn watch(evolution_id: Option<String>) -> anyhow::Result<()> {
 
 /// Show status of a specific evolution or all evolutions.
 pub async fn status(evolution_id: Option<String>) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let records_dir = paths.workspace().join("evolution_records");
 
     if let Some(evo_id) = evolution_id {
@@ -202,7 +202,7 @@ pub async fn status(evolution_id: Option<String>) -> anyhow::Result<()> {
 
 /// List all evolution records (same as `skills list` but more detailed).
 pub async fn list(all: bool, verbose: bool) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let records_dir = paths.workspace().join("evolution_records");
 
     let mut records = load_all_records(&records_dir);
@@ -281,7 +281,7 @@ pub async fn list(all: bool, verbose: bool) -> anyhow::Result<()> {
 
 /// Show evolution history for a skill by name (alias for status filtered by skill_name).
 pub async fn show(skill_name: &str) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let records_dir = paths.workspace().join("evolution_records");
 
     let mut records = load_all_records(&records_dir);
@@ -345,7 +345,7 @@ pub async fn show(skill_name: &str) -> anyhow::Result<()> {
 
 /// Rollback a skill evolution to a previous version.
 pub async fn rollback(skill_name: &str, to: Option<String>) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let records_dir = paths.workspace().join("evolution_records");
 
     let mut records = load_all_records(&records_dir);

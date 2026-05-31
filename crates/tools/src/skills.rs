@@ -511,6 +511,7 @@ mod tests {
     fn tool_context(store: Arc<dyn crate::SkillFileStoreOps + Send + Sync>) -> ToolContext {
         ToolContext {
             workspace: PathBuf::from("/tmp/workspace"),
+            base: PathBuf::from("/tmp/blockcell"),
             builtin_skills_dir: None,
             active_skill_dir: None,
             session_key: "cli:test".to_string(),
@@ -546,7 +547,8 @@ mod tests {
         store: Option<Arc<dyn crate::SkillFileStoreOps + Send + Sync>>,
     ) -> ToolContext {
         ToolContext {
-            workspace,
+            workspace: workspace.clone(),
+            base: workspace,
             builtin_skills_dir: None,
             active_skill_dir: None,
             session_key: "cli:test".to_string(),

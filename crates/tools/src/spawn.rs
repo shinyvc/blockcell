@@ -183,6 +183,7 @@ mod tests {
         let tool = SpawnTool;
         let ctx = ToolContext {
             workspace: PathBuf::from("/tmp/workspace"),
+            base: PathBuf::from("/tmp/blockcell"),
             builtin_skills_dir: None,
             active_skill_dir: None,
             session_key: "cli:test".to_string(),
@@ -241,6 +242,7 @@ mod tests {
         let tool = SpawnTool;
         let ctx = ToolContext {
             workspace: PathBuf::from("/tmp/workspace"),
+            base: PathBuf::from("/tmp/blockcell"),
             builtin_skills_dir: None,
             active_skill_dir: None,
             session_key: "cli:test".to_string(),

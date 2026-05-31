@@ -594,6 +594,7 @@ mod tests {
     fn tool_context(skill_dir: PathBuf) -> ToolContext {
         ToolContext {
             workspace: std::env::temp_dir(),
+            base: std::env::temp_dir().join("blockcell"),
             builtin_skills_dir: None,
             active_skill_dir: Some(skill_dir),
             session_key: "cli:test".to_string(),

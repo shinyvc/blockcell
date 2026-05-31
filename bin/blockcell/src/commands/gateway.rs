@@ -1023,9 +1023,13 @@ async fn auth_middleware(
 // ---------------------------------------------------------------------------
 
 pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Result<()> {
-    let paths = Paths::new();
+    let mut paths = Paths::new();
     super::env_file::ensure_and_load_blockcell_env(&paths)?;
     let mut config = Config::load_or_default(&paths)?;
+    paths.apply_workspace_config(&config.agents.defaults.workspace);
+
+    // 同步 BLOCKCELL_WORKSPACE 环境变量，供 channel listener 等模块读取 media 目录
+    let _ = std::env::set_var("BLOCKCELL_WORKSPACE", paths.workspace());
 
     // Ensure autoUpgrade.manifestUrl has a value (migrates old configs with empty string)
     if config.auto_upgrade.manifest_url.is_empty() {
@@ -1765,9 +1769,20 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     // ── Start messaging channels ──
     let mut channel_handles: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
 
+    // 辅助函数：根据 channel/account 解析所属 agent 的 workspace，设置为 BLOCKCELL_WORKSPACE。
+    // 每个 listener 的 channel 创建前调用，确保 media_dir 指向正确的 agent workspace。
+    let set_workspace_for_listener = |channel: &str, account_id: Option<&str>| {
+        let agent_id = config
+            .resolve_effective_channel_owner(channel, account_id)
+            .unwrap_or("default");
+        let ws = paths.for_agent(agent_id).workspace();
+        let _ = std::env::set_var("BLOCKCELL_WORKSPACE", &ws);
+    };
+
     #[cfg(feature = "telegram")]
     for listener in blockcell_channels::account::telegram_listener_configs(&config) {
         let listener_name = listener.label.clone();
+        set_workspace_for_listener("telegram", listener.account_id.as_deref());
         let telegram = Arc::new(TelegramChannel::new(listener.config, inbound_tx.clone()));
         let shutdown_rx = shutdown_tx.subscribe();
         channel_handles.push((
@@ -1781,6 +1796,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     #[cfg(feature = "whatsapp")]
     for listener in blockcell_channels::account::whatsapp_listener_configs(&config) {
         let listener_name = listener.label.clone();
+        set_workspace_for_listener("whatsapp", listener.account_id.as_deref());
         let whatsapp = Arc::new(WhatsAppChannel::new(listener.config, inbound_tx.clone()));
         let shutdown_rx = shutdown_tx.subscribe();
         channel_handles.push((
@@ -1794,6 +1810,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     #[cfg(feature = "feishu")]
     for listener in blockcell_channels::account::feishu_scoped_configs(&config) {
         let listener_name = listener.label.clone();
+        set_workspace_for_listener("feishu", listener.account_id.as_deref());
         let feishu = Arc::new(FeishuChannel::new(listener.config, inbound_tx.clone()));
         let shutdown_rx = shutdown_tx.subscribe();
         channel_handles.push((
@@ -1807,6 +1824,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     #[cfg(feature = "slack")]
     for listener in blockcell_channels::account::slack_listener_configs(&config) {
         let listener_name = listener.label.clone();
+        set_workspace_for_listener("slack", listener.account_id.as_deref());
         let slack = Arc::new(SlackChannel::new(listener.config, inbound_tx.clone()));
         let shutdown_rx = shutdown_tx.subscribe();
         channel_handles.push((
@@ -1820,6 +1838,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     #[cfg(feature = "discord")]
     for listener in blockcell_channels::account::discord_listener_configs(&config) {
         let listener_name = listener.label.clone();
+        set_workspace_for_listener("discord", listener.account_id.as_deref());
         let discord = Arc::new(DiscordChannel::new(listener.config, inbound_tx.clone()));
         let shutdown_rx = shutdown_tx.subscribe();
         channel_handles.push((
@@ -1833,6 +1852,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     #[cfg(feature = "dingtalk")]
     for listener in blockcell_channels::account::dingtalk_listener_configs(&config) {
         let listener_name = listener.label.clone();
+        set_workspace_for_listener("dingtalk", listener.account_id.as_deref());
         let dingtalk = Arc::new(DingTalkChannel::new(listener.config, inbound_tx.clone()));
         let shutdown_rx = shutdown_tx.subscribe();
         channel_handles.push((
@@ -1847,6 +1867,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     for listener in blockcell_channels::account::wecom_listener_configs(&config) {
         let listener_name = listener.label.clone();
         info!(listener = %listener_name, "Starting WeCom listener");
+        set_workspace_for_listener("wecom", listener.account_id.as_deref());
         let wecom = Arc::new(WeComChannel::new(listener.config, inbound_tx.clone()));
         let shutdown_rx = shutdown_tx.subscribe();
         channel_handles.push((
@@ -1861,6 +1882,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     for listener in blockcell_channels::account::qq_listener_configs(&config) {
         let listener_name = listener.label.clone();
         info!(listener = %listener_name, "Starting QQ listener");
+        set_workspace_for_listener("qq", listener.account_id.as_deref());
         let qq = Arc::new(blockcell_channels::qq::QQChannel::new(
             listener.config,
             inbound_tx.clone(),
@@ -1878,6 +1900,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     for listener in blockcell_channels::account::napcat_listener_configs(&config) {
         let listener_name = listener.label.clone();
         info!(listener = %listener_name, "Starting NapCatQQ listener");
+        set_workspace_for_listener("napcat", listener.account_id.as_deref());
         let napcat = Arc::new(NapCatChannel::new(listener.config, inbound_tx.clone()));
         let shutdown_rx = shutdown_tx.subscribe();
         channel_handles.push((
@@ -1892,6 +1915,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     for listener in blockcell_channels::account::weixin_listener_configs(&config) {
         let listener_name = listener.label.clone();
         info!(listener = %listener_name, "Starting Weixin listener");
+        set_workspace_for_listener("weixin", listener.account_id.as_deref());
         let weixin = Arc::new(blockcell_channels::weixin::WeixinChannel::new(
             listener.config,
             inbound_tx.clone(),

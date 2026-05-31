@@ -80,10 +80,10 @@ fn resolve_api_key(ctx: &ToolContext, params: &Value) -> Option<String> {
 }
 
 fn load_config_from_disk(ctx: &ToolContext) -> Option<Config> {
-    // ctx.workspace is typically ~/.blockcell/workspace
-    // Main config lives at ~/.blockcell/config.json5
-    let base_dir = ctx.workspace.parent()?.to_path_buf();
-    let paths = Paths::with_base(base_dir);
+    // 使用 ctx.base 直接获取 base 目录（如 ~/.blockcell），
+    // 而非从 workspace 反推。当配置了 workspace_override 时，
+    // workspace.parent() 不再是 base 目录。
+    let paths = Paths::with_base(ctx.base.clone());
     Config::load(&paths.config_file()).ok()
 }
 

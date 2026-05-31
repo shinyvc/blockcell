@@ -196,10 +196,14 @@ impl AgentDefinitionLoader {
     /// 创建加载器
     ///
     /// # 参数
-    /// - `blockcell_dir`: BlockCell 配置目录 (通常是 ~/.blockcell)
+    /// - `base_dir`: BlockCell 配置目录 (通常是 ~/.blockcell)
+    /// - `workspace_dir`: workspace 目录 (可选，配置 agents.defaults.workspace 后传入 paths.workspace())
+    ///   未传入时回退到 base_dir/workspace/agents
     /// - `project_dir`: 项目目录 (可选，用于加载项目级 Agent)
-    pub fn new(blockcell_dir: &Path, project_dir: Option<&Path>) -> Self {
-        let user_agents_dir = blockcell_dir.join("workspace").join("agents");
+    pub fn new(base_dir: &Path, workspace_dir: Option<&Path>, project_dir: Option<&Path>) -> Self {
+        let user_agents_dir = workspace_dir
+            .map(|w| w.join("agents"))
+            .unwrap_or_else(|| base_dir.join("workspace").join("agents"));
         let project_agents_dir = project_dir.map(|d| d.join(".blockcell").join("agents"));
         Self {
             user_agents_dir,
@@ -817,7 +821,7 @@ color: blue
     fn test_loader_new() {
         let workspace = PathBuf::from("/home/user/.blockcell");
         let project = PathBuf::from("/home/user/project");
-        let loader = AgentDefinitionLoader::new(&workspace, Some(&project));
+        let loader = AgentDefinitionLoader::new(&workspace, None, Some(&project));
         assert_eq!(
             loader.user_agents_dir,
             PathBuf::from("/home/user/.blockcell/workspace/agents")
@@ -961,7 +965,7 @@ mcp_tools: none
         // agents_dir 不存在
         assert!(!agents_dir.exists());
 
-        let loader = AgentDefinitionLoader::new(tmp_dir.path(), None);
+        let loader = AgentDefinitionLoader::new(tmp_dir.path(), None, None);
         loader.ensure_default_agents();
 
         // 目录应被创建
@@ -990,7 +994,7 @@ mcp_tools: none
         let custom_content = "---\nname: my-custom\n---\nCustom body";
         std::fs::write(agents_dir.join("code-reviewer.md"), custom_content).unwrap();
 
-        let _loader = AgentDefinitionLoader::new(tmp_dir.path(), None);
+        let _loader = AgentDefinitionLoader::new(tmp_dir.path(), None, None);
         // 目录已存在，ensure_default_agents 不会被 load_all 调用
         // 验证已有文件未被覆盖
         let existing = std::fs::read_to_string(agents_dir.join("code-reviewer.md")).unwrap();

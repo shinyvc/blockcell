@@ -110,9 +110,15 @@ impl TelegramChannel {
 
         let client = builder.build().expect("Failed to create HTTP client");
 
-        let media_dir = dirs::home_dir()
-            .map(|h| h.join(".blockcell").join("workspace").join("media"))
-            .unwrap_or_else(|| PathBuf::from(".blockcell/workspace/media"));
+        // 从 BLOCKCELL_WORKSPACE 环境变量读取 media 目录，支持自定义 workspace
+        let media_dir = std::env::var("BLOCKCELL_WORKSPACE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .map(|h| h.join(".blockcell").join("workspace"))
+                    .unwrap_or_else(|| PathBuf::from(".blockcell/workspace"))
+            })
+            .join("media");
 
         // Ensure media directory exists
         let _ = std::fs::create_dir_all(&media_dir);

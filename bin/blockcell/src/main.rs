@@ -780,13 +780,24 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // 初始化路径和配置
-    let paths = Paths::default();
-    let logs_dir = paths.logs_dir();
+    let mut paths = Paths::new();
+
+    // 先加载 .env 环境变量，确保 config 中的 ${ENV_VAR} 可以正确展开
+    // （必须在加载 config 之前执行）
+    commands::env_file::ensure_and_load_blockcell_env(&paths)?;
 
     // 加载配置（如果配置文件存在）
     // 如果不存在，使用默认配置（日志默认不输出）
     let config = blockcell_core::Config::load_or_default(&paths)
         .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
+
+    // 应用 workspace 配置覆盖，确保日志等路径使用配置值
+    paths.apply_workspace_config(&config.agents.defaults.workspace);
+
+    // 同步 BLOCKCELL_WORKSPACE 环境变量，供 channel listener 等模块读取 media 目录
+    let _ = std::env::set_var("BLOCKCELL_WORKSPACE", paths.workspace());
+
+    let logs_dir = paths.logs_dir();
 
     // 清理旧日志（保留 3 天）
     logging::cleanup_old_logs(&logs_dir, 3);

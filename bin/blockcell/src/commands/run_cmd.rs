@@ -47,8 +47,9 @@ fn resolve_tool_context(
 
 /// Run a direct tool call, bypassing the LLM.
 pub async fn tool(tool_name: &str, params_json: &str, agent: Option<&str>) -> anyhow::Result<()> {
-    let root_paths = Paths::new();
+    let mut root_paths = Paths::new();
     let root_config = Config::load_or_default(&root_paths)?;
+    root_paths.apply_workspace_config(&root_config.agents.defaults.workspace);
     let resolved = resolve_tool_context(&root_config, &root_paths, agent)?;
     let mcp_manager = Arc::new(McpManager::load(&root_paths).await?);
     let registry =
@@ -82,6 +83,7 @@ pub async fn tool(tool_name: &str, params_json: &str, agent: Option<&str>) -> an
 
     let ctx = blockcell_tools::ToolContext {
         workspace: paths.workspace(),
+        base: paths.base.clone(),
         builtin_skills_dir: Some(paths.builtin_skills_dir()),
         active_skill_dir: None,
         config,

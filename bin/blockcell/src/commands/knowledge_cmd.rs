@@ -3,7 +3,7 @@ use serde_json::Value;
 
 /// Show knowledge graph statistics.
 pub async fn stats(graph_name: Option<String>) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let kg_dir = paths.workspace().join("knowledge_graphs");
 
     if !kg_dir.exists() {
@@ -62,7 +62,7 @@ pub async fn stats(graph_name: Option<String>) -> anyhow::Result<()> {
 
 /// Search entities in a knowledge graph.
 pub async fn search(query: &str, graph_name: Option<String>, limit: usize) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let kg_dir = paths.workspace().join("knowledge_graphs");
     let name = graph_name.as_deref().unwrap_or("default");
     let db_path = kg_dir.join(format!("{}.db", name));
@@ -137,7 +137,7 @@ pub async fn export(
     format: &str,
     output: Option<String>,
 ) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let kg_dir = paths.workspace().join("knowledge_graphs");
     let name = graph_name.as_deref().unwrap_or("default");
     let db_path = kg_dir.join(format!("{}.db", name));
@@ -209,7 +209,7 @@ pub async fn export(
 
 /// List all knowledge graphs.
 pub async fn list_graphs() -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let kg_dir = paths.workspace().join("knowledge_graphs");
 
     if !kg_dir.exists() {

@@ -348,6 +348,9 @@ pub trait TaskManagerOps: Send + Sync {
 #[derive(Clone)]
 pub struct ToolContext {
     pub workspace: PathBuf,
+    /// 根 base 目录（如 ~/.blockcell），独立于 workspace_override。
+    /// 工具需要基于 base 重建 Paths 时使用此字段，而非从 workspace 反推。
+    pub base: PathBuf,
     pub builtin_skills_dir: Option<PathBuf>,
     pub active_skill_dir: Option<PathBuf>,
     pub session_key: String,

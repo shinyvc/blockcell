@@ -11,7 +11,7 @@ fn open_cli_memory_store(paths: &Paths) -> anyhow::Result<MemoryStore> {
 
 /// List recent memory items.
 pub async fn list(item_type: Option<String>, limit: usize) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let db_path = paths.workspace().join("memory").join("memory.db");
 
     if !db_path.exists() {
@@ -75,7 +75,7 @@ pub async fn list(item_type: Option<String>, limit: usize) -> anyhow::Result<()>
 
 /// Show a specific memory item by ID.
 pub async fn show(id: &str) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let db_path = paths.workspace().join("memory").join("memory.db");
 
     if !db_path.exists() {
@@ -117,7 +117,7 @@ pub async fn show(id: &str) -> anyhow::Result<()> {
 
 /// Delete (soft-delete) a memory item by ID.
 pub async fn delete(id: &str) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let db_path = paths.workspace().join("memory").join("memory.db");
 
     if !db_path.exists() {
@@ -144,7 +144,7 @@ pub async fn delete(id: &str) -> anyhow::Result<()> {
 
 /// Show memory statistics.
 pub async fn stats() -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let db_path = paths.workspace().join("memory").join("memory.db");
 
     if !db_path.exists() {
@@ -198,7 +198,7 @@ pub async fn search(
     item_type: Option<String>,
     top_k: usize,
 ) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let db_path = paths.workspace().join("memory").join("memory.db");
 
     if !db_path.exists() {
@@ -277,7 +277,7 @@ pub async fn search(
 
 /// Run maintenance (clean expired + purge recycle bin).
 pub async fn maintenance(recycle_days: i64) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let db_path = paths.workspace().join("memory").join("memory.db");
 
     if !db_path.exists() {
@@ -300,7 +300,7 @@ pub async fn maintenance(recycle_days: i64) -> anyhow::Result<()> {
 
 /// Retry queued vector sync operations.
 pub async fn retry_vector_sync(limit: usize) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let db_path = paths.workspace().join("memory").join("memory.db");
 
     if !db_path.exists() {
@@ -322,7 +322,7 @@ pub async fn retry_vector_sync(limit: usize) -> anyhow::Result<()> {
 
 /// Rebuild the vector index from active SQLite rows.
 pub async fn reindex() -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let db_path = paths.workspace().join("memory").join("memory.db");
 
     if !db_path.exists() {
@@ -344,7 +344,7 @@ pub async fn reindex() -> anyhow::Result<()> {
 
 /// Clear all memory (soft-delete everything).
 pub async fn clear(scope: Option<String>) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let db_path = paths.workspace().join("memory").join("memory.db");
 
     if !db_path.exists() {

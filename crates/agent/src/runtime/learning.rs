@@ -996,6 +996,7 @@ impl super::AgentRuntime {
     fn memory_flush_tool_context(&self, session_key: &str) -> Result<ToolContext> {
         Ok(ToolContext {
             workspace: self.paths.workspace(),
+            base: self.paths.base.clone(),
             builtin_skills_dir: Some(self.paths.builtin_skills_dir()),
             active_skill_dir: None,
             session_key: session_key.to_string(),

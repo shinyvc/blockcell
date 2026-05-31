@@ -186,7 +186,7 @@ fn agent_owner_bindings(config: &Config, agent_id: &str) -> Vec<String> {
 
 /// Run full environment diagnostics.
 pub async fn run() -> anyhow::Result<()> {
-    let paths = Paths::new();
+    let paths = Paths::new_configured();
 
     println!();
     println!("🩺 blockcell doctor — Environment Diagnostics");

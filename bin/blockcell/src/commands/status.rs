@@ -52,7 +52,7 @@ fn channel_account_owner_suffix(config: &Config, channel: &str) -> String {
 }
 
 pub async fn run() -> anyhow::Result<()> {
-    let paths = Paths::new();
+    let paths = Paths::new_configured();
 
     println!("blockcell status");
     println!("===============");

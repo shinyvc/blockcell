@@ -474,13 +474,10 @@ impl Tool for CronTool {
         let origin_channel = ctx.channel.clone();
         let origin_chat_id = ctx.chat_id.clone();
         let default_timezone = ctx.config.default_timezone.clone();
-        // Derive agent-specific paths from the workspace directory.
-        // ctx.workspace = <base>/workspace, so parent() = <base> (e.g. ~/.blockcell/agents/<id>).
-        let paths = if let Some(base) = ctx.workspace.parent() {
-            Paths::with_base(base.to_path_buf())
-        } else {
-            Paths::new()
-        };
+        // 使用 ctx.base 重建 Paths，而非从 workspace 反推。
+        // 当配置了 workspace_override 时，workspace 不再是 <base>/workspace，
+        // parent() 推导出的 base 会指向错误目录。
+        let paths = Paths::with_base(ctx.base.clone());
         tokio::task::spawn_blocking(move || {
             execute_cron_action_with_paths(
                 &paths,

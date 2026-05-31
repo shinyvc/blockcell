@@ -143,10 +143,10 @@ pub async fn info(tool_name: &str) -> anyhow::Result<()> {
 
 /// Test a tool by calling it directly with JSON params.
 pub async fn test(tool_name: &str, params_json: &str) -> anyhow::Result<()> {
-    let paths = Paths::new();
+    let paths = Paths::new_configured();
     let mcp_manager = Arc::new(McpManager::load(&paths).await?);
     let registry = build_tool_registry_with_all_mcp(Some(&mcp_manager)).await?;
-    let paths = Paths::new();
+    let paths = Paths::new_configured();
     paths.ensure_dirs()?;
     let memory_file_store = Arc::new(blockcell_agent::MemoryFileStore::open(&paths)?);
     let skill_file_store = Arc::new(blockcell_agent::SkillFileStore::open(&paths)?);
@@ -166,6 +166,7 @@ pub async fn test(tool_name: &str, params_json: &str) -> anyhow::Result<()> {
 
     let ctx = blockcell_tools::ToolContext {
         workspace: paths.workspace(),
+        base: paths.base.clone(),
         builtin_skills_dir: Some(paths.builtin_skills_dir()),
         active_skill_dir: None,
         config: blockcell_core::Config::load_or_default(&paths)?,
@@ -214,7 +215,7 @@ pub async fn test(tool_name: &str, params_json: &str) -> anyhow::Result<()> {
 
 /// Toggle a tool on/off.
 pub async fn toggle(tool_name: &str, enable: bool) -> anyhow::Result<()> {
-    let paths = Paths::new();
+    let paths = Paths::new_configured();
     let toggles_path = paths.workspace().join("toggles.json");
 
     let mut store: Value = if toggles_path.exists() {
@@ -225,7 +226,7 @@ pub async fn toggle(tool_name: &str, enable: bool) -> anyhow::Result<()> {
     };
 
     // Verify tool exists
-    let paths = Paths::new();
+    let paths = Paths::new_configured();
     let mcp_manager = Arc::new(McpManager::load(&paths).await?);
     let registry = build_tool_registry_with_all_mcp(Some(&mcp_manager)).await?;
     if registry.get(tool_name).is_none() {
