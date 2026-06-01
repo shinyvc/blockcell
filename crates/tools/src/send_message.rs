@@ -22,7 +22,8 @@ impl Tool for SendMessageTool {
             name: "send_message".to_string(),
             description: "Send a message to a running agent task. \
                 Only works for non-ONE_SHOT agents (verification, viper, general). \
-                ONE_SHOT agents (explore, plan) cannot receive messages after completion.".to_string(),
+                ONE_SHOT agents (explore, plan) cannot receive messages after completion."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

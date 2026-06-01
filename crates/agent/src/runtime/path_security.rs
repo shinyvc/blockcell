@@ -2,7 +2,7 @@
 //!
 //! 包含路径提取、安全校验、用户授权和危险操作确认。
 
-use super::{canonical_or_normalized, is_path_within_base, AgentRuntime, ConfirmRequest};
+use super::{canonical_or_normalized, is_path_within_base, ConfirmRequest};
 use blockcell_core::path_policy::{PathOp, PolicyAction};
 use blockcell_core::InboundMessage;
 use std::path::{Path, PathBuf};

@@ -1029,7 +1029,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     paths.apply_workspace_config(&config.agents.defaults.workspace);
 
     // 同步 BLOCKCELL_WORKSPACE 环境变量，供 channel listener 等模块读取 media 目录
-    let _ = std::env::set_var("BLOCKCELL_WORKSPACE", paths.workspace());
+    std::env::set_var("BLOCKCELL_WORKSPACE", paths.workspace());
 
     // Ensure autoUpgrade.manifestUrl has a value (migrates old configs with empty string)
     if config.auto_upgrade.manifest_url.is_empty() {
@@ -1776,7 +1776,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
             .resolve_effective_channel_owner(channel, account_id)
             .unwrap_or("default");
         let ws = paths.for_agent(agent_id).workspace();
-        let _ = std::env::set_var("BLOCKCELL_WORKSPACE", &ws);
+        std::env::set_var("BLOCKCELL_WORKSPACE", &ws);
     };
 
     #[cfg(feature = "telegram")]
@@ -2290,10 +2290,8 @@ fn build_api_cors_layer(config: &Config) -> CorsLayer {
     } else {
         // 使用配置的 allowed_origins 列表
         // axum::http 重导出了 http crate 的类型
-        let origin_list: Vec<axum::http::HeaderValue> = origins
-            .iter()
-            .filter_map(|o| o.parse().ok())
-            .collect();
+        let origin_list: Vec<axum::http::HeaderValue> =
+            origins.iter().filter_map(|o| o.parse().ok()).collect();
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(origin_list))
             .allow_credentials(false)

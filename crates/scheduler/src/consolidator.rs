@@ -567,10 +567,12 @@ impl DreamConsolidator {
                 }
                 let guard = match guard_result {
                     Ok(g) => g,
-                    Err(e) => return Err(DreamError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("获取 dream 状态锁失败: {}", e),
-                    ))),
+                    Err(e) => {
+                        return Err(DreamError::Io(std::io::Error::other(format!(
+                            "获取 dream 状态锁失败: {}",
+                            e
+                        ))))
+                    }
                 };
                 guard
             };

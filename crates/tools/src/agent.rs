@@ -44,7 +44,8 @@ Available built-in types: explore (codebase exploration), plan (implementation p
 verification (testing/validation), viper (production code), general (complex tasks). \
 Custom types may also be available from ~/.blockcell/workspace/agents/ or .blockcell/agents/. \
 Omit subagent_type for fork mode (inherits parent context, shares prompt cache, synchronous). \
-Specify subagent_type for typed agents (background execution, returns task_id).".to_string(),
+Specify subagent_type for typed agents (background execution, returns task_id)."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

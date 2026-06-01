@@ -322,7 +322,9 @@ pub async fn list(all: bool, enabled_only: bool) -> anyhow::Result<()> {
             }
         }
         records
-    }).await.unwrap_or_default();
+    })
+    .await
+    .unwrap_or_default();
     records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
     // Categorize: deduplicate by skill_name (keep latest record per skill)
@@ -355,25 +357,32 @@ pub async fn list(all: bool, enabled_only: bool) -> anyhow::Result<()> {
 
     // 将阻塞 I/O 移至 spawn_blocking，收集可用 skills
     let skills_dir_clone = skills_dir.clone();
-    let mut available_skills: Vec<(String, std::path::PathBuf)> = tokio::task::spawn_blocking(move || {
-        let mut skills = Vec::new();
-        if skills_dir_clone.exists() && skills_dir_clone.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&skills_dir_clone) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.is_dir()
-                        && (p.join("SKILL.rhai").exists()
-                            || p.join("SKILL.py").exists()
-                            || p.join("SKILL.md").exists())
-                    {
-                        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-                        skills.push((name, p));
+    let mut available_skills: Vec<(String, std::path::PathBuf)> =
+        tokio::task::spawn_blocking(move || {
+            let mut skills = Vec::new();
+            if skills_dir_clone.exists() && skills_dir_clone.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&skills_dir_clone) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.is_dir()
+                            && (p.join("SKILL.rhai").exists()
+                                || p.join("SKILL.py").exists()
+                                || p.join("SKILL.md").exists())
+                        {
+                            let name = p
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("")
+                                .to_string();
+                            skills.push((name, p));
+                        }
                     }
                 }
             }
-        }
-        skills
-    }).await.unwrap_or_default();
+            skills
+        })
+        .await
+        .unwrap_or_default();
     available_skills.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Filter by enabled if requested (skills with .disabled marker are excluded)
@@ -482,7 +491,9 @@ pub async fn show(name: &str) -> anyhow::Result<()> {
     if meta_path.exists() {
         println!();
         println!("  meta.yaml:");
-        let content = tokio::fs::read_to_string(&meta_path).await.unwrap_or_default();
+        let content = tokio::fs::read_to_string(&meta_path)
+            .await
+            .unwrap_or_default();
         for line in content.lines().take(30) {
             println!("    {}", line);
         }
@@ -523,7 +534,9 @@ pub async fn show(name: &str) -> anyhow::Result<()> {
             }
         }
         records
-    }).await.unwrap_or_default();
+    })
+    .await
+    .unwrap_or_default();
     records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     if !records.is_empty() {
         println!();

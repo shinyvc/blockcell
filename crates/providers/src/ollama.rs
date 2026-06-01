@@ -23,7 +23,12 @@ pub struct OllamaProvider {
 }
 
 impl OllamaProvider {
-    pub fn new(api_base: Option<&str>, model: &str, max_tokens: u32, temperature: f32) -> Result<Self> {
+    pub fn new(
+        api_base: Option<&str>,
+        model: &str,
+        max_tokens: u32,
+        temperature: f32,
+    ) -> Result<Self> {
         Self::new_with_proxy(api_base, model, max_tokens, temperature, None, None, &[])
     }
 

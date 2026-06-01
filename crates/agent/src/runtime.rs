@@ -1,4 +1,4 @@
-use blockcell_core::path_policy::{PathOp, PathPolicy, PolicyAction};
+use blockcell_core::path_policy::PathPolicy;
 use blockcell_core::system_event::{EventPriority, EventScope, SessionSummary, SystemEvent};
 use blockcell_core::types::{
     ChatMessage, LLMResponse, StreamChunk, ToolCallAccumulator, ToolCallRequest,
@@ -13,8 +13,7 @@ use blockcell_storage::ghost_ledger::{GhostEpisodeSource, NewGhostEpisode};
 use blockcell_storage::{AuditLogger, GhostLedger, SessionStore};
 use blockcell_tools::{
     CapabilityRegistryHandle, CoreEvolutionHandle, EventEmitterHandle, MemoryStoreHandle,
-    SessionSearchOps, SpawnHandle, SystemEventEmitter, TaskManagerHandle,
-    ToolRegistry,
+    SessionSearchOps, SpawnHandle, SystemEventEmitter, TaskManagerHandle, ToolRegistry,
 };
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -1226,7 +1225,7 @@ fn build_subagent_inbound_message(
 }
 
 fn global_core_tool_names() -> Vec<String> {
-    blockcell_tools::registry::global_core_tool_names()
+    blockcell_tools::registry::GLOBAL_CORE_TOOL_NAMES
         .iter()
         .map(|name| (*name).to_string())
         .collect()
@@ -2081,8 +2080,11 @@ impl AgentRuntime {
         // 加载 Agent 类型注册表 (从多种来源: Built-in → User-level → Project-level)
         let agent_type_registry = {
             let workspace = paths.workspace();
-            let loader =
-                crate::agent_loader::AgentDefinitionLoader::new(&paths.base, Some(&workspace), Some(&workspace));
+            let loader = crate::agent_loader::AgentDefinitionLoader::new(
+                &paths.base,
+                Some(&workspace),
+                Some(&workspace),
+            );
             loader.load_all()
         };
 
@@ -4442,7 +4444,7 @@ impl AgentRuntime {
             let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
             let mut schemas = self.tool_registry.get_tiered_schemas(
                 &tool_name_refs,
-                blockcell_tools::registry::global_core_tool_names(),
+                blockcell_tools::registry::GLOBAL_CORE_TOOL_NAMES,
             );
 
             if !disabled_tools.is_empty() {
@@ -5862,7 +5864,6 @@ impl AgentRuntime {
         Ok(delivered_response)
     }
 
-
     async fn execute_runtime_tool_call(
         &self,
         tool_name: &str,
@@ -6341,7 +6342,7 @@ impl AgentRuntime {
         } else {
             self.tool_registry.get_tiered_schemas(
                 &tool_name_refs,
-                blockcell_tools::registry::global_core_tool_names(),
+                blockcell_tools::registry::GLOBAL_CORE_TOOL_NAMES,
             )
         };
         if !disabled_tools.is_empty() {

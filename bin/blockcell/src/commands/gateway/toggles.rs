@@ -63,7 +63,9 @@ pub(super) async fn handle_toggles_update(
     match tokio::fs::write(
         &path,
         serde_json::to_string_pretty(&store).unwrap_or_default(),
-    ).await {
+    )
+    .await
+    {
         Ok(_) => Json(serde_json::json!({
             "status": "ok",
             "category": req.category,

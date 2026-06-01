@@ -71,7 +71,11 @@ pub fn safe_truncate(s: &str, max_chars: usize) -> &str {
         return s;
     }
     // 找到第 max_chars 个字符的字节边界
-    let end = s.char_indices().nth(max_chars).map(|(i, _)| i).unwrap_or(s.len());
+    let end = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
     &s[..end]
 }
 

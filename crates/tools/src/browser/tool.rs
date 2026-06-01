@@ -281,7 +281,9 @@ use super::session::BrowserSession;
 
 /// 等待页面加载完成。订阅 Page.loadEventFired 事件，超时后回退到固定等待。
 /// 订阅 Page.loadEventFired 事件（应在导航前调用，避免竞态）
-async fn subscribe_page_load(cdp: &super::cdp::CdpClient) -> tokio::sync::mpsc::Receiver<serde_json::Value> {
+async fn subscribe_page_load(
+    cdp: &super::cdp::CdpClient,
+) -> tokio::sync::mpsc::Receiver<serde_json::Value> {
     cdp.subscribe_event("Page.loadEventFired").await
 }
 
@@ -297,9 +299,7 @@ async fn wait_for_page_load_event(mut rx: tokio::sync::mpsc::Receiver<serde_json
             tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
         }
         Err(_) => {
-            tracing::warn!(
-                "Page.loadEventFired timed out after 30s, falling back to fixed wait"
-            );
+            tracing::warn!("Page.loadEventFired timed out after 30s, falling back to fixed wait");
             tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
         }
     }

@@ -139,10 +139,8 @@ impl OpenAIProvider {
                 if let Some(tool_calls) = &msg.tool_calls {
                     if !tool_calls.is_empty() {
                         // 保存 tool_call ID 用于验证
-                        let round_ids: std::collections::HashSet<String> = tool_calls
-                            .iter()
-                            .map(|tc| tc.id.clone())
-                            .collect();
+                        let round_ids: std::collections::HashSet<String> =
+                            tool_calls.iter().map(|tc| tc.id.clone()).collect();
                         let id_count = round_ids.len();
 
                         // 临时缓冲：先收集后续 tool 消息，验证完整后再 push
@@ -1321,6 +1319,7 @@ struct StreamFunctionCall {
 }
 
 /// 流式请求体
+#[allow(clippy::too_many_arguments)]
 fn finalize_stream_response(
     mode: ToolCallMode,
     tools_available: bool,

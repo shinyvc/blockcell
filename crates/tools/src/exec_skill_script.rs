@@ -12,9 +12,8 @@ use crate::registry::ToolRegistry;
 use crate::{Tool, ToolContext, ToolSchema};
 
 /// 默认的 ToolRegistry 单例，避免每次 exec_skill_script 调用都重新创建
-static DEFAULT_TOOL_REGISTRY: LazyLock<ToolRegistry> = LazyLock::new(|| {
-    ToolRegistry::with_defaults()
-});
+static DEFAULT_TOOL_REGISTRY: LazyLock<ToolRegistry> =
+    LazyLock::new(|| ToolRegistry::with_defaults());
 
 pub struct ExecSkillScriptTool;
 

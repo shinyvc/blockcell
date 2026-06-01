@@ -4,7 +4,6 @@
 //!  SelfImprove, Evolution 等配置定义。
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

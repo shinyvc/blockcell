@@ -795,7 +795,7 @@ async fn main() -> anyhow::Result<()> {
     paths.apply_workspace_config(&config.agents.defaults.workspace);
 
     // 同步 BLOCKCELL_WORKSPACE 环境变量，供 channel listener 等模块读取 media 目录
-    let _ = std::env::set_var("BLOCKCELL_WORKSPACE", paths.workspace());
+    std::env::set_var("BLOCKCELL_WORKSPACE", paths.workspace());
 
     let logs_dir = paths.logs_dir();
 

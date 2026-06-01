@@ -316,7 +316,6 @@ pub async fn process_webhook(
     inbound_tx: Option<&mpsc::Sender<InboundMessage>>,
     media_dir: PathBuf,
 ) -> Result<String> {
-
     let body: WebhookBody = serde_json::from_str(raw_body)
         .map_err(|e| Error::Channel(format!("Lark webhook JSON parse error: {}", e)))?;
 
@@ -329,7 +328,13 @@ pub async fn process_webhook(
             }
             if let Ok(plaintext) = decrypt_lark(encrypt_key, encrypted) {
                 debug!(len = plaintext.len(), listener = %listener.label, "Lark webhook decrypted payload");
-                return Box::pin(process_webhook(&listener.config, &plaintext, inbound_tx, media_dir.clone())).await;
+                return Box::pin(process_webhook(
+                    &listener.config,
+                    &plaintext,
+                    inbound_tx,
+                    media_dir.clone(),
+                ))
+                .await;
             }
         }
         return Err(Error::Channel(
@@ -414,7 +419,9 @@ pub async fn process_webhook(
                 serde_json::from_str(&message.content).unwrap_or(ImageContent { image_key: None });
             let paths = if let Some(key) = content.image_key {
                 info!(image_key = %key, "Lark webhook: received image");
-                match download_lark_resource(&resolved_config, &media_dir, &key, "image", "jpg").await {
+                match download_lark_resource(&resolved_config, &media_dir, &key, "image", "jpg")
+                    .await
+                {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e, "Lark: failed to download image");
@@ -438,7 +445,9 @@ pub async fn process_webhook(
             let duration_ms = content.duration.unwrap_or(0);
             let paths = if let Some(key) = content.file_key {
                 info!(file_key = %key, "Lark webhook: received audio");
-                match download_lark_resource(&resolved_config, &media_dir, &key, "file", "opus").await {
+                match download_lark_resource(&resolved_config, &media_dir, &key, "file", "opus")
+                    .await
+                {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e, "Lark: failed to download audio");
@@ -464,7 +473,8 @@ pub async fn process_webhook(
             let ext = file_name.rsplit('.').next().unwrap_or("bin").to_string();
             let paths = if let Some(key) = content.file_key {
                 info!(file_key = %key, file_name = %file_name, "Lark webhook: received file");
-                match download_lark_resource(&resolved_config, &media_dir, &key, "file", &ext).await {
+                match download_lark_resource(&resolved_config, &media_dir, &key, "file", &ext).await
+                {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e, "Lark: failed to download file");
@@ -490,7 +500,9 @@ pub async fn process_webhook(
             let file_name = content.file_name.clone().unwrap_or_default();
             let paths = if let Some(key) = content.file_key {
                 info!(file_key = %key, "Lark webhook: received video");
-                match download_lark_resource(&resolved_config, &media_dir, &key, "file", "mp4").await {
+                match download_lark_resource(&resolved_config, &media_dir, &key, "file", "mp4")
+                    .await
+                {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e, "Lark: failed to download video");
@@ -511,7 +523,9 @@ pub async fn process_webhook(
             let content: StickerContent =
                 serde_json::from_str(&message.content).unwrap_or(StickerContent { file_key: None });
             let paths = if let Some(key) = content.file_key {
-                match download_lark_resource(&resolved_config, &media_dir, &key, "image", "png").await {
+                match download_lark_resource(&resolved_config, &media_dir, &key, "image", "png")
+                    .await
+                {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e, "Lark: failed to download sticker");

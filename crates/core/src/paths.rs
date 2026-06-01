@@ -87,17 +87,26 @@ impl Paths {
         let base = dirs::home_dir()
             .map(|h| h.join(".blockcell"))
             .unwrap_or_else(|| PathBuf::from(".blockcell"));
-        Self { base, workspace_override: None }
+        Self {
+            base,
+            workspace_override: None,
+        }
     }
 
     pub fn with_base(base: PathBuf) -> Self {
-        Self { base, workspace_override: None }
+        Self {
+            base,
+            workspace_override: None,
+        }
     }
 
     /// 从已知的 base 和 workspace 路径创建 Paths。
     /// 适用于工具执行上下文，其中 base 和 workspace 可能因配置而不同。
     pub fn with_base_and_workspace(base: PathBuf, workspace: PathBuf) -> Self {
-        Self { base, workspace_override: Some(workspace) }
+        Self {
+            base,
+            workspace_override: Some(workspace),
+        }
     }
 
     /// 创建 Paths 并从已存在的 config.json5 读取 workspace 配置。

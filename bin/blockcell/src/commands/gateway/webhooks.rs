@@ -20,15 +20,22 @@ pub(super) async fn handle_lark_webhook(
     // 根据 webhook 匹配的 account 解析 agent owner，使用其 workspace 的 media_dir。
     // 避免：(1) 进程级 BLOCKCELL_WORKSPACE 竞争；(2) 多账号下媒体写入错误的 agent workspace。
     // 即使 account_id 为 None，也要走 resolve_effective_channel_owner 以支持 channelOwners 级路由。
-    let account_id = blockcell_channels::lark::resolve_lark_webhook_account_id(&state.config, &body);
-    let owner = state.config
+    let account_id =
+        blockcell_channels::lark::resolve_lark_webhook_account_id(&state.config, &body);
+    let owner = state
+        .config
         .resolve_effective_channel_owner("lark", account_id.as_deref())
         .unwrap_or("default")
         .to_string();
     let media_dir = state.paths.for_agent(&owner).media_dir();
 
-    match blockcell_channels::lark::process_webhook(&state.config, &body, Some(&state.inbound_tx), media_dir)
-        .await
+    match blockcell_channels::lark::process_webhook(
+        &state.config,
+        &body,
+        Some(&state.inbound_tx),
+        media_dir,
+    )
+    .await
     {
         Ok(resp_json) => {
             let val: serde_json::Value =
@@ -84,8 +91,14 @@ pub(super) async fn handle_wecom_webhook(
 
     // 根据 webhook 匹配的 account 解析 agent owner，使用其 workspace 的 media_dir。
     // 即使 account_id 为 None，也要走 resolve_effective_channel_owner 以支持 channelOwners 级路由。
-    let account_id = blockcell_channels::wecom::resolve_wecom_webhook_account_id(&state.config, &http_method, &query, &body);
-    let owner = state.config
+    let account_id = blockcell_channels::wecom::resolve_wecom_webhook_account_id(
+        &state.config,
+        &http_method,
+        &query,
+        &body,
+    );
+    let owner = state
+        .config
         .resolve_effective_channel_owner("wecom", account_id.as_deref())
         .unwrap_or("default")
         .to_string();

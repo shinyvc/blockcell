@@ -314,15 +314,27 @@ pub(super) async fn handle_ghost_activity(
                         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
                         match role {
                             "user" if routine_prompt.is_empty() => {
-                                routine_prompt = msg.get("content").and_then(|v| v.as_str()).unwrap_or("").chars().take(200).collect();
+                                routine_prompt = msg
+                                    .get("content")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .chars()
+                                    .take(200)
+                                    .collect();
                             }
                             "assistant" => {
                                 if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
                                     summary = content.chars().take(500).collect();
                                 }
-                                if let Some(calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                                if let Some(calls) =
+                                    msg.get("tool_calls").and_then(|v| v.as_array())
+                                {
                                     for call in calls {
-                                        if let Some(name) = call.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()) {
+                                        if let Some(name) = call
+                                            .get("function")
+                                            .and_then(|f| f.get("name"))
+                                            .and_then(|n| n.as_str())
+                                        {
                                             tool_calls.push(name.to_string());
                                         }
                                     }

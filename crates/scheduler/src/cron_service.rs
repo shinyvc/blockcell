@@ -524,7 +524,10 @@ impl CronService {
             // 则需要重新读取，避免 save() 覆盖其他进程的写入
             let path = self.paths.cron_jobs_file();
             let current_mtime = if path.exists() {
-                tokio::fs::metadata(&path).await.ok().and_then(|m| m.modified().ok())
+                tokio::fs::metadata(&path)
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok())
             } else {
                 None
             };

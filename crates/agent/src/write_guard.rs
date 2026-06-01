@@ -134,7 +134,6 @@ impl WriteGuard {
         });
         active.iter().cloned().collect()
     }
-
 }
 
 impl Default for WriteGuard {

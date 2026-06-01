@@ -5,27 +5,22 @@
 
 use super::{
     active_skill_name_from_metadata, chat_message_text, disable_skill_toggle,
-    persist_ghost_learning_boundary_with_decision, truncate_str,
-    LearningReviewCompletionGuard, MainSessionTarget, ReviewMode,
-    COMBINED_REVIEW_PROMPT, LEARNED_SKILL_DISABLE_THRESHOLD, MEMORY_REVIEW_PROMPT,
-    SESSION_ACTIVE_SKILL_CORRECTIONS_KEY, SESSION_ACTIVE_SKILL_NAME_KEY,
+    persist_ghost_learning_boundary_with_decision, truncate_str, LearningReviewCompletionGuard,
+    MainSessionTarget, ReviewMode, COMBINED_REVIEW_PROMPT, LEARNED_SKILL_DISABLE_THRESHOLD,
+    MEMORY_REVIEW_PROMPT, SESSION_ACTIVE_SKILL_CORRECTIONS_KEY, SESSION_ACTIVE_SKILL_NAME_KEY,
     SKILL_REVIEW_PROMPT,
 };
-use crate::ghost_learning::{
-    estimate_turn_complexity_score, GhostLearningBoundary,
-    GhostLearningBoundaryKind,
-};
 use crate::ghost_background_review::spawn_pending_background_reviews;
+use crate::ghost_learning::{
+    estimate_turn_complexity_score, GhostLearningBoundary, GhostLearningBoundaryKind,
+};
 use crate::memory_file_store::MemoryFileStore;
 use blockcell_core::types::{ChatMessage, ToolCallRequest};
 use blockcell_core::Result;
 use blockcell_core::{scope_abort_token, InboundMessage, OutboundMessage};
 use blockcell_providers::{CallResult, ProviderPool};
 use blockcell_storage::ghost_ledger::GhostEpisodeSource;
-use blockcell_tools::{
-    CapabilityRegistryHandle, CoreEvolutionHandle,
-    ToolContext, ToolRegistry,
-};
+use blockcell_tools::{CapabilityRegistryHandle, CoreEvolutionHandle, ToolContext, ToolRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -774,7 +769,9 @@ impl super::AgentRuntime {
         )
     }
 
-    pub(super) async fn capture_main_session_end_learning_boundary(&self) -> Result<Option<String>> {
+    pub(super) async fn capture_main_session_end_learning_boundary(
+        &self,
+    ) -> Result<Option<String>> {
         if !self.ghost_learning_enabled() {
             return Ok(None);
         }

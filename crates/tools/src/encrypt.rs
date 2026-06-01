@@ -467,8 +467,8 @@ async fn action_hash_file(params: &Value) -> Result<Value> {
     // 使用 spawn_blocking 在后台线程分块读取文件并计算哈希
     // 用 BufReader 分块处理，避免大文件一次性读入内存造成 OOM
     let (hash, file_size) = tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(&path_for_block)
-            .map_err(|e| format!("打开文件失败: {}", e))?;
+        let file =
+            std::fs::File::open(&path_for_block).map_err(|e| format!("打开文件失败: {}", e))?;
         let file_size = file
             .metadata()
             .map_err(|e| format!("获取文件大小失败: {}", e))?
@@ -492,15 +492,11 @@ async fn action_hash_file(params: &Value) -> Result<Value> {
             }
             "sha1" => {
                 // SHA-1 已不再安全，明确拒绝，避免静默替换导致校验失败
-                return Err(format!(
-                    "SHA-1 算法已不再安全且不被支持。请使用 sha256 或 sha512"
-                ));
+                return Err("SHA-1 算法已不再安全且不被支持。请使用 sha256 或 sha512".to_string());
             }
             "md5" => {
                 // MD5 已不再安全，明确拒绝，避免静默替换导致校验失败
-                return Err(format!(
-                    "MD5 算法已不再安全且不被支持。请使用 sha256 或 sha512"
-                ));
+                return Err("MD5 算法已不再安全且不被支持。请使用 sha256 或 sha512".to_string());
             }
             _ => return Err(format!("未知哈希算法: {}", algo_for_block)),
         };
@@ -509,7 +505,7 @@ async fn action_hash_file(params: &Value) -> Result<Value> {
     })
     .await
     .map_err(|e| Error::Tool(format!("后台任务出错: {}", e)))?
-    .map_err(|e| Error::Tool(e))?;
+    .map_err(Error::Tool)?;
 
     Ok(json!({
         "hash": hash,

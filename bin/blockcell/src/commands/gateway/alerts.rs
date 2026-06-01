@@ -59,7 +59,8 @@ pub(super) async fn handle_alerts_create(
     let path = alerts_dir.join("rules.json");
 
     let mut store: serde_json::Value = if path.exists() {
-        tokio::fs::read_to_string(&path).await
+        tokio::fs::read_to_string(&path)
+            .await
             .ok()
             .and_then(|c| serde_json::from_str(&c).ok())
             .unwrap_or(serde_json::json!({"version": 1, "rules": []}))
@@ -95,7 +96,9 @@ pub(super) async fn handle_alerts_create(
     match tokio::fs::write(
         &path,
         serde_json::to_string_pretty(&store).unwrap_or_default(),
-    ).await {
+    )
+    .await
+    {
         Ok(_) => Json(serde_json::json!({ "status": "created", "rule_id": rule_id })),
         Err(e) => Json(serde_json::json!({ "error": format!("{}", e) })),
     }
@@ -112,7 +115,8 @@ pub(super) async fn handle_alerts_update(
         return Json(serde_json::json!({ "error": "No alert rules found" }));
     }
 
-    let mut store: serde_json::Value = match tokio::fs::read_to_string(&path).await
+    let mut store: serde_json::Value = match tokio::fs::read_to_string(&path)
+        .await
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
     {
@@ -151,7 +155,9 @@ pub(super) async fn handle_alerts_update(
     match tokio::fs::write(
         &path,
         serde_json::to_string_pretty(&store).unwrap_or_default(),
-    ).await {
+    )
+    .await
+    {
         Ok(_) => Json(serde_json::json!({ "status": "updated", "rule_id": rule_id })),
         Err(e) => Json(serde_json::json!({ "error": format!("{}", e) })),
     }
@@ -167,7 +173,8 @@ pub(super) async fn handle_alerts_delete(
         return Json(serde_json::json!({ "status": "not_found" }));
     }
 
-    let mut store: serde_json::Value = match tokio::fs::read_to_string(&path).await
+    let mut store: serde_json::Value = match tokio::fs::read_to_string(&path)
+        .await
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
     {
@@ -189,7 +196,9 @@ pub(super) async fn handle_alerts_delete(
     match tokio::fs::write(
         &path,
         serde_json::to_string_pretty(&store).unwrap_or_default(),
-    ).await {
+    )
+    .await
+    {
         Ok(_) => Json(serde_json::json!({ "status": "deleted", "rule_id": rule_id })),
         Err(e) => Json(serde_json::json!({ "error": format!("{}", e) })),
     }
@@ -202,7 +211,8 @@ pub(super) async fn handle_alerts_history(State(state): State<GatewayState>) -> 
         return Json(serde_json::json!({ "history": [] }));
     }
 
-    let store: serde_json::Value = match tokio::fs::read_to_string(&path).await
+    let store: serde_json::Value = match tokio::fs::read_to_string(&path)
+        .await
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
     {

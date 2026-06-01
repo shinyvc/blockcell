@@ -445,8 +445,6 @@ pub struct ResolvedAgentConfig {
     pub intent_profile: Option<String>,
 }
 
-
-
 /// 日志配置。
 /// 控制日志输出方式和等级。
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -152,12 +152,7 @@ pub fn create_embedder(config: &Config) -> anyhow::Result<Option<Arc<dyn Embedde
         config.network.proxy.as_deref(),
         &config.network.no_proxy,
     )
-    .with_context(|| {
-        format!(
-            "Failed to create embedder for provider '{}'",
-            provider_name
-        )
-    })?;
+    .with_context(|| format!("Failed to create embedder for provider '{}'", provider_name))?;
 
     Ok(Some(Arc::new(embedder)))
 }

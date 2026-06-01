@@ -486,17 +486,19 @@ fn collect_skill_search_entries_filtered_recursive(
 pub(super) async fn handle_skills(State(state): State<GatewayState>) -> impl IntoResponse {
     // Load disabled toggles once for all skills
     let toggles_path = state.paths.toggles_file();
-    let disabled_skills: std::collections::HashSet<String> = tokio::fs::read_to_string(&toggles_path).await
-        .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-        .and_then(|v| v.get("skills").and_then(|s| s.as_object()).cloned())
-        .map(|obj| {
-            obj.into_iter()
-                .filter(|(_, v)| v == &serde_json::Value::Bool(false))
-                .map(|(k, _)| k)
-                .collect()
-        })
-        .unwrap_or_default();
+    let disabled_skills: std::collections::HashSet<String> =
+        tokio::fs::read_to_string(&toggles_path)
+            .await
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| v.get("skills").and_then(|s| s.as_object()).cloned())
+            .map(|obj| {
+                obj.into_iter()
+                    .filter(|(_, v)| v == &serde_json::Value::Bool(false))
+                    .map(|(k, _)| k)
+                    .collect()
+            })
+            .unwrap_or_default();
 
     let mut skills = Vec::new();
 
@@ -927,7 +929,8 @@ pub(super) async fn handle_evolution_trigger(
                         let _ = tokio::fs::write(
                             &toggles_path,
                             serde_json::to_string_pretty(&store).unwrap_or_default(),
-                        ).await;
+                        )
+                        .await;
                     }
                 }
             } else {
@@ -939,7 +942,8 @@ pub(super) async fn handle_evolution_trigger(
                 let _ = tokio::fs::write(
                     &toggles_path,
                     serde_json::to_string_pretty(&store).unwrap_or_default(),
-                ).await;
+                )
+                .await;
             }
 
             // Broadcast WS event so WebUI refreshes immediately without waiting for 10s poll
@@ -1020,7 +1024,9 @@ pub(super) async fn handle_evolution_resume(
         }
 
         // Save updated record
-        if let Err(e) = tokio::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).await {
+        if let Err(e) =
+            tokio::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).await
+        {
             return Json(serde_json::json!({ "error": format!("Failed to save record: {}", e) }));
         }
 
@@ -1115,7 +1121,9 @@ pub(super) async fn handle_evolution_stop(
         }
 
         // Save updated record
-        if let Err(e) = tokio::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).await {
+        if let Err(e) =
+            tokio::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).await
+        {
             return Json(serde_json::json!({ "error": format!("Failed to save record: {}", e) }));
         }
 
@@ -1154,7 +1162,8 @@ pub(super) async fn handle_evolution_delete(
     let path = records_dir.join(format!("{}.json", evolution_id));
     if path.exists() {
         // Read skill_name before deleting so we can clean up EvolutionService state
-        let skill_name = tokio::fs::read_to_string(&path).await
+        let skill_name = tokio::fs::read_to_string(&path)
+            .await
             .ok()
             .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
             .and_then(|v| {

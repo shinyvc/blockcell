@@ -14,14 +14,14 @@ use super::{
     create_subagent_context, CacheSafeParams, CanUseToolFn, SubagentOverrides, ToolPermission,
 };
 use crate::memory_event;
-#[allow(deprecated)]
-pub(crate) use blockcell_tools::SkillMutexHandle;
 use blockcell_core::types::ChatMessage;
 use blockcell_core::UsageMetrics;
 use blockcell_providers::ProviderPool;
 use blockcell_tools::fuzzy_match::fuzzy_find_and_replace;
 use blockcell_tools::security_scan::{scan_skill_content, scan_skill_dir_with_trust};
 use blockcell_tools::skill_manage::{atomic_write_text, extract_frontmatter};
+#[allow(deprecated)]
+pub(crate) use blockcell_tools::SkillMutexHandle;
 use blockcell_tools::{MemoryFileStoreHandle, MemoryStoreHandle, SkillFileStoreHandle};
 use regex::Regex;
 use serde_json::json;

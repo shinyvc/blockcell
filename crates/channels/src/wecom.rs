@@ -1269,7 +1269,10 @@ pub fn resolve_wecom_webhook_account_id(
         .map(|s| s.as_str())
         .unwrap_or("");
     let signed_payload = if method == "GET" {
-        query.get("echostr").map(|s| percent_decode(s)).unwrap_or_default()
+        query
+            .get("echostr")
+            .map(|s| percent_decode(s))
+            .unwrap_or_default()
     } else {
         extract_xml_tag(body, "Encrypt").unwrap_or_default()
     };
@@ -1488,7 +1491,9 @@ pub async fn process_webhook(
             let pic_url = extract_xml_tag(&decrypted_body, "PicUrl").unwrap_or_default();
             info!(media_id = %media_id, "WeCom webhook: received image");
             let paths = if !media_id.is_empty() {
-                match download_wecom_media(&resolved_config, &media_id, "image", None, &media_dir).await {
+                match download_wecom_media(&resolved_config, &media_id, "image", None, &media_dir)
+                    .await
+                {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e.to_string(), "WeCom: failed to download image, using PicUrl");
@@ -1512,7 +1517,15 @@ pub async fn process_webhook(
                 extract_xml_tag(&decrypted_body, "Format").unwrap_or_else(|| "amr".to_string());
             info!(media_id = %media_id, format = %format, "WeCom webhook: received voice");
             let paths = if !media_id.is_empty() {
-                match download_wecom_media(&resolved_config, &media_id, "voice", Some(&format), &media_dir).await {
+                match download_wecom_media(
+                    &resolved_config,
+                    &media_id,
+                    "voice",
+                    Some(&format),
+                    &media_dir,
+                )
+                .await
+                {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e.to_string(), "WeCom: failed to download voice");
@@ -1524,7 +1537,8 @@ pub async fn process_webhook(
             };
             // Send immediate ack
             if !from_user.is_empty() {
-                let _ = send_message(&resolved_config, &from_user, "🎤 语音已收到，正在转写...").await;
+                let _ =
+                    send_message(&resolved_config, &from_user, "🎤 语音已收到，正在转写...").await;
             }
             // Voice: always transcribe immediately, no pending intent needed
             ("用户发来了一条语音消息，请先用 audio_transcribe 工具转写，然后根据转写内容回复用户。".to_string(), paths, false)
@@ -1533,7 +1547,14 @@ pub async fn process_webhook(
             let media_id = extract_xml_tag(&decrypted_body, "MediaId").unwrap_or_default();
             info!(media_id = %media_id, "WeCom webhook: received video");
             let paths = if !media_id.is_empty() {
-                match download_wecom_media(&resolved_config, &media_id, "video", Some("mp4"), &media_dir).await
+                match download_wecom_media(
+                    &resolved_config,
+                    &media_id,
+                    "video",
+                    Some("mp4"),
+                    &media_dir,
+                )
+                .await
                 {
                     Ok(p) => vec![p],
                     Err(e) => {
@@ -1557,8 +1578,14 @@ pub async fn process_webhook(
             let ext = file_name.rsplit('.').next().map(|s| s.to_string());
             info!(media_id = %media_id, file_name = %file_name, "WeCom webhook: received file");
             let paths = if !media_id.is_empty() {
-                match download_wecom_media(&resolved_config, &media_id, "file", ext.as_deref(), &media_dir)
-                    .await
+                match download_wecom_media(
+                    &resolved_config,
+                    &media_id,
+                    "file",
+                    ext.as_deref(),
+                    &media_dir,
+                )
+                .await
                 {
                     Ok(p) => vec![p],
                     Err(e) => {

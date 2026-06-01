@@ -393,7 +393,9 @@ pub async fn run(
     println!("  3. Run `blockcell agent` to start chatting");
     println!();
     println!("Quick setup examples:");
-    println!("  blockcell onboard --provider deepseek --api-key YOUR_API_KEY --model deepseek-v4-pro");
+    println!(
+        "  blockcell onboard --provider deepseek --api-key YOUR_API_KEY --model deepseek-v4-pro"
+    );
     println!("  blockcell onboard --provider kimi --api-key YOUR_API_KEY --model kimi-k2.5");
     println!("  blockcell onboard --provider openai --api-key YOUR_API_KEY");
 

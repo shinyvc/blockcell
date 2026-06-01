@@ -161,7 +161,8 @@ pub(super) async fn handle_hub_skill_install(
                         let out_path = if let Some(enclosed) = file.enclosed_name() {
                             let components: Vec<_> = enclosed.components().collect();
                             if components.len() > 1 {
-                                skill_dir_clone.join(components[1..].iter().collect::<std::path::PathBuf>())
+                                skill_dir_clone
+                                    .join(components[1..].iter().collect::<std::path::PathBuf>())
                             } else {
                                 skill_dir_clone.join(enclosed)
                             }
@@ -187,7 +188,9 @@ pub(super) async fn handle_hub_skill_install(
             }
         }
         Ok(())
-    }).await.unwrap_or(Err("spawn_blocking failed".to_string()));
+    })
+    .await
+    .unwrap_or(Err("spawn_blocking failed".to_string()));
 
     if let Err(e) = extract_result {
         return Json(serde_json::json!({ "status": "error", "message": e }));
@@ -916,7 +919,9 @@ pub(super) async fn handle_skill_install_external(
             "tools": [],
         });
         if let Ok(meta_content) = serde_yaml::to_string(&meta_value) {
-            tokio::fs::write(skill_dir.join("meta.yaml"), meta_content).await.ok();
+            tokio::fs::write(skill_dir.join("meta.yaml"), meta_content)
+                .await
+                .ok();
         }
     }
 

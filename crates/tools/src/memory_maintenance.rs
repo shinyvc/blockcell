@@ -4,10 +4,10 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use tracing::{debug, info};
 
+use crate::memory::looks_like_ghost_maintenance_log;
 use crate::Tool;
 use crate::ToolContext;
 use crate::ToolSchema;
-use crate::memory::looks_like_ghost_maintenance_log;
 
 /// 从记忆存储中清理 Ghost Agent 维护日志。
 fn prune_ghost_maintenance_logs(store: &crate::MemoryStoreHandle, dry_run: bool) -> Result<Value> {

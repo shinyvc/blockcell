@@ -431,9 +431,11 @@ impl IntentClassifier {
         let mut classifier = Self { rules };
         for rule in &mut classifier.rules {
             rule.keywords_lower = rule.keywords.iter().map(|s| s.to_lowercase()).collect();
-            rule.keywords_lower.extend(rule.keywords_dyn.iter().cloned());
+            rule.keywords_lower
+                .extend(rule.keywords_dyn.iter().cloned());
             rule.negative_lower = rule.negative.iter().map(|s| s.to_lowercase()).collect();
-            rule.negative_lower.extend(rule.negative_dyn.iter().cloned());
+            rule.negative_lower
+                .extend(rule.negative_dyn.iter().cloned());
         }
 
         classifier

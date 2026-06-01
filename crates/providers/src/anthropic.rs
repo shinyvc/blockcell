@@ -971,8 +971,7 @@ mod tests {
         assert_eq!(provider2.api_base, "https://api.minimaxi.com/anthropic/v1");
 
         // Default (no api_base) uses the built-in constant which already has /v1
-        let provider3 =
-            AnthropicProvider::new("test-key", None, "test-model", 1024, 0.7).unwrap();
+        let provider3 = AnthropicProvider::new("test-key", None, "test-model", 1024, 0.7).unwrap();
         assert_eq!(provider3.api_base, "https://api.anthropic.com/v1");
     }
 }

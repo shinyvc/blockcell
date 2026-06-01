@@ -385,7 +385,7 @@ pub async fn run(
     // 同步 BLOCKCELL_WORKSPACE 环境变量，供 channel listener 等模块读取 media 目录。
     // 必须在 resolve_agent_context 之后设置：命名 agent（如 --agent ops）的 workspace
     // 与 root_paths 不同，媒体文件应下载到该 agent 自己的 workspace/media。
-    let _ = std::env::set_var("BLOCKCELL_WORKSPACE", paths.workspace());
+    std::env::set_var("BLOCKCELL_WORKSPACE", paths.workspace());
     let mut config = resolved.config;
     let mcp_manager = Arc::new(McpManager::load(&root_paths).await?);
     let provider_pool = build_pool_with_overrides(&mut config, model, provider)?;
@@ -2166,6 +2166,7 @@ fn filter_items<'a>(items: &'a [CommandItem], query: &str) -> Vec<&'a CommandIte
 
 /// Render suggestions below the input line
 /// Returns the total number of filtered items (not just displayed)
+#[allow(clippy::too_many_arguments)]
 fn render_suggestions(
     all_items: &[CommandItem],
     query: &str,
