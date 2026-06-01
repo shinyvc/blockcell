@@ -3,6 +3,7 @@ use blockcell_core::{Config, Error, InboundMessage, Result};
 use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;

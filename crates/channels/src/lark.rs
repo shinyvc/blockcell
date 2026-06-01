@@ -18,7 +18,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
@@ -268,20 +268,54 @@ fn resolve_lark_plain_webhook_config(config: &Config, body: &WebhookBody) -> Con
     config.clone()
 }
 
+/// 根据 webhook body 解析匹配的 account_id，供 gateway 计算 agent 级别的 media_dir。
+pub fn resolve_lark_webhook_account_id(config: &Config, raw_body: &str) -> Option<String> {
+    let body: WebhookBody = serde_json::from_str(raw_body).ok()?;
+    let listeners = lark_scoped_configs(config);
+    if listeners.is_empty() {
+        return None;
+    }
+    if listeners.len() == 1 {
+        return listeners[0].account_id.clone();
+    }
+
+    // 加密 webhook：外层 body 只有 encrypt 字段，无法通过 token/app_id 匹配。
+    // 遍历每个 listener 的 encrypt_key 尝试解密，成功则返回该 listener 的 account_id。
+    if let Some(encrypted) = body.encrypt.as_deref().filter(|v| !v.is_empty()) {
+        for listener in &listeners {
+            let encrypt_key = &listener.config.channels.lark.encrypt_key;
+            if encrypt_key.is_empty() {
+                continue;
+            }
+            if decrypt_lark(encrypt_key, encrypted).is_ok() {
+                return listener.account_id.clone();
+            }
+        }
+    }
+
+    if let Some(token) = body.token.as_deref().filter(|v| !v.is_empty()) {
+        for listener in &listeners {
+            if listener.config.channels.lark.verification_token == token {
+                return listener.account_id.clone();
+            }
+        }
+    }
+    if let Some(app_id) = body.app_id.as_deref().filter(|v| !v.is_empty()) {
+        for listener in &listeners {
+            if listener.config.channels.lark.app_id == app_id {
+                return listener.account_id.clone();
+            }
+        }
+    }
+    None
+}
+
 pub async fn process_webhook(
     config: &Config,
     raw_body: &str,
     inbound_tx: Option<&mpsc::Sender<InboundMessage>>,
+    media_dir: PathBuf,
 ) -> Result<String> {
-    // 在请求入口处一次性解析 media_dir，避免并发环境下环境变量竞争
-    let media_dir = std::env::var("BLOCKCELL_WORKSPACE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .map(|h| h.join(".blockcell").join("workspace"))
-                .unwrap_or_else(|| PathBuf::from(".blockcell/workspace"))
-        })
-        .join("media");
 
     let body: WebhookBody = serde_json::from_str(raw_body)
         .map_err(|e| Error::Channel(format!("Lark webhook JSON parse error: {}", e)))?;
@@ -295,7 +329,7 @@ pub async fn process_webhook(
             }
             if let Ok(plaintext) = decrypt_lark(encrypt_key, encrypted) {
                 debug!(len = plaintext.len(), listener = %listener.label, "Lark webhook decrypted payload");
-                return Box::pin(process_webhook(&listener.config, &plaintext, inbound_tx)).await;
+                return Box::pin(process_webhook(&listener.config, &plaintext, inbound_tx, media_dir.clone())).await;
             }
         }
         return Err(Error::Channel(
@@ -380,7 +414,7 @@ pub async fn process_webhook(
                 serde_json::from_str(&message.content).unwrap_or(ImageContent { image_key: None });
             let paths = if let Some(key) = content.image_key {
                 info!(image_key = %key, "Lark webhook: received image");
-                match download_lark_resource(config, &media_dir, &key, "image", "jpg").await {
+                match download_lark_resource(&resolved_config, &media_dir, &key, "image", "jpg").await {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e, "Lark: failed to download image");
@@ -404,7 +438,7 @@ pub async fn process_webhook(
             let duration_ms = content.duration.unwrap_or(0);
             let paths = if let Some(key) = content.file_key {
                 info!(file_key = %key, "Lark webhook: received audio");
-                match download_lark_resource(config, &media_dir, &key, "file", "opus").await {
+                match download_lark_resource(&resolved_config, &media_dir, &key, "file", "opus").await {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e, "Lark: failed to download audio");
@@ -430,7 +464,7 @@ pub async fn process_webhook(
             let ext = file_name.rsplit('.').next().unwrap_or("bin").to_string();
             let paths = if let Some(key) = content.file_key {
                 info!(file_key = %key, file_name = %file_name, "Lark webhook: received file");
-                match download_lark_resource(config, &media_dir, &key, "file", &ext).await {
+                match download_lark_resource(&resolved_config, &media_dir, &key, "file", &ext).await {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e, "Lark: failed to download file");

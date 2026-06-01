@@ -37,13 +37,13 @@ pub fn extract_to_workspace(skills_dir: &Path) -> anyhow::Result<Vec<String>> {
         }
 
         // Write embedded bytes
-        if let Some(asset) = BuiltinSkillAssets::get(rel) {
+        if let Some(asset) = BuiltinSkillAssets::get(relq) {
             std::fs::write(&dest, asset.data.as_ref())?;
             if !extracted_skills.contains(&skill_name) {
                 extracted_skills.push(skill_name);
             }
         }
-    }
+    }q
 
     Ok(extracted_skills)
 }

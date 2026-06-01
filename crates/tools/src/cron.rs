@@ -474,10 +474,10 @@ impl Tool for CronTool {
         let origin_channel = ctx.channel.clone();
         let origin_chat_id = ctx.chat_id.clone();
         let default_timezone = ctx.config.default_timezone.clone();
-        // 使用 ctx.base 重建 Paths，而非从 workspace 反推。
-        // 当配置了 workspace_override 时，workspace 不再是 <base>/workspace，
-        // parent() 推导出的 base 会指向错误目录。
-        let paths = Paths::with_base(ctx.base.clone());
+        // 使用 base + workspace 重建 Paths，保留 workspace override。
+        // 若只用 with_base，自定义 workspace 时 skills_dir() 会指向错误的默认路径，
+        // 导致 resolve_skill_payload_kind 误判 Python 技能为 rhai。
+        let paths = Paths::with_base_and_workspace(ctx.base.clone(), ctx.workspace.clone());
         tokio::task::spawn_blocking(move || {
             execute_cron_action_with_paths(
                 &paths,
