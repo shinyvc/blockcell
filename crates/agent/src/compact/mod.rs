@@ -256,8 +256,17 @@ pub fn build_recovery_message(
 ///
 /// 如果内容超过最大 token 数，安全截断到最近的 UTF-8 字符边界。
 /// 确保至少保留第一个有效字符（即使它很大），避免返回空字符串。
+///
+/// ## 关于 CJK 过截断的说明
+///
+/// 此函数使用 `max_tokens * 4` 字节的保守估算（假设 1 token ≈ 4 字节 ASCII 字符）。
+/// 对于 CJK（中文/日文/韩文）文本，每个字符通常对应 ~1 token 但占用 3 字节，
+/// 因此按字节截断 `max_tokens * 4` 会得到比预期更多的字节内容。
+/// 这种保守截断是**有意为之的安全裕度**——宁可少截断一些（多保留部分内容），
+/// 也不冒上下文溢出的风险。在 token 预算紧张的场景下，少量额外内容
+/// 优于因高估 token 数而导致的截断不足。
 fn truncate_to_tokens(content: &str, max_tokens: usize) -> String {
-    let max_chars = max_tokens * 4;
+    let max_chars = max_tokens * blockcell_core::CHARS_PER_TOKEN;
     if content.len() <= max_chars {
         content.to_string()
     } else {

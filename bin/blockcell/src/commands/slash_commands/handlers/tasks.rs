@@ -61,7 +61,12 @@ impl SlashCommand for TasksCommand {
 
         // 子命令: /tasks resume [task_id] — 从断点恢复未完成的任务
         if trimmed == "resume" || trimmed.starts_with("resume ") {
-            let task_id = trimmed.strip_prefix("resume").unwrap().trim();
+            // 使用 if let 替代 unwrap_or，更安全且语义清晰
+            let task_id = if let Some(s) = trimmed.strip_prefix("resume ") {
+                s.trim()
+            } else {
+                "" // 仅 "/tasks resume" 无参数时
+            };
             return Self::resume_task(task_id, ctx).await;
         }
 

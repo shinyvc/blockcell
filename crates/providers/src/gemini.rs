@@ -30,7 +30,7 @@ impl GeminiProvider {
         model: &str,
         max_tokens: u32,
         temperature: f32,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_with_proxy(
             api_key,
             api_base,
@@ -53,7 +53,7 @@ impl GeminiProvider {
         provider_proxy: Option<&str>,
         global_proxy: Option<&str>,
         no_proxy: &[String],
-    ) -> Self {
+    ) -> Result<Self> {
         let resolved_base = api_base
             .unwrap_or(GEMINI_API_BASE)
             .trim_end_matches('/')
@@ -64,15 +64,15 @@ impl GeminiProvider {
             no_proxy,
             &resolved_base,
             Duration::from_secs(120),
-        );
-        Self {
+        )?;
+        Ok(Self {
             client,
             api_key: api_key.to_string(),
             api_base: resolved_base,
             model: model.to_string(),
             max_tokens,
             temperature,
-        }
+        })
     }
 
     /// Normalize model name: strip "gemini/" prefix if present.

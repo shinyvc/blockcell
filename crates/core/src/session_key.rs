@@ -2,10 +2,23 @@ pub fn build_session_key(channel: &str, chat_id: &str) -> String {
     format!("{}:{}", channel, chat_id)
 }
 
+/// 将 session_key 转换为文件系统安全的文件名（stem）。
+///
+/// 编码规则：`:`、`/`、`\` → `_`
+///
+/// ## 已知限制
+/// chat_id 中若含有下划线 `_`，会导致 `session_title_from_id` 将其误转为 `:`（因为该函数
+/// 将所有 `_` 还原为 `:`）。在 chat_id 包含 `_` 的场景中，round-trip 会丢失信息。
+/// 未来改进：使用更健壮的分隔符（如 percent-encoding 或 double-underscore `__`）。
 pub fn session_file_stem(session_key: &str) -> String {
     session_key.replace([':', '/', '\\'], "_")
 }
 
+/// 从文件 stem 中提取 session_id（即 channel 之后的部分）。
+///
+/// 使用第一个 `_` 作为 channel 与 chat_id 的分界。若 chat_id 中包含 `_`，
+/// 不会被错误截断——但后续 `session_title_from_id` 会将所有 `_` 转为 `:`，
+/// 导致 chat_id 中原有的 `_` 丢失。参见 [`session_file_stem`] 的已知限制。
 pub fn session_id_from_file_stem(file_stem: &str) -> String {
     file_stem
         .find('_')

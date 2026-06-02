@@ -8,6 +8,11 @@ use blockcell_providers::ProviderPool;
 use std::sync::Arc;
 
 /// Compact 摘要章节
+///
+/// ## 排序稳定性说明
+/// 枚举显式指定了判别值 (1–9)，derive(PartialOrd) 按这些判别值排序，
+/// 这恰好与预期的优先级顺序一致（数字越小优先级越高）。
+/// 此排序是稳定且有意为之的，不依赖于字段声明顺序等脆弱因素。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CompactSummarySection {
     /// 用户请求

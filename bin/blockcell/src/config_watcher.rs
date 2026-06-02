@@ -31,7 +31,7 @@ impl ConfigWatcher {
             notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     if event.kind.is_modify() || event.kind.is_create() {
-                        let _ = tx.blocking_send(());
+                        let _ = tx.try_send(());
                     }
                 }
             })?;
@@ -50,26 +50,22 @@ impl ConfigWatcher {
         let mut last_reload = std::time::Instant::now();
         let debounce_duration = Duration::from_secs(1);
 
-        loop {
-            tokio::select! {
-                Some(_) = rx.recv() => {
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_reload) < debounce_duration {
-                        continue;
-                    }
-                    last_reload = now;
+        while let Some(_) = rx.recv().await {
+            let now = std::time::Instant::now();
+            if now.duration_since(last_reload) < debounce_duration {
+                continue;
+            }
+            last_reload = now;
 
-                    // 延迟一小段时间，确保文件写入完成
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+            // 延迟一小段时间，确保文件写入完成
+            tokio::time::sleep(Duration::from_millis(200)).await;
 
-                    match self.reload_config().await {
-                        Ok(()) => {
-                            info!("✅ Config reloaded successfully");
-                        }
-                        Err(e) => {
-                            error!("❌ Failed to reload config: {}", e);
-                        }
-                    }
+            match self.reload_config().await {
+                Ok(()) => {
+                    info!("✅ Config reloaded successfully");
+                }
+                Err(e) => {
+                    error!("❌ Failed to reload config: {}", e);
                 }
             }
         }

@@ -375,6 +375,11 @@ pub fn list_available_browsers() -> Vec<(BrowserEngine, String)> {
 }
 
 /// Find a free TCP port.
+///
+/// 注意：此方法存在竞争条件：drop(listener) 释放端口后，到子进程绑定之间
+/// 可能出现其他进程占用同一端口。理想方案是将 listener 文件描述符直接传递给
+/// 子进程（通过继承或 dup），避免关闭后再打开。如果后续出现端口被占用的问题，
+/// 应改为传递 listener 文件描述符的方式。
 async fn find_free_port() -> Result<u16, String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

@@ -29,7 +29,7 @@ impl OpenAICompatibleEmbedder {
         provider_proxy: Option<&str>,
         global_proxy: Option<&str>,
         no_proxy: &[String],
-    ) -> Self {
+    ) -> Result<Self> {
         let resolved_base = api_base
             .unwrap_or("https://api.openai.com/v1")
             .trim_end_matches('/')
@@ -40,15 +40,15 @@ impl OpenAICompatibleEmbedder {
             no_proxy,
             &resolved_base,
             Duration::from_secs(120),
-        );
+        )?;
 
-        Self {
+        Ok(Self {
             client,
             api_key: api_key.to_string(),
             api_base: resolved_base,
             model: model.to_string(),
             dimensions: AtomicUsize::new(0),
-        }
+        })
     }
 
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
@@ -151,7 +151,8 @@ pub fn create_embedder(config: &Config) -> anyhow::Result<Option<Arc<dyn Embedde
         provider_cfg.proxy.as_deref(),
         config.network.proxy.as_deref(),
         &config.network.no_proxy,
-    );
+    )
+    .with_context(|| format!("Failed to create embedder for provider '{}'", provider_name))?;
 
     Ok(Some(Arc::new(embedder)))
 }

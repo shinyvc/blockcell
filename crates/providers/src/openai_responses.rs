@@ -41,7 +41,7 @@ impl OpenAIResponsesProvider {
         model: &str,
         max_tokens: u32,
         temperature: f32,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_with_proxy(
             api_key,
             api_base,
@@ -66,7 +66,7 @@ impl OpenAIResponsesProvider {
         global_proxy: Option<&str>,
         no_proxy: &[String],
         tool_call_mode: ToolCallMode,
-    ) -> Self {
+    ) -> Result<Self> {
         let resolved_base = api_base
             .unwrap_or("https://api.openai.com/v1")
             .trim_end_matches('/')
@@ -77,8 +77,8 @@ impl OpenAIResponsesProvider {
             no_proxy,
             &resolved_base,
             Duration::from_secs(120),
-        );
-        Self {
+        )?;
+        Ok(Self {
             client,
             api_key: api_key.to_string(),
             api_base: resolved_base,
@@ -86,7 +86,7 @@ impl OpenAIResponsesProvider {
             max_tokens,
             temperature,
             tool_call_mode,
-        }
+        })
     }
 
     fn content_to_text(content: &Value) -> String {

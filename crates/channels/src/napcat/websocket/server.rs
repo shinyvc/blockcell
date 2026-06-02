@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::{accept_hdr_async, tungstenite::Message as WsMessage};
 use tracing::{error, info, warn};
@@ -476,6 +476,9 @@ impl NapCatWsServer {
         // Channel for sending messages to this connection
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<String>(100);
 
+        // 使用有界信号量限制并发任务数，避免无限 tokio::spawn 导致内存压力
+        let semaphore = Arc::new(Semaphore::new(10));
+
         // Main connection loop
         loop {
             tokio::select! {
@@ -503,8 +506,12 @@ impl NapCatWsServer {
                             // Handle the message in a spawned task to avoid blocking
                             // the main loop (media download may take time and needs to
                             // receive API responses via the same WebSocket)
+                            // 使用有界信号量限制并发任务数，避免无限制 tokio::spawn 导致内存压力
                             let server = self.clone();
+                            let sem = semaphore.clone();
                             tokio::spawn(async move {
+                                // 获取信号量许可，任务完成后自动释放
+                                let _permit = sem.acquire_owned().await;
                                 server.handle_ws_message(&text).await;
                             });
                         }

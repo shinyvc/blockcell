@@ -14,14 +14,14 @@ use super::{
     create_subagent_context, CacheSafeParams, CanUseToolFn, SubagentOverrides, ToolPermission,
 };
 use crate::memory_event;
-#[allow(deprecated)]
-use crate::skill_mutex::SkillMutex;
 use blockcell_core::types::ChatMessage;
 use blockcell_core::UsageMetrics;
 use blockcell_providers::ProviderPool;
 use blockcell_tools::fuzzy_match::fuzzy_find_and_replace;
 use blockcell_tools::security_scan::{scan_skill_content, scan_skill_dir_with_trust};
 use blockcell_tools::skill_manage::{atomic_write_text, extract_frontmatter};
+#[allow(deprecated)]
+pub(crate) use blockcell_tools::SkillMutexHandle;
 use blockcell_tools::{MemoryFileStoreHandle, MemoryStoreHandle, SkillFileStoreHandle};
 use regex::Regex;
 use serde_json::json;
@@ -115,7 +115,7 @@ pub struct ForkedAgentParams {
     /// External skills directories (builtin_skills_dir etc., for skill search)
     pub external_skills_dirs: Vec<PathBuf>,
     /// Skill mutex (shared with parent agent to prevent concurrent skill modifications)
-    pub skill_mutex: Option<Arc<SkillMutex>>,
+    pub skill_mutex: Option<SkillMutexHandle>,
     /// 允许的工具列表 (None = 全部工具)
     pub tools: Option<Vec<String>>,
     /// 模型覆盖 (None = inherit from parent)
@@ -215,7 +215,7 @@ impl ForkedAgentParams {
 
     /// 设置 skill_mutex（共享父代理的 SkillMutex，防止并发修改）
     #[allow(deprecated)]
-    pub fn with_skill_mutex(mut self, mutex: Arc<SkillMutex>) -> Self {
+    pub fn with_skill_mutex(mut self, mutex: SkillMutexHandle) -> Self {
         self.skill_mutex = Some(mutex);
         self
     }
@@ -323,7 +323,7 @@ pub struct ForkedAgentParamsBuilder {
     skill_file_store: Option<SkillFileStoreHandle>,
     skills_dir: Option<PathBuf>,
     external_skills_dirs: Vec<PathBuf>,
-    skill_mutex: Option<Arc<SkillMutex>>,
+    skill_mutex: Option<SkillMutexHandle>,
     /// 允许的工具列表
     tools: Option<Vec<String>>,
     /// 模型覆盖
@@ -496,7 +496,7 @@ impl ForkedAgentParamsBuilder {
 
     /// 设置 skill_mutex（共享父代理的 SkillMutex，防止并发修改）
     #[allow(deprecated)]
-    pub fn skill_mutex(mut self, mutex: Arc<SkillMutex>) -> Self {
+    pub fn skill_mutex(mut self, mutex: SkillMutexHandle) -> Self {
         self.skill_mutex = Some(mutex);
         self
     }
@@ -977,7 +977,7 @@ async fn execute_forked_tool(
     skill_file_store: &Option<SkillFileStoreHandle>,
     skills_dir: &Option<PathBuf>,
     external_skills_dirs: &[PathBuf],
-    skill_mutex: &Option<Arc<SkillMutex>>,
+    skill_mutex: &Option<SkillMutexHandle>,
     working_dir: &Option<PathBuf>,
 ) -> Result<String, ForkedAgentError> {
     // Check disallowed tools list
@@ -1002,25 +1002,36 @@ async fn execute_forked_tool(
 
     // SkillMutex 检查: 写入操作前获取互斥锁
     // 注意: _skill_guard 必须在整个 match 块中存活, 才能保护操作期间不被并发修改
+    //
+    // 重要: 当 skill_file_store 可用时, SkillFileStore 内部已有 WriteGuard 保护
+    // (create/edit/patch/delete/write_file/remove_file 都会调用 acquire_write_guard),
+    // 不需要在此预获取 skill_mutex, 否则同一 WriteTarget 被重复获取会导致自我冲突
     let _skill_guard = if tool_name == "skill_manage" {
-        let is_write_action = matches!(
-            input.get("action").and_then(|v| v.as_str()).unwrap_or(""),
-            "create" | "patch" | "edit" | "delete" | "write_file" | "remove_file"
-        );
-        if is_write_action {
-            if let Some(name) = input.get("name").and_then(|v| v.as_str()) {
-                if let Some(ref mutex) = skill_mutex {
-                    // 直接获取写锁（acquire 内部已包含活跃检查）
-                    // 不再先调用 can_modify() 再 acquire()，避免 TOCTOU 竞态
-                    match mutex.acquire(name) {
-                        Ok(guard) => Some(guard),
-                        Err(e) => {
-                            tracing::warn!(skill = %name, error = %e, "SkillMutex acquire failed, rejecting write");
-                            return Ok(json!({
-                                "success": false,
-                                "message": format!("Skill '{}' is currently being modified. Please try again later.", name)
-                            }).to_string());
+        // SkillFileStore 路径: 内部已自带 write guard, 跳过预获取避免自我冲突
+        if skill_file_store.is_some() {
+            None
+        } else {
+            let is_write_action = matches!(
+                input.get("action").and_then(|v| v.as_str()).unwrap_or(""),
+                "create" | "patch" | "edit" | "delete" | "write_file" | "remove_file"
+            );
+            if is_write_action {
+                if let Some(name) = input.get("name").and_then(|v| v.as_str()) {
+                    if let Some(ref mutex) = skill_mutex {
+                        // 直接获取写锁（acquire 内部已包含活跃检查）
+                        // 不再先调用 can_modify() 再 acquire()，避免 TOCTOU 竞态
+                        match mutex.try_acquire(name) {
+                            Some(guard) => Some(guard),
+                            None => {
+                                tracing::warn!(skill = %name, "SkillMutex acquire failed (skill is active), rejecting write");
+                                return Ok(json!({
+                                    "success": false,
+                                    "message": format!("Skill '{}' is currently being modified. Please try again later.", name)
+                                }).to_string());
+                            }
                         }
+                    } else {
+                        None
                     }
                 } else {
                     None
@@ -1028,8 +1039,6 @@ async fn execute_forked_tool(
             } else {
                 None
             }
-        } else {
-            None
         }
     } else {
         None

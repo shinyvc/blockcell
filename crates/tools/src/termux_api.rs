@@ -25,7 +25,7 @@ pub struct TermuxApiTool;
 impl Tool for TermuxApiTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "termux_api",
+            name: "termux_api".to_string(),
             description: "Control Android device via Termux API. Requires termux-api package and Termux:API app. \
                 Actions: battery_status, brightness, camera_info, camera_photo, clipboard_get, clipboard_set, \
                 contact_list, call_log, dialog, download, fingerprint, infrared_frequencies, infrared_transmit, \
@@ -33,7 +33,7 @@ impl Tool for TermuxApiTool {
                 open, open_url, sensor, share, sms_list, sms_send, speech_to_text, storage_get, \
                 telephony_deviceinfo, telephony_cellinfo, telephony_call, toast, torch, tts_engines, tts_speak, \
                 vibrate, volume, wallpaper, wifi_connectioninfo, wifi_scaninfo, wifi_enable, \
-                audio_info, wake_lock, wake_unlock, job_scheduler, info",
+                audio_info, wake_lock, wake_unlock, job_scheduler, info".to_string(),
             parameters: build_schema(),
         }
     }

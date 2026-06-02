@@ -12,8 +12,8 @@ pub struct MessageTool;
 impl Tool for MessageTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "message",
-            description: "Send a message (text and/or media files) to a channel. Use this to send images, files, or text to the current or a different channel/chat. For cross-channel sending, you can provide either 'chat_id' directly OR 'target_name' to look up a known contact by name. The system automatically remembers users who have sent messages on each channel.",
+            name: "message".to_string(),
+            description: "Send a message (text and/or media files) to a channel. Use this to send images, files, or text to the current or a different channel/chat. For cross-channel sending, you can provide either 'chat_id' directly OR 'target_name' to look up a known contact by name. The system automatically remembers users who have sent messages on each channel.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

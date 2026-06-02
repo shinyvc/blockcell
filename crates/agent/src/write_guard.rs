@@ -4,6 +4,8 @@
 //! write operations: USER.md, MEMORY.md, and skill files.
 //! Uses std::sync::RwLock so Drop can release synchronously without tokio runtime.
 
+use async_trait::async_trait;
+use blockcell_tools::{SkillMutexGuard, SkillMutexOps};
 use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
@@ -64,20 +66,22 @@ pub struct WriteGuardError {
 pub struct WriteGuard {
     /// In-process lock: tracks which targets are currently being written
     active_writes: Arc<RwLock<HashSet<WriteTarget>>>,
-    /// Base directory for cross-process lockdir files
+    /// 锁文件基础目录 — 预留用于跨进程文件锁
+    /// 目前仅存储，未来版本将用于跨进程 WriteGuard 协调
+    #[allow(dead_code)]
     lockdir_base: PathBuf,
 }
 
 impl fmt::Debug for WriteGuard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WriteGuard")
-            .field("lockdir_base", &self.lockdir_base)
-            .finish()
+        f.debug_struct("WriteGuard").finish()
     }
 }
 
 impl WriteGuard {
-    /// Create a new WriteGuard with the given lockdir base path
+    /// 创建新的 WriteGuard
+    ///
+    /// `lockdir_base` 为锁文件目录，目前存储用于未来跨进程锁实现。
     pub fn new(lockdir_base: PathBuf) -> Self {
         Self {
             active_writes: Arc::new(RwLock::new(HashSet::new())),
@@ -130,16 +134,39 @@ impl WriteGuard {
         });
         active.iter().cloned().collect()
     }
-
-    /// Get the lockdir base path
-    pub fn lockdir_base(&self) -> &PathBuf {
-        &self.lockdir_base
-    }
 }
 
 impl Default for WriteGuard {
     fn default() -> Self {
         Self::new(PathBuf::new())
+    }
+}
+
+/// 帮助函数: 将技能名称映射为 WriteTarget，用于 SkillMutexOps 实现
+fn skill_name_to_target(skill_name: &str) -> WriteTarget {
+    WriteTarget::Skill {
+        category: String::new(),
+        name: skill_name.to_string(),
+    }
+}
+
+/// 为 WriteGuard 实现 SkillMutexOps trait
+///
+/// 使 WriteGuard 可以作为 `Arc<dyn SkillMutexOps>` (SkillMutexHandle) 传递给工具层，
+/// 替代已废弃的 SkillMutex。
+#[async_trait]
+impl SkillMutexOps for WriteGuard {
+    async fn can_modify(&self, skill_name: &str) -> bool {
+        let target = skill_name_to_target(skill_name);
+        WriteGuard::can_modify(self, &target)
+    }
+
+    fn try_acquire(&self, skill_name: &str) -> Option<SkillMutexGuard> {
+        let target = skill_name_to_target(skill_name);
+        match self.acquire(target) {
+            Ok(guard) => Some(Arc::new(guard)),
+            Err(_) => None,
+        }
     }
 }
 

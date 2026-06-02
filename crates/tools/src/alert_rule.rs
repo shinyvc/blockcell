@@ -129,7 +129,7 @@ pub struct AlertRuleTool;
 impl Tool for AlertRuleTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "alert_rule",
+            name: "alert_rule".to_string(),
             description: "Create and manage conditional alert rules for monitoring metrics. \
                 Rules periodically evaluate a data source (via tool call), extract a metric value, \
                 compare against a threshold, and trigger notifications when conditions are met. \
@@ -138,7 +138,7 @@ impl Tool for AlertRuleTool {
                 cross_above (value crosses above threshold), cross_below (value crosses below threshold). \
                 Actions: 'create' (new rule), 'list' (all rules), 'get' (single rule), \
                 'update' (modify rule), 'delete' (remove rule), 'evaluate' (manually check a rule now), \
-                'history' (trigger history).",
+                'history' (trigger history).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -293,14 +293,20 @@ impl Tool for AlertRuleTool {
 
         match action {
             "evaluate" => {
-                let paths = Paths::new();
+                // 使用 ctx.base + ctx.workspace 重建完整的 Paths，
+                // 确保 alert 规则存储在配置的 workspace 下（而非默认路径）。
+                let paths = Paths::with_base_and_workspace(ctx.base.clone(), ctx.workspace.clone());
                 action_evaluate(&paths, &ctx, &params).await
             }
             _ => {
                 let p = params.clone();
                 let a = action.to_string();
+                let base = ctx.base.clone();
+                let workspace = ctx.workspace.clone();
                 tokio::task::spawn_blocking(move || {
-                    let paths = Paths::new();
+                    // 使用 ctx.base + ctx.workspace 重建完整的 Paths，
+                    // 确保 alert 规则存储在配置的 workspace 下（而非默认路径）。
+                    let paths = Paths::with_base_and_workspace(base, workspace);
                     match a.as_str() {
                         "create" => action_create(&paths, &p),
                         "list" => action_list(&paths),

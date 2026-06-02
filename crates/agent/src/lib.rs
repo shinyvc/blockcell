@@ -37,7 +37,8 @@ pub mod skill_executor;
 pub mod skill_file_store;
 pub mod skill_index;
 pub mod skill_kernel;
-pub mod skill_mutex;
+// skill_mutex 模块已移除 — 所有功能由 write_guard::WriteGuard 替代
+// WriteGuard 实现了 SkillMutexOps trait，可作为 SkillMutexHandle 传给工具层
 pub mod skill_nudge;
 pub mod skill_summary;
 pub mod summary_queue;

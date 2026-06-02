@@ -182,9 +182,8 @@ fn build_python_command(runner: &str, script_path: &Path, args: &[String]) -> Co
 impl Tool for ExecLocalTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "exec_local",
-            description:
-                "Execute a local script or executable inside the active skill directory only. The `path` must be RELATIVE (e.g. `scripts/run.py`), never absolute. If the skill manual shows `{baseDir}/scripts/...`, strip the `{baseDir}` prefix and pass only the relative portion.",
+            name: "exec_local".to_string(),
+            description: "Execute a local script or executable inside the active skill directory only. The `path` must be RELATIVE (e.g. `scripts/run.py`), never absolute. If the skill manual shows `{baseDir}/scripts/...`, strip the `{baseDir}` prefix and pass only the relative portion.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -595,6 +594,7 @@ mod tests {
     fn tool_context(skill_dir: PathBuf) -> ToolContext {
         ToolContext {
             workspace: std::env::temp_dir(),
+            base: std::env::temp_dir().join("blockcell"),
             builtin_skills_dir: None,
             active_skill_dir: Some(skill_dir),
             session_key: "cli:test".to_string(),

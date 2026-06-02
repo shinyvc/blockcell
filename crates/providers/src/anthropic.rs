@@ -34,7 +34,7 @@ impl AnthropicProvider {
         model: &str,
         max_tokens: u32,
         temperature: f32,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_with_proxy(
             api_key,
             api_base,
@@ -57,7 +57,7 @@ impl AnthropicProvider {
         provider_proxy: Option<&str>,
         global_proxy: Option<&str>,
         no_proxy: &[String],
-    ) -> Self {
+    ) -> Result<Self> {
         let resolved_base = api_base
             .unwrap_or(ANTHROPIC_API_BASE)
             .trim_end_matches('/')
@@ -78,15 +78,15 @@ impl AnthropicProvider {
             no_proxy,
             &resolved_base,
             Duration::from_secs(120),
-        );
-        Self {
+        )?;
+        Ok(Self {
             client,
             api_key: api_key.to_string(),
             api_base: resolved_base,
             model: model.to_string(),
             max_tokens,
             temperature,
-        }
+        })
     }
 
     /// Convert OpenAI-style tool schemas to Anthropic tool format.
@@ -532,6 +532,8 @@ impl Provider for AnthropicProvider {
             let mut accumulated_content = String::new();
             let mut finish_reason = "stop".to_string();
             let mut usage = Value::Null;
+            // 记录上一个 SSE event 类型，用于跨行/跨 chunk 的 fallback 解析
+            let mut last_event_type: Option<String> = None;
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
@@ -543,9 +545,9 @@ impl Provider for AnthropicProvider {
                             let line = buffer[..pos].trim().to_string();
                             buffer = buffer[pos + 1..].to_string();
 
-                            // 解析 event 类型（SSE 规范要求，但我们通过 data 中的 type 字段判断事件类型）
-                            if let Some(_event_type) = line.strip_prefix("event: ") {
-                                // 继续读取下一行的 data
+                            // 解析 event 类型（SSE 规范要求）
+                            if let Some(event_type) = line.strip_prefix("event: ") {
+                                last_event_type = Some(event_type.to_string());
                                 continue;
                             }
 
@@ -687,7 +689,13 @@ impl Provider for AnthropicProvider {
                                             }
                                             return;
                                         }
-                                        _ => {}
+                                        _ => {
+                                            debug!(
+                                                event_type = %event.event_type,
+                                                last_event_type = ?last_event_type,
+                                                "收到意外的 SSE 事件类型"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -947,7 +955,8 @@ mod tests {
             "test-model",
             1024,
             0.7,
-        );
+        )
+        .unwrap();
         assert_eq!(provider.api_base, "https://api.minimaxi.com/anthropic/v1");
 
         // Custom api_base already with /v1 should not double-append
@@ -957,11 +966,12 @@ mod tests {
             "test-model",
             1024,
             0.7,
-        );
+        )
+        .unwrap();
         assert_eq!(provider2.api_base, "https://api.minimaxi.com/anthropic/v1");
 
         // Default (no api_base) uses the built-in constant which already has /v1
-        let provider3 = AnthropicProvider::new("test-key", None, "test-model", 1024, 0.7);
+        let provider3 = AnthropicProvider::new("test-key", None, "test-model", 1024, 0.7).unwrap();
         assert_eq!(provider3.api_base, "https://api.anthropic.com/v1");
     }
 }

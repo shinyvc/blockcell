@@ -503,19 +503,51 @@ impl CronService {
             *self.has_unsaved_changes.write().await = true;
         }
 
-        // Always sync new jobs from disk to close the mtime race window.
-        // CronTool may have written new jobs between merge_load and now; without this,
-        // save() would overwrite those new jobs. This also catches cases where mtime
-        // granularity (1-2s on most filesystems) caused merge_load to skip a changed file.
-        match self.sync_new_from_disk(&known_ids).await {
-            Ok(added) => {
-                if added {
-                    *self.has_unsaved_changes.write().await = true;
+        // 同步磁盘上的新任务，缩小 mtime 竞态窗口
+        // CronTool 可能在 merge_load 之后写入了新任务；没有这一步的话，
+        // save() 会覆盖那些新任务。
+        let mut retries = 0;
+        let max_retries = 2;
+        loop {
+            match self.sync_new_from_disk(&known_ids).await {
+                Ok(added) => {
+                    if added {
+                        *self.has_unsaved_changes.write().await = true;
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e.to_string(), "Failed to sync new cron jobs from disk");
                 }
             }
-            Err(e) => {
-                error!(error = %e.to_string(), "Failed to sync new cron jobs from disk");
+
+            // 检查文件 mtime：如果在 sync_new_from_disk 之后又被其他进程修改了，
+            // 则需要重新读取，避免 save() 覆盖其他进程的写入
+            let path = self.paths.cron_jobs_file();
+            let current_mtime = if path.exists() {
+                tokio::fs::metadata(&path)
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+            } else {
+                None
+            };
+            let last_mtime = *self.last_file_mtime.read().await;
+
+            let file_changed_again = match (current_mtime, last_mtime) {
+                (Some(current), Some(last)) => current != last,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+
+            if !file_changed_again || retries >= max_retries {
+                break;
             }
+
+            retries += 1;
+            debug!(
+                retry = retries,
+                "Cron jobs file changed again, re-syncing from disk"
+            );
         }
 
         // Save state changes to disk BEFORE executing jobs

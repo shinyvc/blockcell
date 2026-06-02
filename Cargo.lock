@@ -578,6 +578,7 @@ dependencies = [
  "blockcell-storage",
  "bytes",
  "futures",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
@@ -605,7 +606,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "winapi",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -628,7 +629,7 @@ dependencies = [
  "tracing",
  "uuid",
  "which",
- "winapi",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -674,6 +675,7 @@ dependencies = [
  "once_cell",
  "pdf-extract",
  "quick-xml 0.37.5",
+ "rand 0.8.5",
  "regex",
  "reqwest",
  "rusqlite",
@@ -706,6 +708,7 @@ dependencies = [
  "hex",
  "md5",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

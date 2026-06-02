@@ -39,8 +39,8 @@ fn is_dangerous_command(command: &str) -> bool {
 impl Tool for ExecTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "exec",
-            description: "Execute a shell command",
+            name: "exec".to_string(),
+            description: "Execute a shell command".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

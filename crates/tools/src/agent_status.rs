@@ -11,8 +11,8 @@ pub struct AgentStatusTool;
 impl Tool for AgentStatusTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "agent_status",
-            description: "Inspect configured agent nodes. You MUST provide `action`. action='list': no extra params, returns all agents. action='summary': no extra params, returns compact overview. action='channels': no extra params, returns channel/account routing. action='get': requires `agent_id`.",
+            name: "agent_status".to_string(),
+            description: "Inspect configured agent nodes. You MUST provide `action`. action='list': no extra params, returns all agents. action='summary': no extra params, returns compact overview. action='channels': no extra params, returns channel/account routing. action='get': requires `agent_id`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

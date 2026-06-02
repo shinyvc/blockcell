@@ -52,10 +52,11 @@ pub(super) async fn handle_files_list(
         return Json(serde_json::json!({ "error": "Not a directory" }));
     }
 
+    // 使用 tokio::fs 异步 API 避免阻塞工作线程
     let mut entries = Vec::new();
-    if let Ok(dir) = std::fs::read_dir(&target) {
-        for entry in dir.flatten() {
-            let meta = entry.metadata().ok();
+    if let Ok(mut dir) = tokio::fs::read_dir(&target).await {
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            let meta = entry.metadata().await.ok();
             let name = entry.file_name().to_string_lossy().to_string();
             let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
             let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -222,7 +223,7 @@ pub(super) async fn handle_files_content(
     };
 
     if is_binary {
-        match std::fs::read(&target) {
+        match tokio::fs::read(&target).await {
             Ok(bytes) => {
                 use base64::Engine;
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -242,7 +243,7 @@ pub(super) async fn handle_files_content(
                 .into_response(),
         }
     } else {
-        match std::fs::read_to_string(&target) {
+        match tokio::fs::read_to_string(&target).await {
             Ok(content) => Json(serde_json::json!({
                 "path": params.path,
                 "encoding": "utf-8",
@@ -283,7 +284,7 @@ pub(super) async fn handle_files_download(
         return (StatusCode::FORBIDDEN, "Access denied").into_response();
     }
 
-    match std::fs::read(&target) {
+    match tokio::fs::read(&target).await {
         Ok(bytes) => {
             let filename = target
                 .file_name()
@@ -383,7 +384,7 @@ pub(super) async fn handle_files_serve(
         _ => "application/octet-stream",
     };
 
-    match std::fs::read(&target) {
+    match tokio::fs::read(&target).await {
         Ok(bytes) => {
             let headers = [
                 (header::CONTENT_TYPE, content_type.to_string()),

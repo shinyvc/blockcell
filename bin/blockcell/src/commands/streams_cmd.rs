@@ -3,7 +3,7 @@ use serde_json::Value;
 
 /// List all stream subscriptions (from persisted rules).
 pub async fn list() -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let subs_file = paths.workspace().join("streams").join("subscriptions.json");
 
     if !subs_file.exists() {
@@ -54,7 +54,7 @@ pub async fn list() -> anyhow::Result<()> {
 
 /// Show details for a specific subscription.
 pub async fn status(sub_id: &str) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let subs_file = paths.workspace().join("streams").join("subscriptions.json");
 
     if !subs_file.exists() {
@@ -86,7 +86,7 @@ pub async fn status(sub_id: &str) -> anyhow::Result<()> {
 
 /// Remove a subscription from the persisted rules.
 pub async fn stop(sub_id: &str) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let subs_file = paths.workspace().join("streams").join("subscriptions.json");
 
     if !subs_file.exists() {
@@ -118,7 +118,7 @@ pub async fn stop(sub_id: &str) -> anyhow::Result<()> {
 
 /// Restore all persisted subscriptions.
 pub async fn restore() -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let subs_file = paths.workspace().join("streams").join("subscriptions.json");
 
     if !subs_file.exists() {

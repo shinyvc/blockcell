@@ -23,7 +23,12 @@ pub struct OllamaProvider {
 }
 
 impl OllamaProvider {
-    pub fn new(api_base: Option<&str>, model: &str, max_tokens: u32, temperature: f32) -> Self {
+    pub fn new(
+        api_base: Option<&str>,
+        model: &str,
+        max_tokens: u32,
+        temperature: f32,
+    ) -> Result<Self> {
         Self::new_with_proxy(api_base, model, max_tokens, temperature, None, None, &[])
     }
 
@@ -35,7 +40,7 @@ impl OllamaProvider {
         provider_proxy: Option<&str>,
         global_proxy: Option<&str>,
         no_proxy: &[String],
-    ) -> Self {
+    ) -> Result<Self> {
         let resolved_base = api_base
             .unwrap_or(DEFAULT_OLLAMA_BASE)
             .trim_end_matches('/')
@@ -47,14 +52,14 @@ impl OllamaProvider {
             no_proxy,
             &resolved_base,
             Duration::from_secs(300),
-        );
-        Self {
+        )?;
+        Ok(Self {
             client,
             api_base: resolved_base,
             model: model.to_string(),
             max_tokens,
             temperature,
-        }
+        })
     }
 
     /// Strip "ollama/" prefix from model names.
@@ -134,34 +139,7 @@ impl OllamaProvider {
     /// Build a text description of tools to inject into the system prompt
     /// for models that don't support native tool calling.
     fn build_tools_prompt(tools: &[Value]) -> String {
-        let mut s = String::new();
-        s.push_str("\n\n## Available Tools\n");
-        s.push_str("You MUST use tools to accomplish tasks. To call a tool, output a `<tool_call>` block with JSON inside.\n");
-        s.push_str("You may call multiple tools in one response. Each call must be a separate `<tool_call>` block.\n\n");
-        s.push_str("Format:\n```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param1\": \"value1\"}}\n</tool_call>\n```\n\n");
-        s.push_str("Tools:\n");
-
-        for tool in tools {
-            if let Some(func) = tool.get("function") {
-                let name = func
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let desc = func
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let params = func.get("parameters").cloned().unwrap_or(Value::Null);
-                s.push_str(&format!("### {}\n{}\n", name, desc));
-                if !params.is_null() {
-                    if let Ok(params_str) = serde_json::to_string_pretty(&params) {
-                        s.push_str(&format!("Parameters: {}\n", params_str));
-                    }
-                }
-                s.push('\n');
-            }
-        }
-        s
+        crate::prompt_utils::build_tools_prompt(tools)
     }
 
     /// Parse `<tool_call>...</tool_call>` blocks from text content.

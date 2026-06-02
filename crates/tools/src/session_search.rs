@@ -9,8 +9,8 @@ pub struct SessionSearchTool;
 impl Tool for SessionSearchTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "session_search",
-            description: "Search the captured session/episode context read-only during background learning review before deciding what durable memory or skill updates are justified.",
+            name: "session_search".to_string(),
+            description: "Search the captured session/episode context read-only during background learning review before deciding what durable memory or skill updates are justified.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -76,6 +76,7 @@ mod tests {
     fn tool_context(search: Option<Arc<dyn crate::SessionSearchOps + Send + Sync>>) -> ToolContext {
         ToolContext {
             workspace: PathBuf::from("/tmp/workspace"),
+            base: PathBuf::from("/tmp/blockcell"),
             builtin_skills_dir: None,
             active_skill_dir: None,
             session_key: "cli:test".to_string(),

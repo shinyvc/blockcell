@@ -1,0 +1,1160 @@
+//! 学习与记忆协调 — Review 触发、Ghost Learning 边界捕获、Memory flush
+//!
+//! 包含来自 AgentRuntime 的 review 生成、学习边界捕获、
+//! 记忆刷新和 ghost learning 相关方法。
+
+use super::{
+    active_skill_name_from_metadata, chat_message_text, disable_skill_toggle,
+    persist_ghost_learning_boundary_with_decision, truncate_str, LearningReviewCompletionGuard,
+    MainSessionTarget, ReviewMode, COMBINED_REVIEW_PROMPT, LEARNED_SKILL_DISABLE_THRESHOLD,
+    MEMORY_REVIEW_PROMPT, SESSION_ACTIVE_SKILL_CORRECTIONS_KEY, SESSION_ACTIVE_SKILL_NAME_KEY,
+    SKILL_REVIEW_PROMPT,
+};
+use crate::ghost_background_review::spawn_pending_background_reviews;
+use crate::ghost_learning::{
+    estimate_turn_complexity_score, GhostLearningBoundary, GhostLearningBoundaryKind,
+};
+use crate::memory_file_store::MemoryFileStore;
+use blockcell_core::types::{ChatMessage, ToolCallRequest};
+use blockcell_core::Result;
+use blockcell_core::{scope_abort_token, InboundMessage, OutboundMessage};
+use blockcell_providers::{CallResult, ProviderPool};
+use blockcell_storage::ghost_ledger::GhostEpisodeSource;
+use blockcell_tools::{CapabilityRegistryHandle, CoreEvolutionHandle, ToolContext, ToolRegistry};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tracing::{debug, info, warn};
+
+impl super::AgentRuntime {
+    pub(super) fn spawn_review(
+        &self,
+        mode: ReviewMode,
+        messages: Vec<ChatMessage>,
+        notify_channel: Option<(String, String)>,
+    ) {
+        let label = match mode {
+            ReviewMode::Skill => "skill_nudge_review",
+            ReviewMode::Memory => "memory_nudge_review",
+            ReviewMode::Combined => "combined_nudge_review",
+        };
+        tracing::info!("[Nudge] 阈值到达, 启动后台 {:?} Review", mode);
+
+        let skills_dir = self.paths.skills_dir();
+        // 克隆一份供 ForkedAgent 使用（spawn_blocking 会 move 原始值）
+        let skills_dir_clone = skills_dir.clone();
+        let builtin_skills_dir = self.paths.builtin_skills_dir();
+        let external_skills_dirs = vec![builtin_skills_dir];
+        let provider_pool = self.provider_pool.clone();
+        let model = self.config.agents.defaults.model.clone();
+        let max_review_rounds = self.config.self_improve.review.max_rounds;
+        let memory_store = self.memory_store.clone();
+        let memory_file_store = self.memory_file_store.clone();
+        let skill_file_store = self.skill_file_store.clone();
+        let skill_mutex = self.skill_mutex.clone();
+        let mode_clone = mode.clone();
+        // 与 Hermes 一致: review_agent 继承主 agent 的 system prompt
+        let system_prompt = self.context_builder.build_system_prompt();
+        let outbound_tx = self.outbound_tx.clone();
+        // 共享 skill_index_summary Arc, 供后台 Review 完成后刷新
+        let skill_index_cache = self.context_builder.skill_index_summary_arc();
+        let learning_coordinator = Arc::clone(&self.learning_coordinator);
+        // 继承主 agent 的 abort token，确保用户取消任务时后台 review 也被取消
+        let review_abort_token = self.abort_token.child();
+
+        tokio::spawn(async move {
+            // 用 scope_abort_token 包裹整个 review 逻辑，取消时立即退出
+            scope_abort_token(review_abort_token, async {
+                let _review_completion_guard = LearningReviewCompletionGuard::new(learning_coordinator);
+
+            // 构建 Skill 索引（仅在 Skill/Combined 模式下需要）
+            let skill_summary = match mode_clone {
+                ReviewMode::Memory => String::new(),
+                ReviewMode::Skill | ReviewMode::Combined => {
+                    let index = match tokio::task::spawn_blocking(move || {
+                        if skills_dir.exists() {
+                            crate::skill_index::SkillIndex::build_from_dir(&skills_dir)
+                        } else {
+                            crate::skill_index::SkillIndex::new()
+                        }
+                    })
+                    .await
+                    {
+                        Ok(idx) => idx,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "[Nudge] 构建索引任务失败");
+                            return;
+                        }
+                    };
+
+                    if index.entries().is_empty() {
+                        tracing::info!("[Nudge] 无可用 Skill, 跳过 Skill 部分");
+                        String::new()
+                    } else {
+                        index.to_prompt_summary()
+                    }
+                }
+            };
+
+            // 构建 Review 提示词 (与 Hermes 一致: 选择对应模式的 prompt)
+            let review_prompt = match mode_clone {
+                ReviewMode::Skill => SKILL_REVIEW_PROMPT.to_string(),
+                ReviewMode::Memory => MEMORY_REVIEW_PROMPT.to_string(),
+                ReviewMode::Combined => COMBINED_REVIEW_PROMPT.to_string(),
+            };
+
+            // 构建工具权限
+            // 与 Hermes 一致: review_agent 继承主 agent 的 system prompt，不设自定义系统提示词
+            // Hermes: review_agent = AIAgent(model=self.model, ...) → 使用默认 system prompt
+            let can_use_tool = match mode_clone {
+                ReviewMode::Skill => crate::forked::create_skill_review_can_use_tool(),
+                ReviewMode::Memory => crate::forked::create_memory_review_can_use_tool(),
+                ReviewMode::Combined => crate::forked::create_combined_review_can_use_tool(),
+            };
+
+            // 构建工具 Schema (传给 provider.chat() 让 LLM 知道可用工具)
+            let tool_schemas = match mode_clone {
+                ReviewMode::Skill => crate::forked::build_skill_review_tool_schemas(),
+                ReviewMode::Memory => crate::forked::build_memory_review_tool_schemas(),
+                ReviewMode::Combined => crate::forked::build_combined_review_tool_schemas(),
+            };
+
+            // 构建 ForkedAgent 参数 (与 Hermes 一致: 传入对话历史 + review prompt 作为用户消息)
+            // Hermes: review_agent.run_conversation(user_message=prompt, conversation_history=messages_snapshot)
+            let mut review_messages = messages.clone();
+            // 如果有 Skill 索引，在 prompt 前附加
+            let full_prompt = if skill_summary.is_empty() {
+                review_prompt
+            } else {
+                format!("{}\n\n## Existing Skills\n{}", review_prompt, skill_summary)
+            };
+            review_messages.push(ChatMessage::user(&full_prompt));
+
+            let cache_safe = crate::forked::CacheSafeParams::new(system_prompt, &model);
+            let mut params =
+                crate::forked::ForkedAgentParams::new(provider_pool, review_messages, cache_safe)
+                    .with_can_use_tool(can_use_tool)
+                    .with_tool_schemas(tool_schemas)
+                    .with_query_source("review")
+                    .with_fork_label(label)
+                    .with_max_turns(max_review_rounds);
+
+            // 传入 memory_store（Memory/Combined 模式需要）
+            if let Some(store) = memory_store {
+                params = params.with_memory_store(store);
+            }
+            if let Some(store) = memory_file_store {
+                params = params.with_memory_file_store(store);
+            }
+            if let Some(store) = skill_file_store {
+                params = params.with_skill_file_store(store);
+            }
+
+            // 传入 skill_mutex（防止 review agent 与主 agent 并发修改同一 Skill）
+            params = params.with_skill_mutex(skill_mutex);
+
+            // 传入 skills_dir（Skill/Combined 模式需要，否则 skill_manage/list_skills 无法工作）
+            match mode_clone {
+                ReviewMode::Skill | ReviewMode::Combined => {
+                    // skills_dir 已在上方被 move 到 spawn_blocking 中用于构建索引，
+                    // 但 ForkedAgent 也需要它来执行 skill_manage 工具。
+                    // 由于 PathBuf 实现了 Clone，我们在 spawn_blocking 之前克隆一份。
+                    // 注意: 此处 skills_dir_clone 是从外层闭包捕获的。
+                    params = params.with_skills_dir(skills_dir_clone.clone());
+                    // 传入 external_skills_dirs (builtin_skills_dir) 以支持跨目录搜索
+                    params = params.with_external_skills_dirs(external_skills_dirs.clone());
+                }
+                ReviewMode::Memory => {}
+            }
+
+            match crate::forked::run_forked_agent(params).await {
+                Ok(result) => {
+                    if result.truncated {
+                        tracing::warn!(mode = ?mode_clone, "[Nudge] Review 结果被截断，可能丢失部分信息");
+                    }
+                    tracing::info!(
+                        mode = ?mode_clone,
+                        tokens_out = result.total_usage.output_tokens,
+                        "[Nudge] Review 完成"
+                    );
+                    if let Some(content) = &result.final_content {
+                        let preview: String = content.chars().take(200).collect();
+                        tracing::info!("[Nudge] Review 结果: {}", preview);
+                    }
+                    // 提取 Review 摘要并通知用户 (与 Hermes 一致)
+                    if let Some((channel, chat_id)) = &notify_channel {
+                        if let Some(tx) = &outbound_tx {
+                            if let Some(summary) = Self::extract_review_summary(&result.messages) {
+                                let outbound = OutboundMessage::new(channel, chat_id, &summary);
+                                let _ = tx.send(outbound).await;
+                                tracing::info!("[Nudge] Review 通知已发送: {}", summary);
+                            }
+                        }
+                    }
+
+                    // 刷新父 Agent 的 Skill 索引缓存 (后台 Review 可能创建/修改了 Skill)
+                    // 与 Hermes 一致: 系统提示词在下次 LLM 调用时反映最新的 Skill 列表
+                    if matches!(mode_clone, ReviewMode::Skill | ReviewMode::Combined) {
+                        if let Ok(index) = tokio::task::spawn_blocking(move || {
+                            if skills_dir_clone.exists() {
+                                crate::skill_index::SkillIndex::build_from_dir(&skills_dir_clone)
+                            } else {
+                                crate::skill_index::SkillIndex::new()
+                            }
+                        })
+                        .await
+                        {
+                            let mut cache =
+                                skill_index_cache.write().unwrap_or_else(|e| e.into_inner());
+                            *cache = if index.entries().is_empty() {
+                                None
+                            } else {
+                                Some(index.to_prompt_summary())
+                            };
+                            tracing::info!("[Nudge] Skill 索引缓存已刷新");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(mode = ?mode_clone, error = %e, "[Nudge] Review 失败");
+                }
+            }
+        }).await;
+        });
+    }
+
+    /// 从 Review Agent 的 tool 结果中提取操作摘要 (参考 Hermes 行为)
+    ///
+    /// Hermes 扫描 review_agent._session_messages 中的 tool 结果,
+    /// 查找 created/updated/deleted 等操作，汇总为用户可见的摘要。
+    fn extract_review_summary(messages: &[ChatMessage]) -> Option<String> {
+        let mut actions: Vec<String> = Vec::new();
+
+        for msg in messages {
+            if msg.role != "tool" {
+                continue;
+            }
+            let content = match msg.content.as_str() {
+                Some(c) => c,
+                None => continue,
+            };
+            // 解析 JSON (skill_manage 和 memory 工具返回 JSON，但格式不同)
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(content) {
+                // ── skill_manage 结果: {"success": true, "message": "Skill 'xxx' created", ...} ──
+                let is_skill_success = data
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                if is_skill_success {
+                    if let Some(msg_text) = data.get("message").and_then(|v| v.as_str()) {
+                        let lower = msg_text.to_lowercase();
+                        if lower.contains("created")
+                            || lower.contains("deleted")
+                            || lower.contains("updated")
+                            || lower.contains("patched")
+                            || lower.contains("edited")
+                            || lower.contains("added")
+                            || lower.contains("removed")
+                            || lower.contains("replaced")
+                        {
+                            actions.push(msg_text.to_string());
+                        }
+                    }
+
+                    // memory 工具 (Hermes 格式): {"target": "memory", "success": true, ...}
+                    if let Some(target) = data.get("target").and_then(|v| v.as_str()) {
+                        if !target.is_empty() && data.get("message").is_none() {
+                            let label = match target {
+                                "memory" => "Memory updated",
+                                "user" => "User profile updated",
+                                other => other,
+                            };
+                            actions.push(label.to_string());
+                        }
+                    }
+                }
+
+                // ── memory_upsert 结果: {"status": "saved", "item": {...}} ──
+                if data.get("status").and_then(|v| v.as_str()) == Some("saved") {
+                    actions.push("Memory updated".to_string());
+                }
+
+                // ── memory_forget 结果: {"action": "delete", "deleted": true, ...} ──
+                match data.get("action").and_then(|v| v.as_str()) {
+                    Some("delete") => {
+                        if data
+                            .get("deleted")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
+                            actions.push("Memory updated".to_string());
+                        }
+                    }
+                    Some("batch_delete") => {
+                        let count = data
+                            .get("deleted_count")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        if count > 0 {
+                            actions.push(format!("Memory updated ({} items forgotten)", count));
+                        }
+                    }
+                    Some("restore") => {
+                        if data
+                            .get("restored")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
+                            actions.push("Memory item restored".to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if actions.is_empty() {
+            None
+        } else {
+            Some(format!("\u{1F4BE} {}", actions.join(" \u{00B7} ")))
+        }
+    }
+
+    /// 在上下文压缩前，让 LLM 保存重要信息到 Memory Store
+    ///
+    /// 参考 Hermes `flush_memories()` — 使用 ForkedAgent 执行，
+    /// 只允许 memory_upsert 和 memory_query 工具。
+    /// 与 Hermes 一致: 传入完整对话历史 + flush 提示作为用户消息
+    pub(super) async fn flush_memory_store_before_compact(&self, messages: &[ChatMessage]) {
+        if self.memory_file_store.is_none() {
+            tracing::debug!("[flush] 无 Memory Store, 跳过 flush");
+            return;
+        }
+
+        tracing::info!("[flush] 上下文压缩前保存重要信息...");
+
+        // 与 Hermes 一致: 传入完整对话历史，追加 flush 提示作为用户消息
+        // Hermes: messages + user_message="[System: The session is being compressed...]"
+        let mut flush_messages = messages.to_vec();
+        flush_messages.push(ChatMessage::user(
+            "[System: The session is being compressed. \
+             Save anything worth remembering — prioritize user preferences, \
+             corrections, and recurring patterns over task-specific details.]",
+        ));
+
+        let model = self.config.agents.defaults.model.clone();
+        // 与 Hermes 一致: flush_agent 继承主 agent 的 system prompt
+        let system_prompt = self.context_builder.build_system_prompt();
+        let cache_safe = crate::forked::CacheSafeParams::new(&system_prompt, &model);
+
+        let can_use_tool = crate::forked::create_flush_can_use_tool();
+        let tool_schemas = crate::forked::build_flush_tool_schemas();
+
+        let mut params = crate::forked::ForkedAgentParams::new(
+            self.provider_pool.clone(),
+            flush_messages,
+            cache_safe,
+        )
+        .with_can_use_tool(can_use_tool)
+        .with_tool_schemas(tool_schemas)
+        .with_query_source("memory_flush")
+        .with_fork_label("memory_flush")
+        .with_max_turns(1); // 与 Hermes 一致: flush 仅单次 API 调用, 无需多轮
+
+        if let Some(store) = &self.memory_store {
+            params = params.with_memory_store(store.clone());
+        }
+        if let Some(store) = &self.memory_file_store {
+            params = params.with_memory_file_store(store.clone());
+        }
+
+        match crate::forked::run_forked_agent(params).await {
+            Ok(result) => {
+                if result.truncated {
+                    tracing::warn!("[flush] Memory flush 结果被截断");
+                }
+                tracing::info!(
+                    tokens_out = result.total_usage.output_tokens,
+                    "[flush] Memory flush 完成"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "[flush] Memory flush 失败, 继续压缩");
+            }
+        }
+    }
+
+    /// Initialize and load Layer 5 memory injector (7-layer memory system).
+    /// This loads the four memory files (user.md, project.md, feedback.md, reference.md)
+    /// from the memory directory and makes them available for system prompt injection.
+    pub async fn init_memory_injector(&mut self) -> std::io::Result<()> {
+        use crate::auto_memory::{
+            ensure_memory_dir, get_memory_dir, InjectionConfig, MemoryInjector,
+        };
+
+        // Ensure the memory directory and template files exist on disk
+        // before loading. On a fresh install the directory is absent,
+        // which would cause the permission gate (is_auto_mem_path) to
+        // deny writes and the forked agent to fail silently.
+        match ensure_memory_dir(&self.paths.base).await {
+            Ok(()) => {
+                info!(path = %self.paths.base.display(), "[layer5] Memory directory ensured on disk");
+            }
+            Err(e) => {
+                warn!(path = %self.paths.base.display(), error = %e, "[layer5] Failed to ensure memory directory");
+            }
+        }
+
+        // Use the config base directory (e.g., ~/.blockcell/memory/)
+        let memory_dir = get_memory_dir(&self.paths.base);
+        let mut injector = MemoryInjector::new(InjectionConfig::from(
+            self.config.memory.memory_system.layer5.clone(),
+        ));
+
+        // Try to load memory files; log warning if directory doesn't exist
+        match injector.load_memories(&memory_dir).await {
+            Ok(()) => {
+                let count = injector.cache_size();
+                if count > 0 {
+                    info!(
+                        memory_dir = %memory_dir.display(),
+                        files_loaded = count,
+                        "[Layer 5] Memory injector initialized with {} memory files",
+                        count
+                    );
+                } else {
+                    debug!(
+                        memory_dir = %memory_dir.display(),
+                        "[Layer 5] Memory injector initialized (no memory files found)"
+                    );
+                }
+                self.context_builder.set_memory_injector(injector);
+            }
+            Err(e) => {
+                // Non-fatal: memory injection is optional enhancement
+                warn!(
+                    memory_dir = %memory_dir.display(),
+                    error = %e,
+                    "[Layer 5] Failed to load memory files, continuing without persistent memory injection"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if memory injector cache needs refresh.
+    pub fn memory_injector_needs_reload(&self) -> bool {
+        self.memory_injector_needs_reload
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Signal that memory injector cache needs refresh (called by background tasks).
+    pub fn signal_memory_injector_reload(&self) {
+        self.memory_injector_needs_reload
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Reload memory injector cache if needed.
+    /// This should be called at the start of each conversation turn.
+    pub async fn reload_memory_injector_if_needed(&mut self) -> std::io::Result<()> {
+        if !self.memory_injector_needs_reload() {
+            return Ok(());
+        }
+
+        use crate::auto_memory::{get_memory_dir, InjectionConfig, MemoryInjector};
+
+        let memory_dir = get_memory_dir(&self.paths.base);
+        let mut injector = MemoryInjector::new(InjectionConfig::from(
+            self.config.memory.memory_system.layer5.clone(),
+        ));
+        injector.load_memories(&memory_dir).await?;
+
+        let count = injector.cache_size();
+        info!(
+            memory_dir = %memory_dir.display(),
+            files_loaded = count,
+            "[Layer 5] Memory injector cache reloaded after extraction"
+        );
+
+        self.context_builder.set_memory_injector(injector);
+        self.memory_injector_needs_reload
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Get a clone of the reload flag for use in background tasks.
+    pub fn memory_injector_reload_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.memory_injector_needs_reload)
+    }
+
+    /// Set the capability registry handle for tools.
+    pub fn set_capability_registry(&mut self, registry: CapabilityRegistryHandle) {
+        self.capability_registry = Some(registry);
+    }
+
+    /// Set the core evolution engine handle for tools.
+    pub fn set_core_evolution(&mut self, core_evo: CoreEvolutionHandle) {
+        self.core_evolution = Some(core_evo);
+    }
+
+    pub fn set_evolution_worker(
+        &mut self,
+        worker: Arc<dyn crate::capability_adapter::EvolutionNotifier>,
+    ) {
+        self.evolution_worker = Some(worker);
+    }
+
+    pub fn set_skill_evolution_worker(
+        &mut self,
+        worker: Arc<dyn crate::capability_adapter::EvolutionNotifier>,
+    ) {
+        self.skill_evolution_worker = Some(worker);
+    }
+
+    pub fn set_evolution_workflow_store(
+        &mut self,
+        store: Arc<blockcell_storage::EvolutionWorkflowStore>,
+    ) {
+        self.evolution_workflow_store = Some(store);
+    }
+
+    /// Deprecated: MCP tools are now injected before runtime construction via the shared MCP manager.
+    pub async fn mount_mcp_servers(&mut self) {}
+
+    pub(super) fn ghost_learning_enabled(&self) -> bool {
+        self.config.agents.ghost.learning.enabled
+    }
+
+    pub(super) fn spawn_pending_ghost_background_reviews(&self) {
+        if self.config.agents.ghost.learning.enabled {
+            spawn_pending_background_reviews(
+                self.paths.clone(),
+                Arc::clone(&self.provider_pool),
+                8,
+                self.config.clone(),
+            );
+        }
+    }
+
+    fn persist_ghost_learning_boundary(
+        &self,
+        boundary: GhostLearningBoundary,
+        sources: Vec<GhostEpisodeSource>,
+    ) -> Result<Option<String>> {
+        if !self.ghost_learning_enabled() {
+            return Ok(None);
+        }
+        // 从当前配置刷新 ghost 策略（支持热重载）
+        self.learning_coordinator
+            .update_ghost_policy(&self.config.agents.ghost.learning);
+        let decision = self.learning_coordinator.ghost_decide(&boundary);
+        persist_ghost_learning_boundary_with_decision(
+            &self.config,
+            &self.paths,
+            boundary,
+            sources,
+            decision,
+        )
+    }
+
+    fn detect_correction_signal_count(user_text: &str) -> u32 {
+        let lower = user_text.to_lowercase();
+        let cues = [
+            "correct", "fix", "instead", "prefer", "wrong", "更正", "改成", "修正", "不要", "优先",
+            "正确",
+        ];
+        if cues.iter().any(|cue| lower.contains(cue)) {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn detect_preference_correction_count(user_text: &str) -> u32 {
+        let lower = user_text.to_lowercase();
+        let cues = ["prefer", "use ", "instead", "优先", "改成", "不要", "以后"];
+        if cues.iter().any(|cue| lower.contains(cue)) {
+            1
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn apply_learned_skill_negative_feedback(
+        &self,
+        session_metadata: &mut serde_json::Value,
+        msg: &InboundMessage,
+    ) -> Result<()> {
+        let correction_count = u32::from(
+            Self::detect_correction_signal_count(&msg.content)
+                + Self::detect_preference_correction_count(&msg.content)
+                > 0,
+        );
+        if correction_count == 0 {
+            return Ok(());
+        }
+        let Some(skill_name) = active_skill_name_from_metadata(session_metadata) else {
+            return Ok(());
+        };
+        let current = session_metadata
+            .get(SESSION_ACTIVE_SKILL_CORRECTIONS_KEY)
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as u32;
+        let next = current.saturating_add(correction_count);
+        if !session_metadata.is_object() {
+            *session_metadata = serde_json::json!({});
+        }
+        if let Some(map) = session_metadata.as_object_mut() {
+            map.insert(
+                SESSION_ACTIVE_SKILL_CORRECTIONS_KEY.to_string(),
+                serde_json::Value::Number(next.into()),
+            );
+        }
+        if next >= LEARNED_SKILL_DISABLE_THRESHOLD {
+            disable_skill_toggle(&self.paths, &skill_name)?;
+            if let Some(map) = session_metadata.as_object_mut() {
+                map.remove(SESSION_ACTIVE_SKILL_NAME_KEY);
+                map.insert(
+                    "auto_disabled_skill".to_string(),
+                    serde_json::Value::String(skill_name.clone()),
+                );
+            }
+            warn!(
+                skill = %skill_name,
+                corrections = next,
+                "Auto-disabled learned skill after repeated correction"
+            );
+        }
+        Ok(())
+    }
+
+    fn latest_role_text(messages: &[ChatMessage], role: &str) -> Option<String> {
+        messages
+            .iter()
+            .rev()
+            .find(|msg| msg.role == role)
+            .map(chat_message_text)
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+    }
+
+    pub(super) fn capture_turn_end_learning_boundary(
+        &self,
+        msg: &InboundMessage,
+        history: &[ChatMessage],
+        final_response: &str,
+        tool_call_counts: &HashMap<String, u32>,
+        success: bool,
+    ) -> Result<Option<String>> {
+        if !self.ghost_learning_enabled()
+            || matches!(
+                msg.channel.as_str(),
+                "ghost" | "cron" | "system" | "subagent"
+            )
+        {
+            return Ok(None);
+        }
+
+        let final_text = final_response.trim();
+        if final_text.is_empty() {
+            return Ok(None);
+        }
+
+        let boundary = GhostLearningBoundary {
+            kind: GhostLearningBoundaryKind::TurnEnd,
+            session_key: Some(msg.session_key()),
+            subject_key: Some(format!("chat:{}:sender:{}", msg.chat_id, msg.sender_id)),
+            user_intent_summary: msg.content.clone(),
+            assistant_outcome_summary: final_text.to_string(),
+            tool_call_count: tool_call_counts.values().copied().sum(),
+            memory_write_count: 0,
+            correction_count: Self::detect_correction_signal_count(&msg.content),
+            preference_correction_count: Self::detect_preference_correction_count(&msg.content),
+            success,
+            complexity_score: estimate_turn_complexity_score(&msg.content),
+            reusable_lesson: None,
+        };
+
+        let turn_count = history
+            .iter()
+            .filter(|message| message.role == "user")
+            .count() as u32;
+        // 从当前配置刷新 ghost 策略（支持热重载）
+        self.learning_coordinator
+            .update_ghost_policy(&self.config.agents.ghost.learning);
+        let decision = self
+            .learning_coordinator
+            .ghost_decide_with_turn_count(&boundary, Some(turn_count));
+
+        persist_ghost_learning_boundary_with_decision(
+            &self.config,
+            &self.paths,
+            boundary,
+            vec![
+                GhostEpisodeSource {
+                    source_type: "session".to_string(),
+                    source_key: msg.session_key(),
+                    role: "primary".to_string(),
+                },
+                GhostEpisodeSource {
+                    source_type: "chat".to_string(),
+                    source_key: msg.chat_id.clone(),
+                    role: "context".to_string(),
+                },
+                GhostEpisodeSource {
+                    source_type: "history".to_string(),
+                    source_key: history.len().to_string(),
+                    role: "summary".to_string(),
+                },
+            ],
+            decision,
+        )
+    }
+
+    pub(super) async fn capture_pre_compress_learning_boundary(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+    ) -> Result<Option<String>> {
+        if !self.ghost_learning_enabled() {
+            return Ok(None);
+        }
+        let memory_write_count = self
+            .flush_memories(session_key, messages, "pre_compress")
+            .await?;
+        let provider_pre_compress_context = if let Some(manager) =
+            self.ghost_memory_lifecycle.as_ref()
+        {
+            let message_texts = messages.iter().map(chat_message_text).collect::<Vec<_>>();
+            let provider_block = manager.on_pre_compress(&message_texts, session_key);
+            if !provider_block.trim().is_empty() {
+                debug!(session_key = %session_key, "Ghost memory provider contributed pre-compress context");
+                Some(truncate_str(&provider_block, 1200))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let boundary = GhostLearningBoundary {
+            kind: GhostLearningBoundaryKind::PreCompress,
+            session_key: Some(session_key.to_string()),
+            subject_key: Some(format!("session:{}", session_key)),
+            user_intent_summary: Self::latest_role_text(messages, "user")
+                .unwrap_or_else(|| "pre-compress boundary".to_string()),
+            assistant_outcome_summary: Self::latest_role_text(messages, "assistant")
+                .unwrap_or_else(|| "conversation is about to compact".to_string()),
+            tool_call_count: messages
+                .iter()
+                .filter_map(|msg| msg.tool_calls.as_ref().map(|calls| calls.len() as u32))
+                .sum(),
+            memory_write_count,
+            correction_count: 0,
+            preference_correction_count: 0,
+            success: true,
+            complexity_score: 0,
+            reusable_lesson: provider_pre_compress_context,
+        };
+
+        self.persist_ghost_learning_boundary(
+            boundary,
+            vec![GhostEpisodeSource {
+                source_type: "session".to_string(),
+                source_key: session_key.to_string(),
+                role: "primary".to_string(),
+            }],
+        )
+    }
+
+    pub(super) async fn capture_main_session_end_learning_boundary(
+        &self,
+    ) -> Result<Option<String>> {
+        if !self.ghost_learning_enabled() {
+            return Ok(None);
+        }
+
+        let Some(target) = self.main_session_target.as_ref() else {
+            return Ok(None);
+        };
+        let history = self.session_store.load(&target.session_key)?;
+        if history.is_empty() {
+            return Ok(None);
+        }
+        let memory_write_count = self
+            .flush_memories(&target.session_key, &history, "session_end")
+            .await?;
+        let provider_session_end_context =
+            if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
+                let message_texts = history.iter().map(chat_message_text).collect::<Vec<_>>();
+                manager.on_session_end(&message_texts, &target.session_key);
+                let provider_block =
+                    manager.on_session_boundary_context(&message_texts, &target.session_key);
+                if !provider_block.trim().is_empty() {
+                    Some(truncate_str(&provider_block, 1200))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        let boundary = GhostLearningBoundary {
+            kind: GhostLearningBoundaryKind::SessionEnd,
+            session_key: Some(target.session_key.clone()),
+            subject_key: Some(format!("chat:{}", target.chat_id)),
+            user_intent_summary: Self::latest_role_text(&history, "user")
+                .unwrap_or_else(|| "session end".to_string()),
+            assistant_outcome_summary: Self::latest_role_text(&history, "assistant")
+                .unwrap_or_else(|| "session end boundary".to_string()),
+            tool_call_count: history
+                .iter()
+                .filter_map(|msg| msg.tool_calls.as_ref().map(|calls| calls.len() as u32))
+                .sum(),
+            memory_write_count,
+            correction_count: 0,
+            preference_correction_count: 0,
+            success: true,
+            complexity_score: 0,
+            reusable_lesson: provider_session_end_context,
+        };
+
+        self.persist_ghost_learning_boundary(
+            boundary,
+            vec![GhostEpisodeSource {
+                source_type: "session".to_string(),
+                source_key: target.session_key.clone(),
+                role: "primary".to_string(),
+            }],
+        )
+    }
+
+    pub(super) async fn capture_session_rotate_learning_boundary(
+        &self,
+        previous: &MainSessionTarget,
+        next_msg: &InboundMessage,
+    ) -> Result<Option<String>> {
+        if !self.ghost_learning_enabled() {
+            return Ok(None);
+        }
+
+        let history = self.session_store.load(&previous.session_key)?;
+        if history.is_empty() {
+            return Ok(None);
+        }
+        let memory_write_count = self
+            .flush_memories(&previous.session_key, &history, "session_rotate")
+            .await?;
+        let provider_session_end_context =
+            if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
+                let message_texts = history.iter().map(chat_message_text).collect::<Vec<_>>();
+                manager.on_session_end(&message_texts, &previous.session_key);
+                let provider_block =
+                    manager.on_session_boundary_context(&message_texts, &previous.session_key);
+                if !provider_block.trim().is_empty() {
+                    Some(truncate_str(&provider_block, 1200))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        let boundary = GhostLearningBoundary {
+            kind: GhostLearningBoundaryKind::SessionRotate,
+            session_key: Some(previous.session_key.clone()),
+            subject_key: Some(format!("chat:{}", previous.chat_id)),
+            user_intent_summary: Self::latest_role_text(&history, "user")
+                .unwrap_or_else(|| "session rotate".to_string()),
+            assistant_outcome_summary: Self::latest_role_text(&history, "assistant")
+                .unwrap_or_else(|| "session rotated to a new active chat".to_string()),
+            tool_call_count: history
+                .iter()
+                .filter_map(|msg| msg.tool_calls.as_ref().map(|calls| calls.len() as u32))
+                .sum(),
+            memory_write_count,
+            correction_count: 0,
+            preference_correction_count: 0,
+            success: true,
+            complexity_score: 0,
+            reusable_lesson: Some(match provider_session_end_context {
+                Some(context) => format!(
+                    "Switched active session from {} to {}\n\n{}",
+                    previous.chat_id, next_msg.chat_id, context
+                ),
+                None => format!(
+                    "Switched active session from {} to {}",
+                    previous.chat_id, next_msg.chat_id
+                ),
+            }),
+        };
+
+        self.persist_ghost_learning_boundary(
+            boundary,
+            vec![
+                GhostEpisodeSource {
+                    source_type: "session".to_string(),
+                    source_key: previous.session_key.clone(),
+                    role: "primary".to_string(),
+                },
+                GhostEpisodeSource {
+                    source_type: "chat".to_string(),
+                    source_key: previous.chat_id.clone(),
+                    role: "context".to_string(),
+                },
+                GhostEpisodeSource {
+                    source_type: "session".to_string(),
+                    source_key: next_msg.session_key(),
+                    role: "next".to_string(),
+                },
+            ],
+        )
+    }
+
+    async fn flush_memories(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        boundary: &str,
+    ) -> Result<u32> {
+        if messages.is_empty() {
+            return Ok(0);
+        }
+        let Some((provider_idx, provider)) = self.provider_pool.acquire() else {
+            warn!(session_key = %session_key, boundary = %boundary, "Ghost memory flush skipped: no provider available");
+            return Ok(0);
+        };
+
+        let mut loop_messages = Self::build_memory_flush_messages(session_key, messages, boundary);
+        let registry = Self::restricted_memory_flush_tool_registry();
+        let tools = registry.get_filtered_schemas(&["memory_manage"]);
+        let mut writes = 0u32;
+
+        for _round in 0..2 {
+            let response = match provider.chat(&loop_messages, &tools).await {
+                Ok(response) => {
+                    self.provider_pool.report(provider_idx, CallResult::Success);
+                    response
+                }
+                Err(err) => {
+                    self.provider_pool
+                        .report(provider_idx, ProviderPool::classify_error(&err.to_string()));
+                    warn!(error = %err, session_key = %session_key, boundary = %boundary, "Ghost memory flush provider call failed");
+                    return Ok(writes);
+                }
+            };
+            if response.tool_calls.is_empty() {
+                return Ok(writes);
+            }
+
+            let mut assistant = ChatMessage::assistant(response.content.as_deref().unwrap_or(""));
+            assistant.tool_calls = Some(response.tool_calls.clone());
+            loop_messages.push(assistant);
+
+            for call in response.tool_calls {
+                if call.name != "memory_manage" {
+                    let result = serde_json::json!({
+                        "error": format!("tool '{}' is not allowed during memory flush", call.name),
+                    });
+                    loop_messages.push(Self::memory_flush_tool_result_message(&call, &result));
+                    continue;
+                }
+                let result = registry
+                    .execute(
+                        &call.name,
+                        self.memory_flush_tool_context(session_key)?,
+                        call.arguments.clone(),
+                    )
+                    .await;
+                match result {
+                    Ok(value) => {
+                        if value
+                            .get("success")
+                            .and_then(|success| success.as_bool())
+                            .unwrap_or(false)
+                        {
+                            writes += 1;
+                        }
+                        loop_messages.push(Self::memory_flush_tool_result_message(&call, &value));
+                    }
+                    Err(err) => {
+                        let result = serde_json::json!({"error": err.to_string()});
+                        loop_messages.push(Self::memory_flush_tool_result_message(&call, &result));
+                    }
+                }
+            }
+        }
+
+        Ok(writes)
+    }
+
+    fn memory_flush_tool_context(&self, session_key: &str) -> Result<ToolContext> {
+        Ok(ToolContext {
+            workspace: self.paths.workspace(),
+            base: self.paths.base.clone(),
+            builtin_skills_dir: Some(self.paths.builtin_skills_dir()),
+            active_skill_dir: None,
+            session_key: session_key.to_string(),
+            channel: "ghost".to_string(),
+            account_id: None,
+            sender_id: None,
+            chat_id: session_key.to_string(),
+            config: self.config.clone(),
+            permissions: blockcell_core::types::PermissionSet::new(),
+            task_manager: None,
+            memory_store: None,
+            memory_file_store: Some({
+                let mut mfs = MemoryFileStore::open(&self.paths)?;
+                mfs.set_write_guard(Arc::clone(&self.write_guard));
+                Arc::new(mfs)
+            }),
+            ghost_memory_lifecycle: self.ghost_memory_lifecycle.clone().map(|manager| {
+                manager as Arc<dyn blockcell_tools::GhostMemoryLifecycleOps + Send + Sync>
+            }),
+            skill_file_store: None,
+            session_search: None,
+            outbound_tx: None,
+            spawn_handle: None,
+            capability_registry: None,
+            core_evolution: None,
+            event_emitter: None,
+            channel_contacts_file: Some(self.paths.channel_contacts_file()),
+            response_cache: None,
+            skill_mutex: None,
+            agent_type_registry: None,
+            evolution_workflow_store: None,
+            runtime_handle: self.runtime_handle.clone(),
+            agent_identity: blockcell_core::current_agent_context(),
+        })
+    }
+
+    fn restricted_memory_flush_tool_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(blockcell_tools::memory::MemoryManageTool));
+        registry
+    }
+
+    fn build_memory_flush_messages(
+        session_key: &str,
+        messages: &[ChatMessage],
+        boundary: &str,
+    ) -> Vec<ChatMessage> {
+        let mut flush_messages = messages.iter().rev().take(24).cloned().collect::<Vec<_>>();
+        flush_messages.reverse();
+
+        let sentinel = format!(
+            "__ghost_memory_flush_sentinel:{}:{}",
+            session_key,
+            chrono::Utc::now().timestamp_millis()
+        );
+        flush_messages.push(ChatMessage::user(
+            &serde_json::json!({
+                "_flush_sentinel": sentinel,
+                "task": "The session is reaching a compression/session boundary. Save anything worth remembering before context is lost.",
+                "boundary": boundary,
+                "sessionKey": session_key,
+                "allowedTools": ["memory_manage"],
+                "rules": [
+                    "Use only memory_manage.",
+                    "Save durable user preferences, recurring corrections, stable project facts, reusable non-procedural lessons, and environment constraints.",
+                    "Do not save task progress, temporary TODOs, completed-work logs, one-off outcomes, or short-lived status.",
+                    "If nothing durable should be saved, make no tool calls."
+                ]
+            })
+            .to_string(),
+        ));
+
+        flush_messages
+    }
+
+    fn memory_flush_tool_result_message(
+        call: &ToolCallRequest,
+        result: &serde_json::Value,
+    ) -> ChatMessage {
+        let mut message = ChatMessage::tool_result(&call.id, &result.to_string());
+        message.name = Some(call.name.clone());
+        message
+    }
+
+    /// Create a restricted tool registry for subagents (no spawn, no message, no cron).
+    pub(crate) fn subagent_tool_registry() -> ToolRegistry {
+        use blockcell_tools::alert_rule::AlertRuleTool;
+        use blockcell_tools::app_control::AppControlTool;
+        use blockcell_tools::audio_transcribe::AudioTranscribeTool;
+        use blockcell_tools::browser::BrowseTool;
+        use blockcell_tools::camera::CameraCaptureTool;
+        use blockcell_tools::chart_generate::ChartGenerateTool;
+        use blockcell_tools::community_hub::CommunityHubTool;
+        use blockcell_tools::data_process::DataProcessTool;
+        use blockcell_tools::email::EmailTool;
+        use blockcell_tools::encrypt::EncryptTool;
+        use blockcell_tools::exec::ExecTool;
+        use blockcell_tools::file_ops::FileOpsTool;
+        use blockcell_tools::fs::*;
+        use blockcell_tools::http_request::HttpRequestTool;
+        use blockcell_tools::image_understand::ImageUnderstandTool;
+        use blockcell_tools::knowledge_graph::KnowledgeGraphTool;
+        use blockcell_tools::memory::{
+            MemoryForgetTool, MemoryManageTool, MemoryQueryTool, MemoryUpsertTool,
+        };
+        use blockcell_tools::memory_maintenance::MemoryMaintenanceTool;
+        use blockcell_tools::network_monitor::NetworkMonitorTool;
+        use blockcell_tools::ocr::OcrTool;
+        use blockcell_tools::office_write::OfficeWriteTool;
+        use blockcell_tools::skills::{ListSkillsTool, SkillManageTool, SkillViewTool};
+        use blockcell_tools::stream_subscribe::StreamSubscribeTool;
+        use blockcell_tools::system_info::{CapabilityEvolveTool, SystemInfoTool};
+        use blockcell_tools::tasks::ListTasksTool;
+        use blockcell_tools::termux_api::TermuxApiTool;
+        use blockcell_tools::toggle_manage::ToggleManageTool;
+        use blockcell_tools::tts::TtsTool;
+        use blockcell_tools::video_process::VideoProcessTool;
+        use blockcell_tools::web::*;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(ReadFileTool));
+        registry.register(Arc::new(WriteFileTool));
+        registry.register(Arc::new(EditFileTool));
+        registry.register(Arc::new(ListDirTool));
+        registry.register(Arc::new(ExecTool));
+        registry.register(Arc::new(WebSearchTool));
+        registry.register(Arc::new(WebFetchTool));
+        registry.register(Arc::new(ListTasksTool));
+        registry.register(Arc::new(BrowseTool));
+        registry.register(Arc::new(MemoryManageTool));
+        registry.register(Arc::new(MemoryQueryTool));
+        registry.register(Arc::new(MemoryUpsertTool));
+        registry.register(Arc::new(MemoryForgetTool));
+        registry.register(Arc::new(ListSkillsTool));
+        registry.register(Arc::new(SkillViewTool));
+        registry.register(Arc::new(SkillManageTool));
+        registry.register(Arc::new(SystemInfoTool));
+        registry.register(Arc::new(CapabilityEvolveTool));
+        registry.register(Arc::new(CameraCaptureTool));
+        registry.register(Arc::new(AppControlTool));
+        registry.register(Arc::new(FileOpsTool));
+        registry.register(Arc::new(DataProcessTool));
+        registry.register(Arc::new(HttpRequestTool));
+        registry.register(Arc::new(EmailTool));
+        registry.register(Arc::new(AudioTranscribeTool));
+        registry.register(Arc::new(ChartGenerateTool));
+        registry.register(Arc::new(OfficeWriteTool));
+        registry.register(Arc::new(TtsTool));
+        registry.register(Arc::new(OcrTool));
+        registry.register(Arc::new(ImageUnderstandTool));
+        registry.register(Arc::new(VideoProcessTool));
+        registry.register(Arc::new(EncryptTool));
+        registry.register(Arc::new(NetworkMonitorTool));
+        registry.register(Arc::new(KnowledgeGraphTool));
+        registry.register(Arc::new(StreamSubscribeTool));
+        registry.register(Arc::new(AlertRuleTool));
+        registry.register(Arc::new(CommunityHubTool));
+        registry.register(Arc::new(MemoryMaintenanceTool));
+        registry.register(Arc::new(ToggleManageTool));
+        registry.register(Arc::new(TermuxApiTool));
+        // No SpawnTool, MessageTool, CronTool — subagents can't spawn or send messages
+        registry
+    }
+} // impl AgentRuntime

@@ -712,7 +712,7 @@ mod tests {
 
         // 模拟 Token 累积
         let total_chars: usize = candidates.iter().map(|c| c.content.len()).sum();
-        let estimated_tokens = total_chars / 4; // 粗略估算
+        let estimated_tokens = total_chars / blockcell_core::CHARS_PER_TOKEN; // 粗略估算
 
         // 验证 Compact 触发条件
         let token_budget = 100_000;

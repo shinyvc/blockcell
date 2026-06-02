@@ -118,8 +118,8 @@ impl Tool for VideoProcessTool {
         );
 
         ToolSchema {
-            name: "video_process",
-            description: "Process videos with ffmpeg. You MUST provide `action`. action='info': optional `input`. action='clip'|'convert'|'extract_audio'|'resize'|'compress'|'watermark': usually requires `input`, plus action-specific fields like `output_path`, `start`, `duration`, `format`, `width`, `height`, or watermark options. action='merge': requires `inputs` with at least 2 files, optional `output_path`. action='subtitle': requires `input` and `subtitle_file`, optional `output_path`. action='thumbnail': usually requires `input`, optional `output_path` and thumbnail fields.",
+            name: "video_process".to_string(),
+            description: "Process videos with ffmpeg. You MUST provide `action`. action='info': optional `input`. action='clip'|'convert'|'extract_audio'|'resize'|'compress'|'watermark': usually requires `input`, plus action-specific fields like `output_path`, `start`, `duration`, `format`, `width`, `height`, or watermark options. action='merge': requires `inputs` with at least 2 files, optional `output_path`. action='subtitle': requires `input` and `subtitle_file`, optional `output_path`. action='thumbnail': usually requires `input`, optional `output_path` and thumbnail fields.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": Value::Object(props),
@@ -849,6 +849,7 @@ mod tests {
     fn test_resolve_path() {
         let ctx = ToolContext {
             workspace: std::path::PathBuf::from("/tmp/workspace"),
+            base: std::path::PathBuf::from("/tmp/blockcell"),
             builtin_skills_dir: None,
             active_skill_dir: None,
             session_key: String::new(),

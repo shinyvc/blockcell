@@ -15,8 +15,8 @@ pub struct OfficeWriteTool;
 impl Tool for OfficeWriteTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "office_write",
-            description: "Generate Office documents. You MUST provide `action`. action='info': no extra params. action='create_pptx': requires `slides`, optional `title`, `output_path`, and `style`. action='create_docx': requires `sections`, optional `title`, `output_path`, and `style`. action='create_xlsx': requires `sheets`, optional `title`, `output_path`, and `style`.",
+            name: "office_write".to_string(),
+            description: "Generate Office documents. You MUST provide `action`. action='info': no extra params. action='create_pptx': requires `slides`, optional `title`, `output_path`, and `style`. action='create_docx': requires `sections`, optional `title`, `output_path`, and `style`. action='create_xlsx': requires `sheets`, optional `title`, `output_path`, and `style`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

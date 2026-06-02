@@ -93,6 +93,7 @@ impl McpManager {
     }
 
     pub async fn client_for(&self, server_name: &str) -> Result<Arc<McpClient>> {
+        // 第一遍检查（无锁快速路径）
         {
             let clients = self.clients.lock().await;
             if let Some(client) = clients.get(server_name) {
@@ -112,6 +113,14 @@ impl McpManager {
             )));
         }
 
+        // 双重检查锁定：再次获取锁并检查，防止在第一次检查和启动之间被其他线程创建
+        {
+            let clients = self.clients.lock().await;
+            if let Some(client) = clients.get(server_name) {
+                return Ok(client.clone());
+            }
+        }
+
         info!(server = %server_name, command = %server_cfg.command, "Starting MCP server");
         let client = Arc::new(
             McpClient::start(
@@ -126,6 +135,7 @@ impl McpManager {
             .await?,
         );
 
+        // 第三次检查（插入时原子操作）
         let mut clients = self.clients.lock().await;
         Ok(clients
             .entry(server_name.to_string())

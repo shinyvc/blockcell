@@ -110,9 +110,15 @@ impl TelegramChannel {
 
         let client = builder.build().expect("Failed to create HTTP client");
 
-        let media_dir = dirs::home_dir()
-            .map(|h| h.join(".blockcell").join("workspace").join("media"))
-            .unwrap_or_else(|| PathBuf::from(".blockcell/workspace/media"));
+        // 从 BLOCKCELL_WORKSPACE 环境变量读取 media 目录，支持自定义 workspace
+        let media_dir = std::env::var("BLOCKCELL_WORKSPACE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .map(|h| h.join(".blockcell").join("workspace"))
+                    .unwrap_or_else(|| PathBuf::from(".blockcell/workspace"))
+            })
+            .join("media");
 
         // Ensure media directory exists
         let _ = std::fs::create_dir_all(&media_dir);
@@ -530,19 +536,58 @@ impl TelegramChannel {
 }
 
 /// Escape special characters for Telegram MarkdownV2 parse mode.
-/// All characters outside code spans that have special meaning must be escaped.
+/// 使用状态机追踪代码块（``` 多行 和 ` 内联），代码块内字符不转义。
 pub fn escape_markdown_v2(text: &str) -> String {
-    // Characters that must be escaped in MarkdownV2 outside code/pre blocks
+    // MarkdownV2 中需要在代码块外转义的字符
     const SPECIAL: &[char] = &[
         '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!',
     ];
     let mut out = String::with_capacity(text.len() + 32);
-    for ch in text.chars() {
-        if SPECIAL.contains(&ch) {
-            out.push('\\');
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+
+    while i < n {
+        // 检测 ``` 代码块开始或结束
+        if i + 2 < n && chars[i] == '`' && chars[i + 1] == '`' && chars[i + 2] == '`' {
+            out.push_str("```");
+            i += 3;
+            // 代码块内部不转义，直到遇到结束 ```
+            while i < n {
+                if i + 2 < n && chars[i] == '`' && chars[i + 1] == '`' && chars[i + 2] == '`' {
+                    out.push_str("```");
+                    i += 3;
+                    break;
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
         }
-        out.push(ch);
+        // 检测 ` 内联代码
+        else if chars[i] == '`' {
+            out.push('`');
+            i += 1;
+            // 内联代码内部不转义，直到遇到结束 `
+            while i < n && chars[i] != '`' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            if i < n {
+                out.push('`');
+                i += 1;
+            }
+        }
+        // 普通文本中的特殊字符需要转义
+        else if SPECIAL.contains(&chars[i]) {
+            out.push('\\');
+            out.push(chars[i]);
+            i += 1;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
     }
+
     out
 }
 
@@ -645,13 +690,7 @@ async fn do_send_message(
     // 400 with "can't parse entities" → retry as plain text
     if status.as_u16() == 400 && body.contains("parse") {
         warn!("Telegram MarkdownV2 parse error, retrying as plain text");
-        let plain_request = SendMessageRequest {
-            chat_id: chat_id.to_string(),
-            text: text.to_string(),
-            parse_mode: String::new(),
-            reply_to_message_id: None,
-        };
-        // Send without parse_mode by using a plain JSON body
+        // 直接使用 serde_json 构建请求体，避免构造未使用的 SendMessageRequest 结构体
         let mut plain_body = serde_json::json!({
             "chat_id": chat_id,
             "text": text,
@@ -672,7 +711,6 @@ async fn do_send_message(
                 err
             )));
         }
-        let _ = plain_request; // suppress unused warning (fields used for serde only)
         return Ok(());
     }
 
@@ -680,8 +718,9 @@ async fn do_send_message(
 }
 
 /// Split a message into chunks at newline boundaries, respecting a max length.
+/// max_len 基于字符数（例如 Telegram 的 4096 字符限制），非字节数。
 fn split_message(text: &str, max_len: usize) -> Vec<String> {
-    if text.len() <= max_len {
+    if text.chars().count() <= max_len {
         return vec![text.to_string()];
     }
 
@@ -689,32 +728,23 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
     let mut remaining = text;
 
     while !remaining.is_empty() {
-        if remaining.len() <= max_len {
+        if remaining.chars().count() <= max_len {
             chunks.push(remaining.to_string());
             break;
         }
 
-        // Find the best split point within the limit.
-        let mut split_at = max_len;
+        // 找到第 max_len 个字符的字节偏移
+        let split_at = remaining
+            .char_indices()
+            .nth(max_len)
+            .map(|(i, _)| i)
+            .unwrap_or(remaining.len());
 
-        // Ensure split_at is a char boundary before we slice
-        while split_at > 0 && !remaining.is_char_boundary(split_at) {
-            split_at -= 1;
-        }
-
-        // If we somehow couldn't find a boundary (e.g., max_len too small), fallback to first char
-        if split_at == 0 {
-            split_at = remaining
-                .chars()
-                .next()
-                .map(|c| c.len_utf8())
-                .unwrap_or(max_len);
-        }
-
-        // Try to split on a newline within the safe boundary
-        if let Some(last_newline) = remaining[..split_at].rfind('\n') {
-            split_at = last_newline + 1; // Include the newline in the chunk
-        }
+        // 在安全边界内尝试按换行符分割
+        let split_at = remaining[..split_at]
+            .rfind('\n')
+            .map(|i| i + 1) // 包含换行符在 chunk 中
+            .unwrap_or(split_at);
 
         chunks.push(remaining[..split_at].to_string());
         remaining = &remaining[split_at..];
@@ -854,15 +884,15 @@ mod tests {
     #[test]
     fn test_split_message_utf8_boundary() {
         // "你好" is 6 bytes (3 bytes per char).
-        let text = "你好".repeat(1000); // 6000 bytes
+        let text = "你好".repeat(3000); // 6000 chars, 18000 bytes
         let chunks = split_message(&text, 4096);
         assert_eq!(chunks.len(), 2);
-        assert!(chunks[0].len() <= 4096);
-        assert!(chunks[1].len() <= 4096);
-        // Make sure it split at a valid char boundary (no panic, valid string)
+        // 第一块应包含 4096 个字符
+        assert_eq!(chunks[0].chars().count(), 4096);
+        // 第二块应包含剩余的字符
+        assert_eq!(chunks[1].chars().count(), 6000 - 4096);
+        // 确保在有效字符边界分割（无 panic，有效字符串）
         assert!(String::from_utf8(chunks[0].as_bytes().to_vec()).is_ok());
         assert!(String::from_utf8(chunks[1].as_bytes().to_vec()).is_ok());
-        // 4096 / 3 = 1365 with remainder 1. So 1365 * 3 = 4095 is the closest boundary.
-        assert_eq!(chunks[0].len(), 4095);
     }
 }

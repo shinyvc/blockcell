@@ -18,8 +18,8 @@ pub struct AppControlTool;
 impl Tool for AppControlTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "app_control",
-            description: "Control macOS apps via AppleScript + System Events. You MUST provide `action`. action='list_apps'|'get_frontmost': no extra params. action='activate'|'read_ui'|'get_windows'|'click_menu'|'click_ui_element'|'type'|'press_key'|'screenshot': usually requires `app`. action='type'|'press_key'|'click_menu': also requires `text`. action='click_ui_element': requires `app` and `ui_path`. action='screenshot': requires `app`, optional `screenshot_path`. action='read_ui': requires `app`, optional `depth`. action='wait': optional `amount` in ms.",
+            name: "app_control".to_string(),
+            description: "Control macOS apps via AppleScript + System Events. You MUST provide `action`. action='list_apps'|'get_frontmost': no extra params. action='activate'|'read_ui'|'get_windows'|'click_menu'|'click_ui_element'|'type'|'press_key'|'screenshot': usually requires `app`. action='type'|'press_key'|'click_menu': also requires `text`. action='click_ui_element': requires `app` and `ui_path`. action='screenshot': requires `app`, optional `screenshot_path`. action='read_ui': requires `app`, optional `depth`. action='wait': optional `amount` in ms.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

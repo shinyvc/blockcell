@@ -10,13 +10,17 @@ use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
+
+// 所有 std::sync::Mutex 均为短时锁定且不在 .await 间持有锁，因此安全。
+// 详细审计见：LONGCONN_REGISTRY、CHAT_REQID_REGISTRY、SEEN_MSG_IDS 的 lock() 调用点
+// 均未跨越 .await 点。token_cache 则直接使用 tokio::sync::Mutex。
 
 /// Global msg_id dedup set — prevents the same WeCom message from being processed twice.
 /// WeCom sometimes delivers the same webhook twice (retry on timeout) or echoes bot-sent
@@ -267,15 +271,28 @@ pub struct WeComChannel {
     #[allow(dead_code)]
     inbound_tx: mpsc::Sender<InboundMessage>,
     token_cache: Arc<tokio::sync::Mutex<CachedToken>>,
+    /// 媒体文件下载目录，在 new() 中从 BLOCKCELL_WORKSPACE 环境变量解析并缓存
+    media_dir: PathBuf,
 }
 
 impl WeComChannel {
     pub fn new(config: Config, inbound_tx: mpsc::Sender<InboundMessage>) -> Self {
+        // 从 BLOCKCELL_WORKSPACE 环境变量读取 media 目录，支持自定义 workspace
+        let media_dir = std::env::var("BLOCKCELL_WORKSPACE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                dirs::home_dir()
+                    .map(|h| h.join(".blockcell").join("workspace"))
+                    .unwrap_or_else(|| std::path::PathBuf::from(".blockcell/workspace"))
+            })
+            .join("media");
+        let _ = std::fs::create_dir_all(&media_dir);
         Self {
             config,
             client: shared_client(),
             inbound_tx,
             token_cache: Arc::new(tokio::sync::Mutex::new(CachedToken::default())),
+            media_dir,
         }
     }
 
@@ -735,6 +752,7 @@ impl WeComChannel {
                         &image.aeskey,
                         "image",
                         None,
+                        &self.media_dir,
                     )
                     .await
                     {
@@ -768,6 +786,7 @@ impl WeComChannel {
                         &voice.aeskey,
                         "voice",
                         Some("amr"),
+                        &self.media_dir,
                     )
                     .await
                     {
@@ -796,6 +815,7 @@ impl WeComChannel {
                         &file.aeskey,
                         "file",
                         file.filename.as_deref().and_then(|n| n.rsplit('.').next()),
+                        &self.media_dir,
                     )
                     .await
                     {
@@ -999,6 +1019,7 @@ async fn download_and_decrypt_longconn_media(
     aeskey: &str,
     media_type: &str,
     ext_hint: Option<&str>,
+    media_dir: &Path,
 ) -> Result<String> {
     let resp = client
         .get(url)
@@ -1023,10 +1044,7 @@ async fn download_and_decrypt_longconn_media(
         .await
         .map_err(|e| Error::Channel(format!("WeCom long media read failed: {}", e)))?;
     let plain = decrypt_longconn_media_bytes(&bytes, aeskey)?;
-    let media_dir = dirs::home_dir()
-        .map(|h| h.join(".blockcell").join("workspace").join("media"))
-        .unwrap_or_else(|| PathBuf::from(".blockcell/workspace/media"));
-    tokio::fs::create_dir_all(&media_dir)
+    tokio::fs::create_dir_all(media_dir)
         .await
         .map_err(|e| Error::Channel(format!("Failed to create media dir: {}", e)))?;
     let ext = ext_hint
@@ -1229,6 +1247,49 @@ fn resolve_wecom_webhook_config(
     config.clone()
 }
 
+/// 根据 webhook 参数解析匹配的 account_id，供 gateway 计算 agent 级别的 media_dir。
+pub fn resolve_wecom_webhook_account_id(
+    config: &Config,
+    method: &str,
+    query: &std::collections::HashMap<String, String>,
+    body: &str,
+) -> Option<String> {
+    let listeners = wecom_listener_configs(config);
+    if listeners.is_empty() {
+        return None;
+    }
+    if listeners.len() == 1 {
+        return listeners[0].account_id.clone();
+    }
+    let timestamp = query.get("timestamp").map(|s| s.as_str()).unwrap_or("");
+    let nonce = query.get("nonce").map(|s| s.as_str()).unwrap_or("");
+    let msg_signature = query
+        .get("msg_signature")
+        .or_else(|| query.get("signature"))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let signed_payload = if method == "GET" {
+        query
+            .get("echostr")
+            .map(|s| percent_decode(s))
+            .unwrap_or_default()
+    } else {
+        extract_xml_tag(body, "Encrypt").unwrap_or_default()
+    };
+    if !msg_signature.is_empty() && !signed_payload.is_empty() {
+        for listener in &listeners {
+            let token = listener.config.channels.wecom.callback_token.as_str();
+            if token.is_empty() {
+                continue;
+            }
+            if verify_signature_4(token, timestamp, nonce, &signed_payload, msg_signature) {
+                return listener.account_id.clone();
+            }
+        }
+    }
+    None
+}
+
 /// - **GET**: URL verification — responds with `echostr` query param if signature is valid
 /// - **POST**: Message/event callback — parses XML body and forwards to inbound channel
 ///
@@ -1239,6 +1300,7 @@ pub async fn process_webhook(
     query: &std::collections::HashMap<String, String>,
     body: &str,
     inbound_tx: Option<&tokio::sync::mpsc::Sender<blockcell_core::InboundMessage>>,
+    media_dir: PathBuf,
 ) -> (u16, String) {
     let resolved_config = resolve_wecom_webhook_config(config, method, query, body);
     let wecom_cfg = &resolved_config.channels.wecom;
@@ -1429,7 +1491,9 @@ pub async fn process_webhook(
             let pic_url = extract_xml_tag(&decrypted_body, "PicUrl").unwrap_or_default();
             info!(media_id = %media_id, "WeCom webhook: received image");
             let paths = if !media_id.is_empty() {
-                match download_wecom_media(&resolved_config, &media_id, "image", None).await {
+                match download_wecom_media(&resolved_config, &media_id, "image", None, &media_dir)
+                    .await
+                {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e.to_string(), "WeCom: failed to download image, using PicUrl");
@@ -1453,7 +1517,15 @@ pub async fn process_webhook(
                 extract_xml_tag(&decrypted_body, "Format").unwrap_or_else(|| "amr".to_string());
             info!(media_id = %media_id, format = %format, "WeCom webhook: received voice");
             let paths = if !media_id.is_empty() {
-                match download_wecom_media(config, &media_id, "voice", Some(&format)).await {
+                match download_wecom_media(
+                    &resolved_config,
+                    &media_id,
+                    "voice",
+                    Some(&format),
+                    &media_dir,
+                )
+                .await
+                {
                     Ok(p) => vec![p],
                     Err(e) => {
                         warn!(error = %e.to_string(), "WeCom: failed to download voice");
@@ -1465,7 +1537,8 @@ pub async fn process_webhook(
             };
             // Send immediate ack
             if !from_user.is_empty() {
-                let _ = send_message(config, &from_user, "🎤 语音已收到，正在转写...").await;
+                let _ =
+                    send_message(&resolved_config, &from_user, "🎤 语音已收到，正在转写...").await;
             }
             // Voice: always transcribe immediately, no pending intent needed
             ("用户发来了一条语音消息，请先用 audio_transcribe 工具转写，然后根据转写内容回复用户。".to_string(), paths, false)
@@ -1474,7 +1547,14 @@ pub async fn process_webhook(
             let media_id = extract_xml_tag(&decrypted_body, "MediaId").unwrap_or_default();
             info!(media_id = %media_id, "WeCom webhook: received video");
             let paths = if !media_id.is_empty() {
-                match download_wecom_media(&resolved_config, &media_id, "video", Some("mp4")).await
+                match download_wecom_media(
+                    &resolved_config,
+                    &media_id,
+                    "video",
+                    Some("mp4"),
+                    &media_dir,
+                )
+                .await
                 {
                     Ok(p) => vec![p],
                     Err(e) => {
@@ -1498,8 +1578,14 @@ pub async fn process_webhook(
             let ext = file_name.rsplit('.').next().map(|s| s.to_string());
             info!(media_id = %media_id, file_name = %file_name, "WeCom webhook: received file");
             let paths = if !media_id.is_empty() {
-                match download_wecom_media(&resolved_config, &media_id, "file", ext.as_deref())
-                    .await
+                match download_wecom_media(
+                    &resolved_config,
+                    &media_id,
+                    "file",
+                    ext.as_deref(),
+                    &media_dir,
+                )
+                .await
                 {
                     Ok(p) => vec![p],
                     Err(e) => {
@@ -1574,6 +1660,7 @@ async fn download_wecom_media(
     media_id: &str,
     media_type: &str,
     ext_hint: Option<&str>,
+    media_dir: &Path,
 ) -> Result<String> {
     let client = shared_client();
     let mut retried = false;
@@ -1634,10 +1721,8 @@ async fn download_wecom_media(
         .map(|s| s.to_string())
         .unwrap_or_else(|| ext_from_content_type(&content_type, media_type).to_string());
 
-    let media_dir = dirs::home_dir()
-        .map(|h| h.join(".blockcell").join("workspace").join("media"))
-        .unwrap_or_else(|| PathBuf::from(".blockcell/workspace/media"));
-    tokio::fs::create_dir_all(&media_dir)
+    // 使用调用方传入的 media_dir，避免并发环境下环境变量竞争
+    tokio::fs::create_dir_all(media_dir)
         .await
         .map_err(|e| Error::Channel(format!("Failed to create media dir: {}", e)))?;
 
@@ -2391,9 +2476,8 @@ async fn ensure_wecom_voice_amr(file_path: &str) -> Result<String> {
         )));
     }
 
-    let media_dir = dirs::home_dir()
-        .map(|h| h.join(".blockcell").join("workspace").join("media"))
-        .unwrap_or_else(|| PathBuf::from(".blockcell/workspace/media"));
+    // 输出目录与输入文件同目录，避免依赖全局环境变量
+    let media_dir = input.parent().unwrap_or_else(|| std::path::Path::new("."));
     tokio::fs::create_dir_all(&media_dir)
         .await
         .map_err(|e| Error::Channel(format!("Failed to create media dir: {}", e)))?;

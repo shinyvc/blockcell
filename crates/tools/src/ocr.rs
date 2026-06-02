@@ -14,8 +14,8 @@ pub struct OcrTool;
 impl Tool for OcrTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "ocr",
-            description: "Extract text from images or PDFs with OCR. You MUST provide `action`. action='info': no extra params. action='recognize': requires `path`, optional `language`, `backend`, `output_path`, `dpi`, and `psm`.",
+            name: "ocr".to_string(),
+            description: "Extract text from images or PDFs with OCR. You MUST provide `action`. action='info': no extra params. action='recognize': requires `path`, optional `language`, `backend`, `output_path`, `dpi`, and `psm`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -26,7 +26,7 @@ pub struct NapcatGetLoginInfoTool;
 impl Tool for NapcatGetLoginInfoTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_login_info",
+            name: "napcat_get_login_info".to_string(),
             description: build_description(
                 "[QQ Account] Get the bot's QQ login account info (QQ number, nickname). Use this to identify the current bot account.",
                 RiskLevel::ReadOnly,
@@ -82,7 +82,7 @@ pub struct NapcatGetStatusTool;
 impl Tool for NapcatGetStatusTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_status",
+            name: "napcat_get_status".to_string(),
             description: build_description(
                 "[QQ System] Get the NapCatQQ running status.",
                 RiskLevel::ReadOnly,
@@ -138,7 +138,7 @@ pub struct NapcatGetVersionInfoTool;
 impl Tool for NapcatGetVersionInfoTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_version_info",
+            name: "napcat_get_version_info".to_string(),
             description: build_description(
                 "[QQ System] Get NapCatQQ version information.",
                 RiskLevel::ReadOnly,
@@ -198,7 +198,7 @@ pub struct NapcatGetStrangerInfoTool;
 impl Tool for NapcatGetStrangerInfoTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_stranger_info",
+            name: "napcat_get_stranger_info".to_string(),
             description: build_description(
                 "[QQ User] Get a QQ user's profile information by QQ number.",
                 RiskLevel::ReadOnly,
@@ -274,7 +274,7 @@ pub struct NapcatGetFriendListTool;
 impl Tool for NapcatGetFriendListTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_friend_list",
+            name: "napcat_get_friend_list".to_string(),
             description: build_description(
                 "[QQ Friend] Get the bot's QQ friend list. Returns all friends with their nicknames and user IDs.",
                 RiskLevel::ReadOnly,
@@ -334,7 +334,7 @@ pub struct NapcatSendLikeTool;
 impl Tool for NapcatSendLikeTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_send_like",
+            name: "napcat_send_like".to_string(),
             description: build_description(
                 "[QQ User] Send a like (superb) to a QQ user.",
                 RiskLevel::LowRisk,
@@ -406,7 +406,7 @@ pub struct NapcatSetFriendRemarkTool;
 impl Tool for NapcatSetFriendRemarkTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_friend_remark",
+            name: "napcat_set_friend_remark".to_string(),
             description: build_description(
                 "[QQ Friend] Set a QQ friend's remark (alias).",
                 RiskLevel::LowRisk,
@@ -482,7 +482,7 @@ pub struct NapcatDeleteFriendTool;
 impl Tool for NapcatDeleteFriendTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_delete_friend",
+            name: "napcat_delete_friend".to_string(),
             description: build_description(
                 "[QQ Friend] Delete a QQ friend. This is a high-risk operation.",
                 RiskLevel::HighRisk,
@@ -550,7 +550,7 @@ pub struct NapcatSetQQProfileTool;
 impl Tool for NapcatSetQQProfileTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_qq_profile",
+            name: "napcat_set_qq_profile".to_string(),
             description: build_description(
                 "[QQ Profile] Set the bot's QQ profile information (nickname, signature, gender).",
                 RiskLevel::LowRisk,

@@ -3,7 +3,7 @@ use serde_json::Value;
 
 /// List all alert rules.
 pub async fn list() -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let rules_file = paths.workspace().join("alerts").join("rules.json");
 
     if !rules_file.exists() {
@@ -54,7 +54,7 @@ pub async fn list() -> anyhow::Result<()> {
 
 /// Show alert trigger history.
 pub async fn history(limit: usize) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let history_file = paths.workspace().join("alerts").join("history.json");
 
     if !history_file.exists() {
@@ -105,7 +105,7 @@ pub async fn history(limit: usize) -> anyhow::Result<()> {
 
 /// Manually evaluate all alert rules once.
 pub async fn evaluate() -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let rules_file = paths.workspace().join("alerts").join("rules.json");
 
     if !rules_file.exists() {
@@ -147,7 +147,7 @@ pub async fn add(
     operator: &str,
     threshold: &str,
 ) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let alerts_dir = paths.workspace().join("alerts");
     std::fs::create_dir_all(&alerts_dir)?;
     let rules_file = alerts_dir.join("rules.json");
@@ -190,7 +190,7 @@ pub async fn add(
 
 /// Remove an alert rule by ID prefix.
 pub async fn remove(rule_id: &str) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let rules_file = paths.workspace().join("alerts").join("rules.json");
 
     if !rules_file.exists() {

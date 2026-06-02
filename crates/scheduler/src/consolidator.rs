@@ -565,7 +565,16 @@ impl DreamConsolidator {
                         .await;
                     guard_result = CrossProcessLock::acquire(&state_lock_path);
                 }
-                guard_result.unwrap()
+                let guard = match guard_result {
+                    Ok(g) => g,
+                    Err(e) => {
+                        return Err(DreamError::Io(std::io::Error::other(format!(
+                            "获取 dream 状态锁失败: {}",
+                            e
+                        ))))
+                    }
+                };
+                guard
             };
 
             // 在锁内重新读取磁盘上的 current_session_count，
@@ -1363,6 +1372,9 @@ async fn check_lock_validity(lock_path: &Path) -> Result<bool, DreamError> {
 fn is_process_alive(pid: u32) -> bool {
     // Unix: 使用 kill(pid, 0) 检查进程是否存在
     // ESRCH 表示进程不存在
+    // SAFETY: libc::kill(pid, 0) 是安全的 Unix 系统调用，仅查询而不修改任何进程状态。
+    //         信号值 0 是特殊用途，不发送实际信号，仅检查进程是否存在。
+    //         该调用在 pid 不存在时返回 -1 并设置 errno 为 ESRCH，不存在未定义行为风险。
     unsafe {
         let result = libc::kill(pid as i32, 0);
         result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
@@ -1373,11 +1385,17 @@ fn is_process_alive(pid: u32) -> bool {
 #[cfg(windows)]
 fn is_process_alive(pid: u32) -> bool {
     // Windows: 尝试打开进程
-    use winapi::um::handleapi::CloseHandle;
-    use winapi::um::processthreadsapi::GetExitCodeProcess;
-    use winapi::um::processthreadsapi::OpenProcess;
-    use winapi::um::winnt::PROCESS_QUERY_INFORMATION;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION,
+    };
 
+    // SAFETY: 以下 Windows API 调用的安全性说明：
+    // - OpenProcess: 使用 PROCESS_QUERY_INFORMATION 权限打开已命名进程，
+    //   传入来自锁文件的 pid，不修改任何进程状态。返回 null 表示进程不存在。
+    // - GetExitCodeProcess: 从有效进程中读取退出码，不修改任何状态。
+    // - CloseHandle: 关闭已打开的句柄，标准资源清理。
+    // 所有调用均符合 Windows API 安全规范，不涉及内存安全风险。
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
         if handle.is_null() {

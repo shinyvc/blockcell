@@ -6,6 +6,8 @@ use blockcell_core::config::ToolCallMode;
 use blockcell_core::Config;
 use tracing::{info, warn};
 
+use rand::Rng;
+
 use crate::factory::create_provider_with_tool_mode;
 use crate::Provider;
 
@@ -207,7 +209,10 @@ impl ProviderPool {
     ///
     /// 返回 `(entry_index, Arc<dyn Provider>)`
     pub fn acquire(&self) -> Option<(usize, Arc<dyn Provider>)> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("ProviderPool 状态 Mutex 被污染，正在恢复");
+            poisoned.into_inner()
+        });
         self.recover_cooling_entries(&mut state);
 
         // 收集健康条目索引
@@ -247,7 +252,10 @@ impl ProviderPool {
     /// Unlike `acquire()`, this never falls back to another model: callers that set an
     /// explicit model override need the override to be honored or fail loudly.
     pub fn acquire_by_model(&self, model: &str) -> Option<(usize, Arc<dyn Provider>)> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("ProviderPool 状态 Mutex 被污染，正在恢复");
+            poisoned.into_inner()
+        });
         self.recover_cooling_entries(&mut state);
 
         let candidates: Vec<usize> = (0..self.entries.len())
@@ -300,14 +308,8 @@ impl ProviderPool {
             return None;
         }
 
-        // 简单的伪随机：用当前纳秒时间戳 mod total_weight
-        let rand_val = {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos();
-            nanos % total_weight
-        };
+        // 加权随机选取
+        let rand_val = rand::thread_rng().gen_range(0..total_weight);
 
         let mut cumulative = 0u32;
         let mut selected = top_group[0];
@@ -324,7 +326,10 @@ impl ProviderPool {
 
     /// 上报调用结果，驱动健康状态变更。
     pub fn report(&self, idx: usize, result: CallResult) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("ProviderPool 状态 Mutex 被污染，正在恢复");
+            poisoned.into_inner()
+        });
 
         match result {
             CallResult::Success => {
@@ -394,7 +399,10 @@ impl ProviderPool {
 
     /// 返回池状态摘要（用于日志/status 命令）
     pub fn status_summary(&self) -> Vec<PoolEntryStatus> {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("ProviderPool 状态 Mutex 被污染，正在恢复");
+            poisoned.into_inner()
+        });
         let now = Instant::now();
         (0..self.entries.len())
             .map(|idx| {

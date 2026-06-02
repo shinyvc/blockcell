@@ -65,7 +65,13 @@ impl ChannelManager {
     }
 
     fn config_for_outbound(&self, msg: &OutboundMessage) -> Result<Config> {
-        let mut cfg = self.config.clone();
+        // 优化：只克隆 config.channels 而非整个 Config（包含 providers、agents 等无关字段）
+        // 先克隆 channels，再构建一个仅含有 channels 的 Config
+        let channels = self.config.channels.clone();
+        let mut cfg = Config {
+            channels,
+            ..Default::default()
+        };
         let req_account = msg.account_id.as_deref();
         match msg.channel.as_str() {
             "telegram" => {

@@ -186,7 +186,7 @@ fn agent_owner_bindings(config: &Config, agent_id: &str) -> Vec<String> {
 
 /// Run full environment diagnostics.
 pub async fn run() -> anyhow::Result<()> {
-    let paths = Paths::new();
+    let paths = Paths::new_configured();
 
     println!();
     println!("🩺 blockcell doctor — Environment Diagnostics");
@@ -477,9 +477,17 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     // Chrome
-    let chrome_paths = [
+    let chrome_paths: &[&str] = &[
+        // macOS
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        // Windows
+        "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        // Linux
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
     ];
     let chrome_found = chrome_paths
         .iter()

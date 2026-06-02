@@ -272,21 +272,35 @@ impl UpdateManager {
         Ok(())
     }
 
-    /// 检查当前版本是否满足最低版本要求 (简单的 semver 比较)
+    /// 检查当前版本是否满足最低版本要求 (semver 比较，正确处理 pre-release)
     fn version_satisfies(current: &str, minimum: &str) -> bool {
-        Self::parse_version(current) >= Self::parse_version(minimum)
+        let cur = current.trim_start_matches('v');
+        let min = minimum.trim_start_matches('v');
+        // 优先使用 semver 语义比较，正确处理 pre-release 标签
+        if let (Ok(cv), Ok(mv)) = (semver::Version::parse(cur), semver::Version::parse(min)) {
+            return cv >= mv;
+        }
+        // 回退到旧的数字比较
+        Self::parse_numeric(cur) >= Self::parse_numeric(min)
     }
 
-    /// 检查 candidate 版本是否严格大于 base 版本
+    /// 检查 candidate 版本是否严格大于 base 版本 (semver 比较，正确处理 pre-release)
     fn version_greater(candidate: &str, base: &str) -> bool {
-        Self::parse_version(candidate) > Self::parse_version(base)
+        let c = candidate.trim_start_matches('v');
+        let b = base.trim_start_matches('v');
+        // 优先使用 semver 语义比较，正确处理 pre-release 标签
+        // 例如: "1.0.0" > "1.0.0-beta.1" 为 true（正式版大于预发布版）
+        if let (Ok(cv), Ok(bv)) = (semver::Version::parse(c), semver::Version::parse(b)) {
+            return cv > bv;
+        }
+        // 回退到旧的数字比较
+        Self::parse_numeric(c) > Self::parse_numeric(b)
     }
 
-    fn parse_version(v: &str) -> Vec<u64> {
-        v.trim_start_matches('v')
-            .split('.')
+    /// 旧的数字回退解析: 逐段取数字部分，用于非标准 semver 格式
+    fn parse_numeric(v: &str) -> Vec<u64> {
+        v.split('.')
             .filter_map(|s| {
-                // 只取数字部分，忽略预发标识符如 -beta.1
                 s.split(|c: char| !c.is_ascii_digit())
                     .next()
                     .and_then(|n| n.parse::<u64>().ok())

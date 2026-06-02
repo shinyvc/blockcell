@@ -12,7 +12,7 @@ pub async fn show(
     filter: Option<String>,
     session: Option<String>,
 ) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let logs_dir = paths.logs_dir();
 
     if !logs_dir.exists() {
@@ -84,7 +84,7 @@ pub async fn show(
 
 /// Follow logs in real-time (tail -f style).
 pub async fn follow(filter: Option<String>, session: Option<String>) -> anyhow::Result<()> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let logs_dir = paths.logs_dir();
 
     if !logs_dir.exists() {
@@ -169,7 +169,7 @@ pub async fn follow(filter: Option<String>, session: Option<String>) -> anyhow::
 pub async fn clear(force: bool) -> anyhow::Result<()> {
     use blockcell_core::logging::clear_all_logs;
 
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let logs_dir = paths.logs_dir();
 
     if !logs_dir.exists() {

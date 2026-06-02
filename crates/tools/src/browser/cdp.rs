@@ -83,9 +83,12 @@ impl CdpClient {
                             } else if let Some(method) = val.get("method").and_then(|v| v.as_str())
                             {
                                 // This is an event
-                                let listeners = events_clone.lock().await;
-                                if let Some(senders) = listeners.get(method) {
+                                let mut listeners = events_clone.lock().await;
+                                if let Some(senders) = listeners.get_mut(method) {
                                     let params = val.get("params").cloned().unwrap_or(Value::Null);
+                                    // 移除已关闭的 sender，防止长时间 browser session
+                                    // 每次 navigate 累积死监听器导致内存泄漏
+                                    senders.retain(|tx| !tx.is_closed());
                                     for tx in senders {
                                         let _ = tx.try_send(params.clone());
                                     }

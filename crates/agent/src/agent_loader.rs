@@ -196,10 +196,14 @@ impl AgentDefinitionLoader {
     /// 创建加载器
     ///
     /// # 参数
-    /// - `blockcell_dir`: BlockCell 配置目录 (通常是 ~/.blockcell)
+    /// - `base_dir`: BlockCell 配置目录 (通常是 ~/.blockcell)
+    /// - `workspace_dir`: workspace 目录 (可选，配置 agents.defaults.workspace 后传入 paths.workspace())
+    ///   未传入时回退到 base_dir/workspace/agents
     /// - `project_dir`: 项目目录 (可选，用于加载项目级 Agent)
-    pub fn new(blockcell_dir: &Path, project_dir: Option<&Path>) -> Self {
-        let user_agents_dir = blockcell_dir.join("workspace").join("agents");
+    pub fn new(base_dir: &Path, workspace_dir: Option<&Path>, project_dir: Option<&Path>) -> Self {
+        let user_agents_dir = workspace_dir
+            .map(|w| w.join("agents"))
+            .unwrap_or_else(|| base_dir.join("workspace").join("agents"));
         let project_agents_dir = project_dir.map(|d| d.join(".blockcell").join("agents"));
         Self {
             user_agents_dir,
@@ -427,7 +431,7 @@ pub fn parse_agent_markdown_from_str(
         )
     })?;
 
-    let raw: AgentFrontmatter = serde_yaml::from_str(frontmatter)
+    let raw: AgentFrontmatter = serde_yaml::from_str(&frontmatter)
         .map_err(|e| AgentLoadError::YamlParse(file_id.clone(), e))?;
 
     if raw.name.is_empty() {
@@ -479,8 +483,13 @@ pub fn parse_agent_markdown_from_str(
 /// 提取 YAML frontmatter 和正文
 ///
 /// 返回 (frontmatter_str, body_str)，如果格式无效返回 None
-fn extract_frontmatter(content: &str) -> Option<(&str, String)> {
-    let trimmed = content.trim_start();
+///
+/// ## 换行符处理
+/// 自动将 `\r\n` 标准化为 `\n`，避免混合换行符导致 frontmatter 解析失败。
+fn extract_frontmatter(content: &str) -> Option<(String, String)> {
+    // 标准化换行符: \r\n → \n，避免混合换行符导致 frontmatter 解析问题
+    let normalized = content.replace("\r\n", "\n");
+    let trimmed = normalized.trim_start();
 
     // 必须以 --- 开头
     if !trimmed.starts_with("---") {
@@ -492,46 +501,31 @@ fn extract_frontmatter(content: &str) -> Option<(&str, String)> {
     let rest = after_first.trim_start_matches(['\r', '\n']);
 
     // 特殊情况：空 frontmatter (---\n---)
-    // 此时 rest 以 --- 开头
     if let Some(stripped) = rest.strip_prefix("---") {
         let body = stripped.trim_start_matches(['\r', '\n']).to_string();
-        return Some(("", body));
+        return Some((String::new(), body));
     }
 
-    // 查找结束的 --- (支持 \n--- 和 \r\n--- 两种换行格式)
+    // 查找结束的 --- (标准化后只有 \n 换行)
     // 也支持文件末尾直接以 --- 结束（无正文的情况）
-    let end_pos = rest
-        .find("\n---")
-        .or_else(|| rest.find("\r\n---"))
-        .or_else(|| {
-            // 处理文件末尾以 --- 结束的情况
-            // 例如: "---\nname: test\n---" (文件到此结束，没有正文)
-            if rest.trim_end().ends_with("---") {
-                let trimmed_rest = rest.trim_end();
-                // 找到末尾 --- 的起始位置
-                // 从后往前找换行符
-                let pos = trimmed_rest
-                    .rfind("\n---")
-                    .or_else(|| trimmed_rest.rfind("\r\n---"))?;
-                // 确认 --- 确实在末尾
-                Some(pos)
-            } else {
-                None
-            }
-        })?;
+    let end_pos = rest.find("\n---").or_else(|| {
+        // 处理文件末尾以 --- 结束的情况
+        if rest.trim_end().ends_with("---") {
+            let trimmed_rest = rest.trim_end();
+            // 查找末尾 --- 的起始位置
+            trimmed_rest.rfind("\n---")
+        } else {
+            None
+        }
+    })?;
 
     let frontmatter = &rest[..end_pos];
 
     // 跳过结束的 "\n---" 分隔符和后续空白
     // 注意：不能使用 trim_start_matches('-')，因为正文开头可能有合法的连字符（如 Markdown 水平线）
-    let after_end = &rest[end_pos..];
-    let after_separator = after_end
-        .strip_prefix("\n---")
-        .or_else(|| after_end.strip_prefix("\r\n---"))
-        .unwrap_or(after_end)
-        .trim_start_matches(['\r', '\n']);
+    let after_separator = rest[end_pos + 4..].trim_start_matches(['\r', '\n']);
 
-    Some((frontmatter, after_separator.to_string()))
+    Some((frontmatter.to_string(), after_separator.to_string()))
 }
 
 /// 解析逗号分隔的列表
@@ -827,7 +821,7 @@ color: blue
     fn test_loader_new() {
         let workspace = PathBuf::from("/home/user/.blockcell");
         let project = PathBuf::from("/home/user/project");
-        let loader = AgentDefinitionLoader::new(&workspace, Some(&project));
+        let loader = AgentDefinitionLoader::new(&workspace, None, Some(&project));
         assert_eq!(
             loader.user_agents_dir,
             PathBuf::from("/home/user/.blockcell/workspace/agents")
@@ -971,7 +965,7 @@ mcp_tools: none
         // agents_dir 不存在
         assert!(!agents_dir.exists());
 
-        let loader = AgentDefinitionLoader::new(tmp_dir.path(), None);
+        let loader = AgentDefinitionLoader::new(tmp_dir.path(), None, None);
         loader.ensure_default_agents();
 
         // 目录应被创建
@@ -1000,7 +994,7 @@ mcp_tools: none
         let custom_content = "---\nname: my-custom\n---\nCustom body";
         std::fs::write(agents_dir.join("code-reviewer.md"), custom_content).unwrap();
 
-        let _loader = AgentDefinitionLoader::new(tmp_dir.path(), None);
+        let _loader = AgentDefinitionLoader::new(tmp_dir.path(), None, None);
         // 目录已存在，ensure_default_agents 不会被 load_all 调用
         // 验证已有文件未被覆盖
         let existing = std::fs::read_to_string(agents_dir.join("code-reviewer.md")).unwrap();

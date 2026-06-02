@@ -326,8 +326,8 @@ fn save_store(paths: &Paths, store: &JobStore) -> Result<()> {
 impl Tool for CronTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "cron",
-            description: "Manage scheduled tasks (cron jobs). You MUST provide `action`. action='add': requires `name` + `message` and exactly one schedule field from `delay_seconds`, `at_ms`, `every_seconds`, or `cron_expr`; optional `delete_after_run`, `mode`, and `skill_name`. action='list': no extra params. action='remove': requires `job_id`.",
+            name: "cron".to_string(),
+            description: "Manage scheduled tasks (cron jobs). You MUST provide `action`. action='add': requires `name` + `message` and exactly one schedule field from `delay_seconds`, `at_ms`, `every_seconds`, or `cron_expr`; optional `delete_after_run`, `mode`, and `skill_name`. action='list': no extra params. action='remove': requires `job_id`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -474,13 +474,10 @@ impl Tool for CronTool {
         let origin_channel = ctx.channel.clone();
         let origin_chat_id = ctx.chat_id.clone();
         let default_timezone = ctx.config.default_timezone.clone();
-        // Derive agent-specific paths from the workspace directory.
-        // ctx.workspace = <base>/workspace, so parent() = <base> (e.g. ~/.blockcell/agents/<id>).
-        let paths = if let Some(base) = ctx.workspace.parent() {
-            Paths::with_base(base.to_path_buf())
-        } else {
-            Paths::new()
-        };
+        // 使用 base + workspace 重建 Paths，保留 workspace override。
+        // 若只用 with_base，自定义 workspace 时 skills_dir() 会指向错误的默认路径，
+        // 导致 resolve_skill_payload_kind 误判 Python 技能为 rhai。
+        let paths = Paths::with_base_and_workspace(ctx.base.clone(), ctx.workspace.clone());
         tokio::task::spawn_blocking(move || {
             execute_cron_action_with_paths(
                 &paths,

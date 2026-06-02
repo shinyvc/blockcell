@@ -366,9 +366,11 @@ pub async fn run(
     model: Option<String>,
     provider: Option<String>,
 ) -> anyhow::Result<()> {
-    let root_paths = Paths::new();
+    let mut root_paths = Paths::new();
     super::env_file::ensure_and_load_blockcell_env(&root_paths)?;
     let root_config = Config::load_or_default(&root_paths)?;
+    root_paths.apply_workspace_config(&root_config.agents.defaults.workspace);
+
     let resolved = resolve_agent_context(
         &root_config,
         &root_paths,
@@ -379,6 +381,11 @@ pub async fn run(
     let session = resolved.session;
     let paths = resolved.paths;
     paths.ensure_dirs()?;
+
+    // 同步 BLOCKCELL_WORKSPACE 环境变量，供 channel listener 等模块读取 media 目录。
+    // 必须在 resolve_agent_context 之后设置：命名 agent（如 --agent ops）的 workspace
+    // 与 root_paths 不同，媒体文件应下载到该 agent 自己的 workspace/media。
+    std::env::set_var("BLOCKCELL_WORKSPACE", paths.workspace());
     let mut config = resolved.config;
     let mcp_manager = Arc::new(McpManager::load(&root_paths).await?);
     let provider_pool = build_pool_with_overrides(&mut config, model, provider)?;
@@ -1305,16 +1312,21 @@ pub async fn run(
         let session_clear_flag_clone = session_clear_flag.clone();
         let response_cache_for_stdin = response_cache.clone();
         let stdin_current_input = current_input.clone();
+        // 创建关闭标志，用于 Ctrl+C 时优雅退出
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let stdin_shutdown_flag = shutdown_flag.clone();
 
         let stdin_handle = tokio::task::spawn_blocking(move || {
             let mut stdout = std::io::stdout();
-            // Create a small tokio runtime for blocking task manager queries
-            let local_rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create local runtime for stdin");
+            // 获取当前运行时句柄，用于在阻塞线程中执行异步命令
+            let handle = tokio::runtime::Handle::current();
 
             loop {
+                // 检查是否收到关闭信号
+                if stdin_shutdown_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 // Note: prompt is printed inside read_line_with_command_picker
                 // to avoid double printing after raw mode is enabled
 
@@ -1325,6 +1337,7 @@ pub async fn run(
                     &session_clone,
                     &stdin_tx,
                     &stdin_current_input,
+                    &stdin_shutdown_flag,
                 );
 
                 // Check if a confirmation request arrived
@@ -1368,7 +1381,7 @@ pub async fn run(
                     }));
 
                     // 同步执行命令处理器
-                    let result = local_rt.block_on(SLASH_COMMAND_HANDLER.try_handle(&input, &ctx));
+                    let result = handle.block_on(SLASH_COMMAND_HANDLER.try_handle(&input, &ctx));
 
                     match result {
                         CommandResult::Handled(response) => {
@@ -1521,6 +1534,7 @@ fn read_line_with_command_picker(
     _session: &str,
     _stdin_tx: &mpsc::Sender<InboundMessage>,
     current_input: &std::sync::Mutex<(String, usize)>,
+    shutdown_flag: &std::sync::atomic::AtomicBool,
 ) -> String {
     let mut input = String::new();
     // 同步共享输入状态
@@ -1583,7 +1597,8 @@ fn read_line_with_command_picker(
                         if c == 'c' && key.modifiers.contains(KeyModifiers::CONTROL) {
                             let _ = terminal::disable_raw_mode();
                             println!();
-                            std::process::exit(0);
+                            shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                            return String::new();
                         }
 
                         // 在光标位置插入字符
@@ -2151,6 +2166,7 @@ fn filter_items<'a>(items: &'a [CommandItem], query: &str) -> Vec<&'a CommandIte
 
 /// Render suggestions below the input line
 /// Returns the total number of filtered items (not just displayed)
+#[allow(clippy::too_many_arguments)]
 fn render_suggestions(
     all_items: &[CommandItem],
     query: &str,

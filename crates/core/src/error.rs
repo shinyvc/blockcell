@@ -1,5 +1,11 @@
 use thiserror::Error;
 
+/// BlockCell 核心错误类型。
+///
+/// ## 设计说明
+/// 大部分变体使用 `String` 承载自由文本消息，而非强类型字段。
+/// 这是有意为之——灵活的消息格式便于快速迭代和动态错误构造。
+/// 未来版本可视稳定性需求逐步引入 typed 错误字段。
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Config error: {0}")]

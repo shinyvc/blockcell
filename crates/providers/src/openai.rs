@@ -129,6 +129,7 @@ impl OpenAIProvider {
         while i < messages.len() {
             let msg = &messages[i];
 
+            // 孤立的 tool 消息（没有前置 assistant tool_calls 轮次）直接跳过
             if msg.role == "tool" {
                 i += 1;
                 continue;
@@ -137,34 +138,41 @@ impl OpenAIProvider {
             if msg.role == "assistant" {
                 if let Some(tool_calls) = &msg.tool_calls {
                     if !tool_calls.is_empty() {
-                        let expected_ids: std::collections::HashSet<&str> =
-                            tool_calls.iter().map(|tc| tc.id.as_str()).collect();
-                        let mut found_ids = std::collections::HashSet::new();
-                        let mut j = i + 1;
+                        // 保存 tool_call ID 用于验证
+                        let round_ids: std::collections::HashSet<String> =
+                            tool_calls.iter().map(|tc| tc.id.clone()).collect();
+                        let id_count = round_ids.len();
 
+                        // 临时缓冲：先收集后续 tool 消息，验证完整后再 push
+                        let mut temp_tool_msgs: Vec<&ChatMessage> = Vec::new();
+                        let mut matched_count = 0usize;
+                        let mut j = i + 1;
                         while j < messages.len() && messages[j].role == "tool" {
-                            if let Some(id) = messages[j].tool_call_id.as_deref() {
-                                if expected_ids.contains(id) {
-                                    found_ids.insert(id);
+                            if let Some(id) = &messages[j].tool_call_id {
+                                if round_ids.contains(id.as_str()) {
+                                    matched_count += 1;
+                                    temp_tool_msgs.push(&messages[j]);
+                                } else {
+                                    warn!(
+                                        tool_call_id = %id,
+                                        "丢弃 tool 消息：ID 与当前轮的 tool_call 不匹配"
+                                    );
                                 }
                             }
                             j += 1;
                         }
 
-                        if expected_ids.iter().all(|id| found_ids.contains(id)) {
+                        // 只有所有 tool_call 都有对应的 tool 结果时，才保留完整轮次
+                        if matched_count == id_count {
                             sanitized.push(msg.clone());
-                            for tool_msg in &messages[(i + 1)..j] {
-                                if let Some(id) = tool_msg.tool_call_id.as_deref() {
-                                    if expected_ids.contains(id) {
-                                        sanitized.push(tool_msg.clone());
-                                    }
-                                }
+                            for tm in temp_tool_msgs {
+                                sanitized.push(tm.clone());
                             }
                         } else {
-                            debug!(
-                                expected = expected_ids.len(),
-                                found = found_ids.len(),
-                                "Dropping incomplete assistant tool-call round before native tool request"
+                            warn!(
+                                tool_call_count = id_count,
+                                matched = matched_count,
+                                "跳过不完整的 tool round：不是所有 tool_call 都有对应的结果"
                             );
                         }
 
@@ -187,7 +195,7 @@ impl OpenAIProvider {
         model: &str,
         max_tokens: u32,
         temperature: f32,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_with_proxy(
             api_key,
             api_base,
@@ -216,7 +224,7 @@ impl OpenAIProvider {
         tool_call_mode: ToolCallMode,
         provider_name: &str,
         reasoning_effort: Option<&str>,
-    ) -> Self {
+    ) -> Result<Self> {
         let resolved_base = api_base
             .unwrap_or("https://api.openai.com/v1")
             .trim_end_matches('/')
@@ -227,8 +235,8 @@ impl OpenAIProvider {
             no_proxy,
             &resolved_base,
             Duration::from_secs(120),
-        );
-        Self {
+        )?;
+        Ok(Self {
             client,
             api_key: api_key.to_string(),
             api_base: resolved_base,
@@ -238,7 +246,7 @@ impl OpenAIProvider {
             tool_call_mode: AtomicU8::new(Self::mode_to_u8(tool_call_mode)),
             provider_name: provider_name.to_string(),
             reasoning_effort: reasoning_effort.map(|s| s.to_string()),
-        }
+        })
     }
 
     fn mode_to_u8(mode: ToolCallMode) -> u8 {
@@ -261,40 +269,7 @@ impl OpenAIProvider {
 
     /// Build a text description of tools to inject into the system prompt.
     fn build_tools_prompt(tools: &[Value]) -> String {
-        let mut s = String::new();
-        s.push_str("\n\n## Available Tools\n");
-        s.push_str("You MUST use tools to accomplish tasks. To call a tool, output a `<tool_call>` block with JSON inside.\n");
-        s.push_str("You may call multiple tools in one response. Each call must be a separate `<tool_call>` block.\n\n");
-        s.push_str("Format (you MUST follow this exact format):\n```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param1\": \"value1\"}}\n</tool_call>\n```\n\n");
-        s.push_str("IMPORTANT RULES:\n");
-        s.push_str("- When the user asks you to do something that requires a tool, you MUST output <tool_call> blocks. Do NOT just describe what you would do.\n");
-        s.push_str("- After outputting tool calls, STOP and wait for the results. Do NOT guess or fabricate results.\n");
-        s.push_str("- If you don't need any tool, just respond normally with text.\n");
-        s.push_str("- For web content, use web_fetch. For search, use web_search.\n\n");
-        s.push_str("Tools:\n");
-
-        for tool in tools {
-            if let Some(func) = tool.get("function") {
-                let name = func
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let desc = func
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let params = func.get("parameters").cloned().unwrap_or(Value::Null);
-                s.push_str(&format!("### {}\n", name));
-                s.push_str(&format!("{}\n", desc));
-                if !params.is_null() {
-                    if let Ok(params_str) = serde_json::to_string_pretty(&params) {
-                        s.push_str(&format!("Parameters: {}\n", params_str));
-                    }
-                }
-                s.push('\n');
-            }
-        }
-        s
+        crate::prompt_utils::build_tools_prompt(tools)
     }
 
     /// Parse text-based tool call blocks from the response content.
@@ -1344,9 +1319,11 @@ struct StreamFunctionCall {
 }
 
 /// 流式请求体
+#[allow(clippy::too_many_arguments)]
 fn finalize_stream_response(
     mode: ToolCallMode,
     tools_available: bool,
+    raw_content_for_parsing: String,
     accumulated_content: String,
     accumulated_reasoning: String,
     mut tool_calls: Vec<ToolCallRequest>,
@@ -1355,17 +1332,21 @@ fn finalize_stream_response(
 ) -> LLMResponse {
     let mut content = accumulated_content;
 
+    // 使用 raw_content 解析文本工具调用（包含 <tool_call> 标记）
+    // filtered_content 已过滤掉工具标记，只用于对用户展示
     if tools_available
         && !matches!(mode, ToolCallMode::None)
         && tool_calls.is_empty()
-        && !content.is_empty()
+        && !raw_content_for_parsing.is_empty()
     {
-        let (remaining_text, parsed_calls) = OpenAIProvider::parse_text_tool_calls(&content);
+        let (remaining_text, parsed_calls) =
+            OpenAIProvider::parse_text_tool_calls(&raw_content_for_parsing);
         if !parsed_calls.is_empty() {
             info!(
                 count = parsed_calls.len(),
-                "Parsed text-based tool calls from streaming response"
+                "Parsed text-based tool calls from streaming response (raw content)"
             );
+            // 使用 remaining_text 作为展示内容（已剥离工具调用标记）
             content = remaining_text;
             tool_calls = parsed_calls;
         }
@@ -1630,6 +1611,9 @@ impl Provider for OpenAIProvider {
             let mut stream = response.bytes_stream();
             let mut buffer = String::new();
             let mut tool_calls: HashMap<usize, ToolCallAccumulator> = HashMap::new();
+            // raw_content 保留完整内容（含 <tool_call> 标记），用于文本工具调用解析
+            // accumulated_content 保存过滤后的内容，用于最终响应对用户展示
+            let mut raw_content = String::new();
             let mut accumulated_content = String::new();
             let mut accumulated_reasoning = String::new();
             let mut finish_reason = "stop".to_string();
@@ -1662,6 +1646,7 @@ impl Provider for OpenAIProvider {
                                     let response = finalize_stream_response(
                                         mode,
                                         tools_available,
+                                        raw_content,
                                         accumulated_content,
                                         accumulated_reasoning,
                                         final_tool_calls,
@@ -1676,11 +1661,14 @@ impl Provider for OpenAIProvider {
                                 if let Ok(chunk) = serde_json::from_str::<StreamResponse>(data) {
                                     if let Some(choice) = chunk.choices.first() {
                                         // 处理文本增量
+                                        // raw_content 保留完整内容（含工具调用标记），用于后续 parse_text_tool_calls
+                                        // filtered_content 只用于对用户流式展示
                                         if let Some(content) = &choice.delta.content {
-                                            accumulated_content.push_str(content);
+                                            raw_content.push_str(content);
                                             if let Some(delta) =
                                                 text_tool_markup_filter.push(content)
                                             {
+                                                accumulated_content.push_str(&delta);
                                                 let _ =
                                                     tx.send(StreamChunk::TextDelta { delta }).await;
                                             }
@@ -1768,6 +1756,7 @@ impl Provider for OpenAIProvider {
             let response = finalize_stream_response(
                 mode,
                 tools_available,
+                raw_content,
                 accumulated_content,
                 accumulated_reasoning,
                 final_tool_calls,
@@ -2130,11 +2119,14 @@ ls -la
 
     #[test]
     fn test_finalize_stream_response_parses_text_mode_tool_call_blocks() {
+        // raw_content_for_parsing 包含 <tool_call> 标记，accumulated_content 已过滤
+        let raw_text = "我来帮您查看上一级目录。\n<tool_call>\n<function=list_dir>\n<parameter=path>/Users/apple/.blockcell</parameter>\n</function>\n</tool_call>".to_string();
         let response = finalize_stream_response(
             ToolCallMode::Text,
             true,
-            "我来帮您查看上一级目录。\n<tool_call>\n<function=list_dir>\n<parameter=path>/Users/apple/.blockcell</parameter>\n</function>\n</tool_call>".to_string(),
-            String::new(),
+            raw_text,
+            String::new(), // accumulated_content（对用户展示的过滤后文本）
+            String::new(), // accumulated_reasoning
             vec![],
             "stop".to_string(),
             Value::Null,
@@ -2155,11 +2147,14 @@ ls -la
 
     #[test]
     fn test_finalize_stream_response_parses_dsml_tool_call_blocks() {
+        // raw_content_for_parsing 包含 DSML 工具调用标记
+        let raw_text = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"list_dir\"><｜DSML｜parameter name=\"path\" string=\"true\">/tmp</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>".to_string();
         let response = finalize_stream_response(
             ToolCallMode::Text,
             true,
-            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"list_dir\"><｜DSML｜parameter name=\"path\" string=\"true\">/tmp</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>".to_string(),
-            String::new(),
+            raw_text,
+            String::new(), // accumulated_content（对用户展示的过滤后文本）
+            String::new(), // accumulated_reasoning
             vec![],
             "stop".to_string(),
             Value::Null,

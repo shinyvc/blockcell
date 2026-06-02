@@ -298,7 +298,12 @@ impl ResponseCache {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_else(|| {
+            tracing::warn!(
+                "[response_cache] timestamp_nanos_opt returned None (timestamp out of range), using 0 as fallback ref_id"
+            );
+            0
+        });
         let mut hasher = DefaultHasher::new();
         session_key.hash(&mut hasher);
         ts.hash(&mut hasher);

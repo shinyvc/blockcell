@@ -11,8 +11,8 @@ pub struct ListTasksTool;
 impl Tool for ListTasksTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "list_tasks",
-            description: "List background tasks (subagent jobs). Shows task status, progress, and results. Use this when the user asks about ongoing work or task progress.",
+            name: "list_tasks".to_string(),
+            description: "List background tasks (subagent jobs). Shows task status, progress, and results. Use this when the user asks about ongoing work or task progress.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

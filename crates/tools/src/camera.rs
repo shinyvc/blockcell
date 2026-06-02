@@ -15,8 +15,8 @@ pub struct CameraCaptureTool;
 impl Tool for CameraCaptureTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "camera_capture",
-            description: "Capture photos from a connected camera on macOS. You MUST provide `action`. action='list'|'info': no extra params. action='capture': optional `device_index`, optional `output_path`, optional `format`; use `device_index` after calling `list`.",
+            name: "camera_capture".to_string(),
+            description: "Capture photos from a connected camera on macOS. You MUST provide `action`. action='list'|'info': no extra params. action='capture': optional `device_index`, optional `output_path`, optional `format`; use `device_index` after calling `list`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

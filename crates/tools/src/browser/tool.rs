@@ -32,8 +32,8 @@ pub struct BrowseTool;
 impl Tool for BrowseTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "browse",
-            description: "Browser automation via Chrome DevTools Protocol. Supports persistent sessions, accessibility snapshots with element refs (@e1, @e2...), click, fill, type, scroll, wait, screenshot, PDF, cookies, tabs, and more.",
+            name: "browse".to_string(),
+            description: "Browser automation via Chrome DevTools Protocol. Supports persistent sessions, accessibility snapshots with element refs (@e1, @e2...), click, fill, type, scroll, wait, screenshot, PDF, cookies, tabs, and more.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -279,6 +279,32 @@ use super::session::BrowserSession;
 
 // ─── Action implementations ───────────────────────────────────────────
 
+/// 等待页面加载完成。订阅 Page.loadEventFired 事件，超时后回退到固定等待。
+/// 订阅 Page.loadEventFired 事件（应在导航前调用，避免竞态）
+async fn subscribe_page_load(
+    cdp: &super::cdp::CdpClient,
+) -> tokio::sync::mpsc::Receiver<serde_json::Value> {
+    cdp.subscribe_event("Page.loadEventFired").await
+}
+
+/// 等待 Page.loadEventFired 事件（使用预先订阅的 receiver）
+async fn wait_for_page_load_event(mut rx: tokio::sync::mpsc::Receiver<serde_json::Value>) {
+    let timeout = std::time::Duration::from_secs(30);
+    match tokio::time::timeout(timeout, rx.recv()).await {
+        Ok(Some(_)) => {
+            tracing::debug!("Page.loadEventFired received");
+        }
+        Ok(None) => {
+            tracing::warn!("Page.loadEventFired channel closed, falling back to fixed wait");
+            tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        }
+        Err(_) => {
+            tracing::warn!("Page.loadEventFired timed out after 30s, falling back to fixed wait");
+            tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        }
+    }
+}
+
 async fn action_navigate(session: &mut BrowserSession, params: &Value) -> Result<Value> {
     let url = params["url"]
         .as_str()
@@ -323,10 +349,18 @@ async fn action_navigate(session: &mut BrowserSession, params: &Value) -> Result
             .await
             .map_err(cdp_err)?;
 
-        session.cdp.navigate(url).await.map_err(cdp_err)?;
+        // 先订阅 load 事件，再发起导航，避免快速页面漏掉事件
+        let load_rx = subscribe_page_load(&session.cdp).await;
+        let nav_result = session.cdp.navigate(url).await.map_err(cdp_err)?;
+        // 检查 Page.navigate 返回的 errorText 字段
+        if let Some(error_text) = nav_result.get("errorText").and_then(|v| v.as_str()) {
+            if !error_text.is_empty() {
+                tracing::warn!(url = %url, error = %error_text, "Page.navigate reported error");
+            }
+        }
         session.current_url = Some(url.to_string());
 
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        wait_for_page_load_event(load_rx).await;
         let snap = take_snapshot(session, true).await?;
 
         tracing::info!(
@@ -347,11 +381,19 @@ async fn action_navigate(session: &mut BrowserSession, params: &Value) -> Result
         }));
     }
 
-    session.cdp.navigate(url).await.map_err(cdp_err)?;
+    // 先订阅 load 事件，再发起导航，避免快速页面（about:blank/data: URL）漏掉事件
+    let load_rx = subscribe_page_load(&session.cdp).await;
+    let nav_result = session.cdp.navigate(url).await.map_err(cdp_err)?;
+    // 检查 Page.navigate 返回的 errorText 字段
+    if let Some(error_text) = nav_result.get("errorText").and_then(|v| v.as_str()) {
+        if !error_text.is_empty() {
+            tracing::warn!(url = %url, error = %error_text, "Page.navigate reported error");
+        }
+    }
     session.current_url = Some(url.to_string());
 
-    // Wait for page load
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    // 等待页面加载（使用预先订阅的 receiver，超时后回退到固定等待）
+    wait_for_page_load_event(load_rx).await;
 
     // Auto-snapshot after navigation
     let snap = take_snapshot(session, true).await?;
@@ -574,7 +616,9 @@ async fn action_screenshot(
     let base64_data = session.cdp.screenshot(full_page).await.map_err(cdp_err)?;
 
     let media_dir = workspace.join("media");
-    std::fs::create_dir_all(&media_dir).ok();
+    if let Err(e) = std::fs::create_dir_all(&media_dir) {
+        tracing::warn!(error = %e, "Failed to create media directory for screenshot");
+    }
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let workspace_path = media_dir.join(format!("screenshot_{}.png", ts));
 
@@ -602,9 +646,13 @@ async fn action_screenshot(
     let extra_path = if let Some(ref up) = user_path {
         if !up.starts_with(workspace) {
             if let Some(parent) = up.parent() {
-                std::fs::create_dir_all(parent).ok();
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!(error = %e, path = %up.display(), "Failed to create parent directory for screenshot output");
+                }
             }
-            std::fs::copy(&workspace_path, up).ok();
+            if let Err(e) = std::fs::copy(&workspace_path, up) {
+                tracing::warn!(error = %e, path = %up.display(), "Failed to copy screenshot to user-specified path");
+            }
             Some(up.display().to_string())
         } else {
             None
@@ -632,7 +680,9 @@ async fn action_pdf(
     let base64_data = session.cdp.print_to_pdf().await.map_err(cdp_err)?;
 
     let media_dir = workspace.join("media");
-    std::fs::create_dir_all(&media_dir).ok();
+    if let Err(e) = std::fs::create_dir_all(&media_dir) {
+        tracing::warn!(error = %e, "Failed to create media directory for PDF");
+    }
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let workspace_path = media_dir.join(format!("page_{}.pdf", ts));
 
@@ -659,9 +709,13 @@ async fn action_pdf(
     let extra_path = if let Some(ref up) = user_path {
         if !up.starts_with(workspace) {
             if let Some(parent) = up.parent() {
-                std::fs::create_dir_all(parent).ok();
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!(error = %e, path = %up.display(), "Failed to create parent directory for PDF output");
+                }
             }
-            std::fs::copy(&workspace_path, up).ok();
+            if let Err(e) = std::fs::copy(&workspace_path, up) {
+                tracing::warn!(error = %e, path = %up.display(), "Failed to copy PDF to user-specified path");
+            }
             Some(up.display().to_string())
         } else {
             None
@@ -1257,7 +1311,12 @@ async fn click_by_backend_node(session: &mut BrowserSession, backend_node_id: i6
 
 /// Click an element by CSS selector.
 async fn click_by_selector(session: &mut BrowserSession, selector: &str) -> Result<()> {
-    let escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
+    let escaped = selector
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('"', "\\\"")
+        .replace('`', "\\`")
+        .replace("${", "\\${");
     let js = format!(
         concat!(
             "(function() {{ var el = document.querySelector('{}');",

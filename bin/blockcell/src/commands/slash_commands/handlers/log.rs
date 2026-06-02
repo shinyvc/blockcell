@@ -15,7 +15,7 @@ fn sync_config_to_file(
     console_enabled: Option<bool>,
     file_enabled: Option<bool>,
 ) -> Result<(), String> {
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let config_path = paths.config_file();
 
     // 加载现有配置
@@ -109,7 +109,7 @@ impl SlashCommand for LogCommand {
                 )))
             }
             LogAction::Clear => {
-                let paths = Paths::default();
+                let paths = Paths::new_configured();
                 let (count, size) = clear_all_logs(&paths.logs_dir());
                 let size_mb = size as f64 / 1024.0 / 1024.0;
                 CommandResult::Handled(CommandResponse::markdown(format!(
@@ -255,7 +255,7 @@ fn show_status(controller: &blockcell_core::logging::LogController) -> CommandRe
     let status = controller.status();
 
     // 统计日志文件数量和大小
-    let paths = Paths::default();
+    let paths = Paths::new_configured();
     let logs_dir = paths.logs_dir();
 
     let mut file_count = 0;

@@ -1,7 +1,8 @@
+use blockcell_core::Result;
 use reqwest::blocking::Client as BlockingClient;
 use reqwest::{Client, Proxy};
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// 代理解析结果
 enum ProxyResolution {
@@ -116,7 +117,7 @@ pub fn build_http_client(
     no_proxy: &[String],
     api_base: &str,
     timeout: Duration,
-) -> Client {
+) -> Result<Client> {
     let mut builder = Client::builder().timeout(timeout);
 
     match resolve_proxy(provider_proxy, global_proxy, no_proxy, api_base) {
@@ -139,9 +140,9 @@ pub fn build_http_client(
         }
     }
 
-    builder.build().unwrap_or_else(|e| {
-        warn!(error = %e, "Failed to build HTTP client with proxy, using default");
-        Client::new()
+    builder.build().map_err(|e| {
+        error!(error = %e, "Failed to build HTTP client");
+        blockcell_core::Error::Provider(format!("HTTP client creation failed: {}", e))
     })
 }
 
@@ -151,7 +152,7 @@ pub fn build_blocking_http_client(
     no_proxy: &[String],
     api_base: &str,
     timeout: Duration,
-) -> BlockingClient {
+) -> Result<BlockingClient> {
     let mut builder = BlockingClient::builder().timeout(timeout);
 
     match resolve_proxy(provider_proxy, global_proxy, no_proxy, api_base) {
@@ -171,9 +172,9 @@ pub fn build_blocking_http_client(
         ProxyResolution::None => {}
     }
 
-    builder.build().unwrap_or_else(|error| {
-        warn!(error = %error, "Failed to build blocking HTTP client with proxy, using default");
-        BlockingClient::new()
+    builder.build().map_err(|e| {
+        error!(error = %e, "Failed to build blocking HTTP client");
+        blockcell_core::Error::Provider(format!("Blocking HTTP client creation failed: {}", e))
     })
 }
 
@@ -281,14 +282,13 @@ mod tests {
     #[test]
     fn test_build_http_client_no_proxy() {
         // 能正常构建出 Client
-        let client = build_http_client(
+        let _client = build_http_client(
             None,
             None,
             &[],
             "https://api.openai.com/v1",
             Duration::from_secs(30),
-        );
-        // reqwest::Client 不提供公开的 proxy 检查，只验证构建不 panic
-        drop(client);
+        )
+        .expect("build_http_client should succeed in test");
     }
 }

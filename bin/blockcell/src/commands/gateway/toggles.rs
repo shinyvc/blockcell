@@ -6,10 +6,10 @@ use super::*;
 /// GET /v1/toggles — get all toggle states
 pub(super) async fn handle_toggles_get(State(state): State<GatewayState>) -> impl IntoResponse {
     let path = state.paths.toggles_file();
-    if !path.exists() {
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
         return Json(serde_json::json!({ "skills": {}, "tools": {} }));
     }
-    match std::fs::read_to_string(&path) {
+    match tokio::fs::read_to_string(&path).await {
         Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
             Ok(val) => Json(val),
             Err(_) => Json(serde_json::json!({ "skills": {}, "tools": {} })),
@@ -35,8 +35,9 @@ pub(super) async fn handle_toggles_update(
     }
 
     let path = state.paths.toggles_file();
-    let mut store: serde_json::Value = if path.exists() {
-        std::fs::read_to_string(&path)
+    let mut store: serde_json::Value = if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        tokio::fs::read_to_string(&path)
+            .await
             .ok()
             .and_then(|c| serde_json::from_str(&c).ok())
             .unwrap_or(serde_json::json!({ "skills": {}, "tools": {} }))
@@ -59,10 +60,12 @@ pub(super) async fn handle_toggles_update(
         store[&req.category][&req.name] = serde_json::json!(false);
     }
 
-    match std::fs::write(
+    match tokio::fs::write(
         &path,
         serde_json::to_string_pretty(&store).unwrap_or_default(),
-    ) {
+    )
+    .await
+    {
         Ok(_) => Json(serde_json::json!({
             "status": "ok",
             "category": req.category,

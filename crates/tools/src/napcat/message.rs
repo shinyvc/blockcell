@@ -28,7 +28,7 @@ pub struct NapcatDeleteMsgTool;
 impl Tool for NapcatDeleteMsgTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_delete_msg",
+            name: "napcat_delete_msg".to_string(),
             description: build_description(
                 "[QQ Message] Recall (delete) a QQ message that was sent. Risk: Medium.",
                 RiskLevel::MediumRisk,
@@ -96,7 +96,7 @@ pub struct NapcatGetMsgTool;
 impl Tool for NapcatGetMsgTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_msg",
+            name: "napcat_get_msg".to_string(),
             description: build_description(
                 "[QQ Message] Get QQ message details by message ID.",
                 RiskLevel::ReadOnly,
@@ -163,7 +163,7 @@ pub struct NapcatSetFriendAddRequestTool;
 impl Tool for NapcatSetFriendAddRequestTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_friend_add_request",
+            name: "napcat_set_friend_add_request".to_string(),
             description: build_description(
                 "[QQ Friend] Handle a QQ friend add request (approve or reject). Risk: Medium.",
                 RiskLevel::MediumRisk,
@@ -245,7 +245,7 @@ pub struct NapcatSetGroupAddRequestTool;
 impl Tool for NapcatSetGroupAddRequestTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_set_group_add_request",
+            name: "napcat_set_group_add_request".to_string(),
             description: build_description(
                 "[QQ Group] Handle a QQ group join request (approve or reject). Risk: Medium.",
                 RiskLevel::MediumRisk,
@@ -337,7 +337,7 @@ pub struct NapcatGetCookiesTool;
 impl Tool for NapcatGetCookiesTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_cookies",
+            name: "napcat_get_cookies".to_string(),
             description: build_description(
                 "[QQ System] Get QQ cookies for a specific domain.",
                 RiskLevel::ReadOnly,
@@ -404,7 +404,7 @@ pub struct NapcatGetCsrfTokenTool;
 impl Tool for NapcatGetCsrfTokenTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "napcat_get_csrf_token",
+            name: "napcat_get_csrf_token".to_string(),
             description: build_description(
                 "[QQ System] Get QQ CSRF token for API authentication.",
                 RiskLevel::ReadOnly,

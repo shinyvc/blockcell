@@ -67,14 +67,15 @@ pub use registry_builder::{
 /// Truncate a string to at most `max_chars` characters, respecting UTF-8 char boundaries.
 /// Returns a borrowed slice if no truncation needed, or an owned String if truncated.
 pub fn safe_truncate(s: &str, max_chars: usize) -> &str {
-    if s.len() <= max_chars {
+    if s.chars().count() <= max_chars {
         return s;
     }
-    // Find the last valid char boundary at or before max_chars bytes
-    let mut end = max_chars;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
+    // 找到第 max_chars 个字符的字节边界
+    let end = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
     &s[..end]
 }
 
@@ -351,6 +352,9 @@ pub trait TaskManagerOps: Send + Sync {
 #[derive(Clone)]
 pub struct ToolContext {
     pub workspace: PathBuf,
+    /// 根 base 目录（如 ~/.blockcell），独立于 workspace_override。
+    /// 工具需要基于 base 重建 Paths 时使用此字段，而非从 workspace 反推。
+    pub base: PathBuf,
     pub builtin_skills_dir: Option<PathBuf>,
     pub active_skill_dir: Option<PathBuf>,
     pub session_key: String,
@@ -408,8 +412,8 @@ impl ToolContext {
 }
 
 pub struct ToolSchema {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub parameters: Value,
 }
 

@@ -171,7 +171,7 @@ pub(super) async fn handle_config_test_provider(
         return Json(serde_json::json!({ "status": "error", "message": "api_key is required" }));
     }
 
-    let provider = blockcell_providers::OpenAIProvider::new_with_proxy(
+    let provider = match blockcell_providers::OpenAIProvider::new_with_proxy(
         api_key,
         api_base,
         model,
@@ -183,7 +183,15 @@ pub(super) async fn handle_config_test_provider(
         blockcell_core::config::ToolCallMode::Native,
         "",
         None,
-    );
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Failed to create provider: {}", e)
+            }));
+        }
+    };
 
     match provider.chat(&test_messages, &[]).await {
         Ok(_) => {
@@ -256,9 +264,13 @@ pub(super) async fn handle_ghost_activity(
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
 
-    let mut activities: Vec<serde_json::Value> = Vec::new();
+    // 将阻塞 I/O 操作移至 spawn_blocking，避免阻塞 Tokio 工作线程
+    let activities: Vec<serde_json::Value> = tokio::task::spawn_blocking(move || {
+        let mut activities = Vec::new();
 
-    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+            return activities;
+        };
         let mut ghost_files: Vec<_> = entries
             .flatten()
             .filter(|e| {
@@ -287,7 +299,6 @@ pub(super) async fn handle_ghost_activity(
             if let Ok(content) = std::fs::read_to_string(&path) {
                 let lines: Vec<&str> = content.lines().collect();
                 let message_count = lines.len();
-
                 let raw_ts = session_id
                     .strip_prefix("ghost_")
                     .unwrap_or(&session_id)
@@ -295,11 +306,9 @@ pub(super) async fn handle_ghost_activity(
                 let timestamp = chrono::NaiveDateTime::parse_from_str(&raw_ts, "%Y%m%d_%H%M%S")
                     .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or(raw_ts);
-
                 let mut routine_prompt = String::new();
                 let mut summary = String::new();
                 let mut tool_calls: Vec<String> = Vec::new();
-
                 for line in &lines {
                     if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {
                         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -335,7 +344,6 @@ pub(super) async fn handle_ghost_activity(
                         }
                     }
                 }
-
                 activities.push(serde_json::json!({
                     "session_id": session_id,
                     "timestamp": timestamp,
@@ -346,7 +354,10 @@ pub(super) async fn handle_ghost_activity(
                 }));
             }
         }
-    }
+        activities
+    })
+    .await
+    .unwrap_or_default();
 
     let count = activities.len();
     Json(serde_json::json!({

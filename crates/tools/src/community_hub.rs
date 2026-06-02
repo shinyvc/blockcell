@@ -80,10 +80,10 @@ fn resolve_api_key(ctx: &ToolContext, params: &Value) -> Option<String> {
 }
 
 fn load_config_from_disk(ctx: &ToolContext) -> Option<Config> {
-    // ctx.workspace is typically ~/.blockcell/workspace
-    // Main config lives at ~/.blockcell/config.json5
-    let base_dir = ctx.workspace.parent()?.to_path_buf();
-    let paths = Paths::with_base(base_dir);
+    // 使用 ctx.base 直接获取 base 目录（如 ~/.blockcell），
+    // 而非从 workspace 反推。当配置了 workspace_override 时，
+    // workspace.parent() 不再是 base 目录。
+    let paths = Paths::with_base(ctx.base.clone());
     Config::load(&paths.config_file()).ok()
 }
 
@@ -138,8 +138,8 @@ async fn hub_post(
 impl Tool for CommunityHubTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: "community_hub",
-            description: "Interact with the Blockcell Community Hub. You MUST provide `action`. action='heartbeat'|'trending'|'feed'|'list_installed': no extra params. action='search_skills'|'node_search': requires `query`, optional `tags`. action='skill_info'|'install_skill'|'uninstall_skill': requires `skill_name`. action='post': requires `content`. action='like'|'get_replies': requires `post_id`. action='reply': requires `post_id` and `content`. Connection settings are resolved internally.",
+            name: "community_hub".to_string(),
+            description: "Interact with the Blockcell Community Hub. You MUST provide `action`. action='heartbeat'|'trending'|'feed'|'list_installed': no extra params. action='search_skills'|'node_search': requires `query`, optional `tags`. action='skill_info'|'install_skill'|'uninstall_skill': requires `skill_name`. action='post': requires `content`. action='like'|'get_replies': requires `post_id`. action='reply': requires `post_id` and `content`. Connection settings are resolved internally.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

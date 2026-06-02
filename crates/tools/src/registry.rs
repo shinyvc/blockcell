@@ -66,6 +66,10 @@ pub const GLOBAL_CORE_TOOL_NAMES: &[&str] = &[
     "session_recall",
 ];
 
+/// 全局核心工具名称列表。
+///
+/// 已废弃：请直接使用 `GLOBAL_CORE_TOOL_NAMES` 常量。
+#[deprecated(note = "直接使用 GLOBAL_CORE_TOOL_NAMES 常量")]
 pub fn global_core_tool_names() -> &'static [&'static str] {
     GLOBAL_CORE_TOOL_NAMES
 }
@@ -382,8 +386,8 @@ mod tests {
     impl Tool for NoRequiredTool {
         fn schema(&self) -> crate::ToolSchema {
             crate::ToolSchema {
-                name: "no_required_tool",
-                description: "Tool without required parameters",
+                name: "no_required_tool".to_string(),
+                description: "Tool without required parameters".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
