@@ -36,7 +36,9 @@ use crate::ghost_learning::{
 use crate::ghost_recall::should_inject_ghost_recall;
 use crate::history_projector::{HistoryProjector, TimeBasedMCConfig};
 use crate::intent::{IntentCategory, IntentToolResolver};
+use crate::memory_event;
 use crate::memory_file_store::MemoryFileStore;
+use crate::response_cache::sanitize_tool_use_id;
 use crate::session_metrics::{ProcessingMetrics, ScopedTimer};
 use crate::skill_executor::{determine_manual_load_mode, SkillExecutionResult};
 use crate::skill_file_store::SkillFileStore;
@@ -2597,6 +2599,15 @@ impl AgentRuntime {
         // Perform async initialization: load cursor state + mark session active
         memory_system.initialize().await?;
 
+        // 将配置中的熔断器阈值应用到运行时熔断器
+        {
+            use crate::session_metrics::CircuitBreakerConfig as AgentCBConfig;
+            let cb_config = AgentCBConfig::from_memory_config(
+                &self.config.memory.memory_system.circuit_breaker,
+            );
+            crate::session_metrics::set_circuit_breaker_configs(&cb_config);
+        }
+
         // ========== Record config for all layers to metrics ==========
 
         // Layer 1: Tool Result Storage
@@ -3135,6 +3146,11 @@ impl AgentRuntime {
             is_auto
         );
         circuit_breaker.record_success();
+
+        // 注意：如果 compact 路径中包含重试逻辑，应在重试时记录：
+        //   crate::memory_event!(layer4, ptl_retry, retry_count);
+        // 如果 token 预算从缓存中失效（需要重建缓存），应记录：
+        //   crate::memory_event!(layer4, cache_break);
 
         info!(
             pre_compact_tokens,
@@ -5077,21 +5093,32 @@ impl AgentRuntime {
                     if let serde_json::Value::String(ref s) = tool_msg.content {
                         let char_count = s.chars().count();
                         if char_count > 2400 {
-                            let head: String = s.chars().take(1600).collect();
-                            let tail: String = s
-                                .chars()
-                                .rev()
-                                .take(800)
-                                .collect::<String>()
-                                .chars()
-                                .rev()
-                                .collect();
-                            tool_msg.content = serde_json::Value::String(format!(
-                                "{}\n...<trimmed {} chars>...\n{}",
-                                head,
-                                char_count - 2400,
-                                tail
-                            ));
+                            // Layer 1: Attempt to persist large tool output to disk before truncation.
+                            // This preserves the full output for later recovery by the memory system.
+                            let persisted_stub = self
+                                .try_persist_large_tool_result(s, tool_msg.tool_call_id.as_deref())
+                                .await;
+
+                            if let Some(stub) = persisted_stub {
+                                tool_msg.content = serde_json::Value::String(stub);
+                            } else {
+                                // Fallback: inline truncation when persistence is unavailable
+                                let head: String = s.chars().take(1600).collect();
+                                let tail: String = s
+                                    .chars()
+                                    .rev()
+                                    .take(800)
+                                    .collect::<String>()
+                                    .chars()
+                                    .rev()
+                                    .collect();
+                                tool_msg.content = serde_json::Value::String(format!(
+                                    "{}\n...<trimmed {} chars>...\n{}",
+                                    head,
+                                    char_count - 2400,
+                                    tail
+                                ));
+                            }
                         }
                     }
                     current_messages.push(tool_msg.clone());
@@ -5876,6 +5903,84 @@ impl AgentRuntime {
             }
         }
         self.tool_registry.execute(tool_name, ctx, arguments).await
+    }
+
+    /// Layer 1: 在截断前将大型工具结果持久化到磁盘。
+    ///
+    /// 如果持久化成功，返回 `<persisted-output>` 存根字符串；
+    /// 如果失败则返回 `None`，由调用方进行内联截断。
+    ///
+    /// TODO: `.tool_results/` 目录无自动清理机制，长期运行会累积磁盘占用。
+    /// 后续应添加基于 TTL 或 LRU 的清理策略。
+    async fn try_persist_large_tool_result(
+        &self,
+        content: &str,
+        tool_call_id: Option<&str>,
+    ) -> Option<String> {
+        let tool_id = sanitize_tool_use_id(tool_call_id.unwrap_or("unknown"));
+        let persistence_dir = self.paths.workspace().join(".tool_results").join(&tool_id);
+        let output_file = persistence_dir.join("output.txt");
+
+        match tokio::fs::create_dir_all(&persistence_dir).await {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    tool_id = %tool_id,
+                    error = %e,
+                    "[layer1] Failed to create tool result persistence directory"
+                );
+                return None;
+            }
+        }
+
+        match tokio::fs::write(&output_file, content).await {
+            Ok(()) => {
+                let byte_size = content.len();
+                let char_count = content.chars().count();
+                let preview: String = content.chars().take(400).collect();
+                let stub = format!(
+                    "<persisted-output>\n\
+                     tool_use_id: {tool_id}\n\
+                     file: {output_path}\n\
+                     size: {byte_size} bytes ({char_count} chars)\n\
+                     preview: {preview}...\n\
+                     </persisted-output>",
+                    tool_id = tool_id,
+                    output_path = output_file.display(),
+                    byte_size = byte_size,
+                    char_count = char_count,
+                    preview = preview,
+                );
+                // Record metrics event
+                let filepath_display = output_file.display().to_string();
+                memory_event!(
+                    layer1,
+                    persisted,
+                    tool_id,
+                    byte_size as u64,
+                    stub.len() as u64,
+                    filepath_display.as_str(),
+                    "unknown",
+                    false
+                );
+                memory_event!(layer1, preview_generated, tool_id, stub.len() as u64);
+                tracing::info!(
+                    tool_id = %tool_id,
+                    path = %output_file.display(),
+                    byte_size = byte_size,
+                    "[layer1] Persisted large tool result to disk"
+                );
+                Some(stub)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tool_id = %tool_id,
+                    error = %e,
+                    "[layer1] Failed to persist large tool result"
+                );
+                None
+            }
+        }
     }
 
     async fn execute_tool_call(

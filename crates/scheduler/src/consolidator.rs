@@ -14,9 +14,11 @@
 //! 4. Prune - 修剪索引
 
 use blockcell_agent::forked::{
-    create_dream_can_use_tool, run_forked_agent, CacheSafeParams, ForkedAgentParams,
+    build_forked_tool_schemas, create_dream_can_use_tool, run_forked_agent, CacheSafeParams,
+    ForkedAgentParams,
 };
 use blockcell_agent::memory_event;
+use blockcell_agent::session_metrics::get_dream_circuit_breaker;
 use blockcell_agent::CrossProcessLock;
 use blockcell_core::types::ChatMessage;
 use serde::{Deserialize, Serialize};
@@ -374,6 +376,7 @@ pub async fn check_gates(
         return GateCheckResult::SessionGateFailed;
     }
 
+    memory_event!(layer6, gate_passed, "all_gates");
     GateCheckResult::Passed
 }
 
@@ -477,13 +480,17 @@ impl DreamConsolidator {
         let mut stats = DreamStats::default();
         let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
             self.orient().await?;
+            memory_event!(layer6, phase_completed, "orient");
             let signals = self.gather().await?;
+            memory_event!(layer6, phase_completed, "gather");
             self.consolidate(&signals).await?;
+            memory_event!(layer6, phase_completed, "consolidate");
             // 在 consolidate 后计算 memory 变化
             let post_memory_state = self.scan_memory_dir(&memory_dir).await;
             stats = self.compute_memory_diff(&pre_memory_state, &post_memory_state);
             // prune 返回修剪统计
             let prune_stats = self.prune().await?;
+            memory_event!(layer6, phase_completed, "prune");
             stats.sessions_pruned = prune_stats.sessions_pruned;
             stats.sessions_processed = prune_stats.sessions_processed;
             Ok::<(), DreamError>(())
@@ -504,17 +511,33 @@ impl DreamConsolidator {
 
         // 只有成功时才推进时间门和会话门，失败/超时保留原值以便重试
         if result.is_ok() {
-            self.state.last_consolidation_time = Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-            );
-            // 只推进到整合开始前的快照值，而非 current_session_count。
-            // 整合期间新增的会话未必被本次 gather/prune 处理，
-            // 下一轮门控应仍能看到这些新会话。
-            self.state.last_session_count = processed_session_count;
-            self.state.consolidation_count += 1;
+            // 检查是否产生了实际变化，避免无效果时推进 gate 状态
+            if stats.memories_created == 0
+                && stats.memories_updated == 0
+                && stats.memories_deleted == 0
+            {
+                tracing::info!("[dream] consolidation produced no changes");
+                // 仍推进时间门以防止无限重试循环，
+                // 但不推进会话门和整合计数（无实际产出）
+                self.state.last_consolidation_time = Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                );
+            } else {
+                self.state.last_consolidation_time = Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                );
+                // 只推进到整合开始前的快照值，而非 current_session_count。
+                // 整合期间新增的会话未必被本次 gather/prune 处理，
+                // 下一轮门控应仍能看到这些新会话。
+                self.state.last_session_count = processed_session_count;
+                self.state.consolidation_count += 1;
+            }
         }
 
         // 最终保存：在同一个跨进程锁保护下完成 read-merge-write，
@@ -659,6 +682,7 @@ impl DreamConsolidator {
                 );
             }
             Err(e) => {
+                memory_event!(layer6, dream_failed, e.to_string());
                 tracing::error!(
                     elapsed_ms = elapsed.as_millis() as u64,
                     error = %e,
@@ -997,6 +1021,13 @@ impl DreamConsolidator {
         // 创建 CacheSafeParams（使用默认系统提示）
         let cache_safe_params = CacheSafeParams::default();
 
+        // 熔断器检查：如果熔断器打开，跳过整合
+        let cb = get_dream_circuit_breaker();
+        if !cb.allow() {
+            tracing::warn!("[dream] Circuit breaker is open, skipping consolidation");
+            return Err(DreamError::CircuitBreakerOpen);
+        }
+
         // 运行 Forked Agent 进行整合
         // 使用 Builder 模式构建参数
         let params = ForkedAgentParams::builder()
@@ -1008,6 +1039,7 @@ impl DreamConsolidator {
             .fork_label("auto_dream")
             .max_turns(10)
             .skip_transcript(true)
+            .tool_schemas(build_forked_tool_schemas(&["exec".to_string()]))
             .build()
             .map_err(|e| {
                 DreamError::ConsolidationFailed(format!("Failed to build params: {}", e))
@@ -1017,6 +1049,9 @@ impl DreamConsolidator {
 
         match result {
             Ok(agent_result) => {
+                // 熔断器记录成功
+                cb.record_success();
+
                 tracing::info!(
                     input_tokens = agent_result.total_usage.input_tokens,
                     output_tokens = agent_result.total_usage.output_tokens,
@@ -1026,6 +1061,9 @@ impl DreamConsolidator {
                 Ok(())
             }
             Err(e) => {
+                // 熔断器记录失败
+                cb.record_failure();
+
                 tracing::error!(error = %e, "[dream] Forked Agent failed");
                 Err(DreamError::ConsolidationFailed(format!("{}", e)))
             }
@@ -1444,6 +1482,9 @@ pub enum DreamError {
 
     #[error("Consolidation timed out after {0}s")]
     Timeout(u64),
+
+    #[error("Circuit breaker is open, dream consolidation blocked")]
+    CircuitBreakerOpen,
 }
 
 #[cfg(test)]

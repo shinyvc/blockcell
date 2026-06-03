@@ -680,7 +680,7 @@ pub const DISK_PERSIST_FAILED_WARNING: &str =
 /// 1. 只保留字母、数字、连字符和下划线
 /// 2. 检查是否为 Windows 保留文件名
 /// 3. 限制长度
-fn sanitize_tool_use_id(tool_use_id: &str) -> String {
+pub fn sanitize_tool_use_id(tool_use_id: &str) -> String {
     // 移除或替换危险字符
     let sanitized: String = tool_use_id
         .chars()
@@ -1248,7 +1248,10 @@ pub async fn process_tool_result(
     // 检查是否已经处理过
     if state.is_seen(tool_use_id) {
         // 返回之前的决定
-        return state.get_replacement(tool_use_id).map(|s| s.to_string());
+        return state.get_replacement(tool_use_id).map(|s| {
+            memory_event!(layer1, replacement_frozen, tool_use_id, s.len());
+            s.to_string()
+        });
     }
 
     // 检查内容大小
@@ -1267,6 +1270,7 @@ pub async fn process_tool_result(
     .await
     {
         Ok(result) => {
+            memory_event!(layer1, preview_generated, tool_use_id, result.original_size);
             let message = build_large_tool_result_message(&result, preview_size_bytes);
             Some(message)
         }

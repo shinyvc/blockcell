@@ -311,6 +311,17 @@ pub fn init_logging(
         return Err(format!("Failed to create logs directory: {}", e));
     }
 
+    // 支持 RUST_LOG_FORMAT=json 环境变量，使用 tracing-subscriber 的 JSON 格式输出
+    let log_format = std::env::var("RUST_LOG_FORMAT").unwrap_or_default();
+    if log_format == "json" {
+        let filter = EnvFilter::new(level);
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init();
+        return Ok(());
+    }
+
     let file_appender = RollingFileAppender::new(Rotation::DAILY, logs_dir, "agent.log");
 
     let filter = EnvFilter::new(level);

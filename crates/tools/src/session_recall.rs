@@ -3,11 +3,15 @@ use async_trait::async_trait;
 use blockcell_core::Result;
 use serde_json::{json, Value};
 
-/// Retrieves a previously cached large response by its cache ID.
+/// 通过缓存 ID 检索之前缓存的助手响应（列表/表格）。
 ///
-/// When the LLM returns a long numbered list or table, the runtime caches the full
-/// content and replaces the history entry with a compact stub containing a ref_id.
-/// Call this tool to get the full content back when the user references a specific item.
+/// 当 LLM 返回长编号列表或表格时，运行时会缓存完整内容
+/// 并用包含 ref_id 的紧凑存根替换历史条目。
+/// 当用户引用特定条目时，调用此工具获取完整内容。
+///
+/// ## 当前范围
+/// 此工具恢复缓存的助手响应（assistant response cache），
+/// 也支持通过 `tool:{id}` 格式的 ID 恢复磁盘持久化的大工具输出（`<persisted-output>` 存根）。
 pub struct SessionRecallTool;
 
 #[async_trait]
@@ -17,6 +21,7 @@ impl Tool for SessionRecallTool {
             name: "session_recall".to_string(),
             description: "从当前会话缓存中取回之前返回的完整列表/表格内容。\
                 当历史消息中出现 [已缓存N条结果，ID: ref:XXXXXX] 时，使用此工具获取完整内容。\
+                也支持通过 `tool:{id}` 格式的 ID 恢复磁盘持久化的大工具输出（`<persisted-output>` 存根）。\
                 场景：用户询问某个列表的第N条、要求展示完整结果、引用之前搜索/查询的数据。"
                 .to_string(),
             parameters: json!({
@@ -24,7 +29,8 @@ impl Tool for SessionRecallTool {
                 "properties": {
                     "id": {
                         "type": "string",
-                        "description": "缓存内容的ID，格式为 ref:XXXXXX 或直接输入 XXXXXX（8位十六进制）"
+                        "description": "缓存内容的ID，格式为 ref:XXXXXX 或直接输入 XXXXXX（8位十六进制），\
+                            也支持 tool:{id} 格式恢复持久化工具输出"
                     }
                 },
                 "required": ["id"]
@@ -44,8 +50,10 @@ impl Tool for SessionRecallTool {
     fn prompt_rule(&self, _ctx: &crate::PromptContext) -> Option<String> {
         Some(
             "- **session_recall**: 当历史消息中出现 `[已缓存N条结果，ID: ref:XXXXXX]` 时，\
-            调用此工具传入对应ID即可取回完整列表内容。用户说「第X条是什么」「完整列表」「显示全部」时优先调用此工具。"
-            .to_string(),
+            调用此工具传入对应ID即可取回完整列表内容。\
+            也支持 `tool:{id}` 格式恢复已持久化的工具输出（`<persisted-output>` 存根）。\
+            用户说「第X条是什么」「完整列表」「显示全部」时优先调用此工具。"
+                .to_string(),
         )
     }
 
@@ -60,8 +68,47 @@ impl Tool for SessionRecallTool {
         if id.is_empty() {
             return Ok(json!({
                 "error": "缺少参数 id",
-                "hint": "请提供缓存ID，例如: ref:a3f8c21e"
+                "hint": "请提供缓存ID，例如: ref:a3f8c21e 或 tool:tool-xxx"
             }));
+        }
+
+        // 检查是否是持久化工具结果 ID
+        if id.starts_with("tool:") {
+            let tool_id = &id[5..]; // 去掉 "tool:" 前缀
+                                    // 路径安全验证：拒绝包含路径遍历字符的 tool_id
+            if tool_id.is_empty()
+                || tool_id.contains("..")
+                || tool_id.contains('/')
+                || tool_id.contains('\\')
+                || tool_id.contains('\0')
+            {
+                return Ok(json!({
+                    "tool_id": tool_id,
+                    "error": "无效的 tool_id，包含不安全字符",
+                    "status": "invalid"
+                }));
+            }
+            let workspace_dir = &ctx.workspace;
+            let output_path = workspace_dir
+                .join(".tool_results")
+                .join(tool_id)
+                .join("output.txt");
+            match tokio::fs::read_to_string(&output_path).await {
+                Ok(content) => {
+                    return Ok(json!({
+                        "tool_id": tool_id,
+                        "content": content,
+                        "status": "found"
+                    }));
+                }
+                Err(_) => {
+                    return Ok(json!({
+                        "tool_id": tool_id,
+                        "error": "未找到持久化工具输出，可能已被清理",
+                        "status": "not_found"
+                    }));
+                }
+            }
         }
 
         let cache = match &ctx.response_cache {

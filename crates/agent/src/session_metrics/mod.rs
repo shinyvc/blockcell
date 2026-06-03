@@ -15,7 +15,8 @@ mod summary;
 
 pub use circuit_breaker::{
     get_compact_circuit_breaker, get_dream_circuit_breaker, get_memory_extraction_circuit_breaker,
-    reset_all_circuit_breakers, CircuitBreaker, CircuitBreakerConfig, CircuitState,
+    reset_all_circuit_breakers, set_circuit_breaker_configs, CircuitBreaker, CircuitBreakerConfig,
+    CircuitState,
 };
 pub use memory::{
     get_memory_metrics, Layer1Metrics, Layer2Metrics, Layer3Metrics, Layer4Metrics, Layer5Metrics,
@@ -164,6 +165,27 @@ macro_rules! memory_event {
         );
     };
 
+    (layer1, persisted, $tool_use_id:expr, $original_size:expr, $preview_size:expr, $filepath:expr, $session_key:expr, $truncated:expr) => {
+        tracing::info!(
+            target: "blockcell.session_metrics.layer1",
+            event = "persisted",
+            tool_use_id = %$tool_use_id,
+            original_size = $original_size,
+            preview_size = $preview_size,
+            filepath = %$filepath,
+            session_key = %$session_key,
+            truncated = $truncated,
+            "Tool result persisted to disk"
+        );
+        $crate::session_metrics::get_memory_metrics().layer1.record_persisted_with_fields(
+            $original_size as u64,
+            $preview_size as u64,
+            $filepath,
+            $session_key,
+            $truncated
+        );
+    };
+
     (layer1, budget_exceeded, $total_size:expr, $budget:expr, $candidates:expr) => {
         tracing::warn!(
             target: "blockcell.session_metrics.layer1",
@@ -182,6 +204,30 @@ macro_rules! memory_event {
             $max_results as u64,
             $preview_limit as u64
         );
+    };
+
+    // Layer 1: Preview generated
+    (layer1, preview_generated, $tool_use_id:expr, $size:expr) => {
+        tracing::debug!(
+            target: "blockcell.session_metrics.layer1",
+            event = "preview_generated",
+            tool_use_id = %$tool_use_id,
+            size = $size,
+            "Preview generated for tool result"
+        );
+        $crate::session_metrics::get_memory_metrics().layer1.record_preview_generated();
+    };
+
+    // Layer 1: Replacement frozen
+    (layer1, replacement_frozen, $tool_use_id:expr, $size:expr) => {
+        tracing::debug!(
+            target: "blockcell.session_metrics.layer1",
+            event = "replacement_frozen",
+            tool_use_id = %$tool_use_id,
+            size = $size,
+            "Replacement frozen for tool result"
+        );
+        $crate::session_metrics::get_memory_metrics().layer1.record_replacement_frozen();
     };
 
     // ========== Layer 2: Micro Compact ==========
@@ -214,6 +260,18 @@ macro_rules! memory_event {
             $gap_minutes as u64,
             $keep_recent as u64
         );
+    };
+
+    // Layer 2: Evaluated
+    (layer2, evaluated, $triggered:expr, $reason:expr) => {
+        tracing::debug!(
+            target: "blockcell.session_metrics.layer2",
+            event = "evaluated",
+            triggered = $triggered,
+            reason = $reason,
+            "Micro compact condition evaluated"
+        );
+        $crate::session_metrics::get_memory_metrics().layer2.record_evaluated($triggered);
     };
 
     // ========== Layer 3: Session Memory ==========
@@ -249,6 +307,23 @@ macro_rules! memory_event {
         $crate::session_metrics::get_memory_metrics().layer3.record_config(
             $max_total as u64,
             $max_section as u64
+        );
+    };
+
+    // Layer 3: Extraction completed
+    (layer3, extraction_completed, $success:expr, $token_cost:expr, $sections:expr) => {
+        tracing::info!(
+            target: "blockcell.session_metrics.layer3",
+            event = "extraction_completed",
+            success = $success,
+            token_cost = $token_cost,
+            sections = $sections,
+            "Session memory extraction completed"
+        );
+        $crate::session_metrics::get_memory_metrics().layer3.record_extraction_completed(
+            $success,
+            $token_cost as u64,
+            $sections as u64
         );
     };
 
@@ -350,6 +425,28 @@ macro_rules! memory_event {
         );
     };
 
+    // Layer 4: Retry
+    // TODO: 当前未接入业务路径 — compact 重试逻辑尚未实现，此事件预留用于未来扩展
+    (layer4, ptl_retry, $attempt:expr) => {
+        tracing::warn!(
+            target: "blockcell.session_metrics.layer4",
+            event = "ptl_retry",
+            attempt = $attempt,
+            "Compact retry"
+        );
+        $crate::session_metrics::get_memory_metrics().layer4.record_retry();
+    };
+
+    // Layer 4: Cache break
+    (layer4, cache_break) => {
+        tracing::warn!(
+            target: "blockcell.session_metrics.layer4",
+            event = "cache_break",
+            "Cache break event"
+        );
+        $crate::session_metrics::get_memory_metrics().layer4.record_cache_break();
+    };
+
     // ========== Layer 5: Memory Extraction ==========
 
     (layer5, memory_written, $memory_type:expr, $filepath:expr, $content_len:expr) => {
@@ -394,6 +491,30 @@ macro_rules! memory_event {
         );
     };
 
+    // Layer 5: Extraction started
+    (layer5, extraction_started, $memory_type:expr, $filepath:expr) => {
+        tracing::debug!(
+            target: "blockcell.session_metrics.layer5",
+            event = "extraction_started",
+            memory_type = $memory_type,
+            filepath = %$filepath,
+            "Memory extraction started"
+        );
+        $crate::session_metrics::get_memory_metrics().layer5.record_extraction_started();
+    };
+
+    // Layer 5: Cursor updated
+    (layer5, cursor_updated, $memory_type:expr, $new_count:expr) => {
+        tracing::debug!(
+            target: "blockcell.session_metrics.layer5",
+            event = "cursor_updated",
+            memory_type = $memory_type,
+            new_count = $new_count,
+            "Memory cursor updated"
+        );
+        $crate::session_metrics::get_memory_metrics().layer5.record_cursor_updated();
+    };
+
     // ========== Layer 6: Auto Dream ==========
 
     (layer6, dream_started, $sessions_count:expr, $hours_since_last:expr) => {
@@ -433,6 +554,39 @@ macro_rules! memory_event {
         $crate::session_metrics::get_memory_metrics().layer6.record_config($interval_hours as u64);
     };
 
+    // Layer 6: Gate passed
+    (layer6, gate_passed, $gate_name:expr) => {
+        tracing::debug!(
+            target: "blockcell.session_metrics.layer6",
+            event = "gate_passed",
+            gate_name = $gate_name,
+            "Dream gate passed"
+        );
+        $crate::session_metrics::get_memory_metrics().layer6.record_gate_passed();
+    };
+
+    // Layer 6: Phase completed
+    (layer6, phase_completed, $phase_name:expr) => {
+        tracing::debug!(
+            target: "blockcell.session_metrics.layer6",
+            event = "phase_completed",
+            phase_name = $phase_name,
+            "Dream phase completed"
+        );
+        $crate::session_metrics::get_memory_metrics().layer6.record_phase_completed();
+    };
+
+    // Layer 6: Dream failed
+    (layer6, dream_failed, $error:expr) => {
+        tracing::error!(
+            target: "blockcell.session_metrics.layer6",
+            event = "dream_failed",
+            error = $error,
+            "Dream consolidation failed"
+        );
+        $crate::session_metrics::get_memory_metrics().layer6.record_failure();
+    };
+
     // ========== Layer 7: Forked Agent ==========
 
     (layer7, agent_spawned, $fork_label:expr, $max_turns:expr, $parent_id:expr) => {
@@ -462,8 +616,8 @@ macro_rules! memory_event {
         );
     };
 
-    // Layer 7: agent_completed with duration
-    (layer7, agent_completed_with_duration, $fork_label:expr, $turns:expr, $tokens:expr, $duration_ms:expr) => {
+    // Layer 7: agent_completed with duration and cache hit rate
+    (layer7, agent_completed_with_duration, $fork_label:expr, $turns:expr, $tokens:expr, $duration_ms:expr, $cache_hit_rate:expr) => {
         tracing::info!(
             target: "blockcell.session_metrics.layer7",
             event = "agent_completed",
@@ -471,12 +625,14 @@ macro_rules! memory_event {
             turns_used = $turns,
             total_tokens = $tokens,
             duration_ms = $duration_ms,
+            cache_hit_rate = $cache_hit_rate,
             "Forked agent completed"
         );
-        $crate::session_metrics::get_memory_metrics().layer7.record_completed_with_duration(
+        $crate::session_metrics::get_memory_metrics().layer7.record_completed_with_duration_and_rate(
             $turns as u64,
             $tokens as u64,
-            $duration_ms as u64
+            $duration_ms as u64,
+            $cache_hit_rate as f64
         );
     };
 
@@ -649,10 +805,13 @@ mod tests {
 
         memory_event!(layer5, injection_completed, 5, 8, 2, 3);
 
-        assert_eq!(metrics.layer5.user_memories(), 5);
-        assert_eq!(metrics.layer5.project_memories(), 8);
-        assert_eq!(metrics.layer5.feedback_memories(), 2);
-        assert_eq!(metrics.layer5.reference_memories(), 3);
+        // injection_completed now only increments injection_count,
+        // not the individual memory counters (to avoid inflation).
+        assert_eq!(metrics.layer5.injection_count(), 1);
+        assert_eq!(metrics.layer5.user_memories(), 0);
+        assert_eq!(metrics.layer5.project_memories(), 0);
+        assert_eq!(metrics.layer5.feedback_memories(), 0);
+        assert_eq!(metrics.layer5.reference_memories(), 0);
     }
 
     #[test]

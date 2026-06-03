@@ -20,6 +20,10 @@ impl SlashCommand for SessionMetricsCommand {
         "session-metrics"
     }
 
+    fn aliases(&self) -> &[&str] {
+        &["session_metrics"]
+    }
+
     fn description(&self) -> &str {
         "Show memory system metrics"
     }

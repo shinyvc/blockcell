@@ -45,6 +45,10 @@ pub struct Layer1Summary {
     pub max_tool_results: u64,
     pub preview_size_limit: u64,
     pub current_stored_results: u64,
+    /// Preview generated count.
+    pub preview_generated_count: u64,
+    /// Replacement frozen count.
+    pub replacement_frozen_count: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,6 +60,8 @@ pub struct Layer2Summary {
     pub gap_threshold_minutes: u64,
     pub keep_recent: u64,
     pub last_trigger_timestamp: u64,
+    pub evaluated_count: u64,
+    pub not_triggered_count: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +74,9 @@ pub struct Layer3Summary {
     pub max_section_length: u64,
     pub last_extraction_timestamp: u64,
     pub section_count: u64,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub total_token_cost: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +97,12 @@ pub struct Layer4Summary {
     pub usage_percentage: f64,
     pub last_compact_timestamp: u64,
     pub total_recovery_budget: u64,
+    /// Retry count.
+    pub retry_count: u64,
+    /// Cache break count.
+    pub cache_break_count: u64,
+    /// Total recovery tokens.
+    pub total_recovery_tokens: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +122,14 @@ pub struct Layer5Summary {
     pub project_bytes: u64,
     pub feedback_bytes: u64,
     pub reference_bytes: u64,
+    /// Number of batch injection events (separate from memory counts).
+    pub injection_count: u64,
+    /// Number of extractions started.
+    pub extraction_started_count: u64,
+    /// Number of cursor updates.
+    pub cursor_updated_count: u64,
+    /// Number of extraction failures.
+    pub extraction_failure_count: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,6 +144,12 @@ pub struct Layer6Summary {
     pub last_dream_timestamp: u64,
     pub sessions_processed: u64,
     pub consolidation_rate: f64,
+    /// Number of gate checks passed.
+    pub gate_passed_count: u64,
+    /// Number of phases completed.
+    pub phase_completed_count: u64,
+    /// Number of dream failures.
+    pub failure_count: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -138,6 +167,8 @@ pub struct Layer7Summary {
     pub avg_tokens_per_agent: f64,
     pub avg_turns: f64,
     pub success_rate: f64,
+    /// Average cache hit rate.
+    pub avg_cache_hit_rate: f64,
 }
 
 /// Get a snapshot of all memory metrics.
@@ -157,6 +188,8 @@ pub fn get_metrics_summary() -> MetricsSummary {
             max_tool_results: m.layer1.max_tool_results(),
             preview_size_limit: m.layer1.preview_size_limit(),
             current_stored_results: m.layer1.current_stored_results(),
+            preview_generated_count: m.layer1.preview_generated_count(),
+            replacement_frozen_count: m.layer1.replacement_frozen_count(),
         },
         layer2: Layer2Summary {
             trigger_count: m.layer2.trigger_count(),
@@ -165,6 +198,8 @@ pub fn get_metrics_summary() -> MetricsSummary {
             gap_threshold_minutes: m.layer2.gap_threshold_minutes(),
             keep_recent: m.layer2.keep_recent(),
             last_trigger_timestamp: m.layer2.last_trigger_timestamp(),
+            evaluated_count: m.layer2.evaluated_count(),
+            not_triggered_count: m.layer2.not_triggered_count(),
         },
         layer3: Layer3Summary {
             extraction_count: m.layer3.extraction_count(),
@@ -174,6 +209,9 @@ pub fn get_metrics_summary() -> MetricsSummary {
             max_section_length: m.layer3.max_section_length(),
             last_extraction_timestamp: m.layer3.last_extraction_timestamp(),
             section_count: m.layer3.section_count(),
+            success_count: m.layer3.success_count(),
+            failure_count: m.layer3.failure_count(),
+            total_token_cost: m.layer3.total_token_cost(),
         },
         layer4: Layer4Summary {
             compact_count: m.layer4.compact_count(),
@@ -191,6 +229,9 @@ pub fn get_metrics_summary() -> MetricsSummary {
             usage_percentage: m.layer4.usage_percentage(),
             last_compact_timestamp: m.layer4.last_compact_timestamp(),
             total_recovery_budget: m.layer4.total_recovery_budget(),
+            retry_count: m.layer4.retry_count(),
+            cache_break_count: m.layer4.cache_break_count(),
+            total_recovery_tokens: m.layer4.total_recovery_tokens(),
         },
         layer5: Layer5Summary {
             extraction_count: m.layer5.extraction_count(),
@@ -207,6 +248,10 @@ pub fn get_metrics_summary() -> MetricsSummary {
             project_bytes: m.layer5.project_bytes(),
             feedback_bytes: m.layer5.feedback_bytes(),
             reference_bytes: m.layer5.reference_bytes(),
+            injection_count: m.layer5.injection_count(),
+            extraction_started_count: m.layer5.extraction_started_count(),
+            cursor_updated_count: m.layer5.cursor_updated_count(),
+            extraction_failure_count: m.layer5.extraction_failure_count(),
         },
         layer6: Layer6Summary {
             dream_count: m.layer6.dream_count(),
@@ -218,6 +263,9 @@ pub fn get_metrics_summary() -> MetricsSummary {
             last_dream_timestamp: m.layer6.last_dream_timestamp(),
             sessions_processed: m.layer6.sessions_processed(),
             consolidation_rate: m.layer6.consolidation_rate(),
+            gate_passed_count: m.layer6.gate_passed_count(),
+            phase_completed_count: m.layer6.phase_completed_count(),
+            failure_count: m.layer6.failure_count(),
         },
         layer7: Layer7Summary {
             spawned_count: m.layer7.spawned_count(),
@@ -232,6 +280,7 @@ pub fn get_metrics_summary() -> MetricsSummary {
             avg_tokens_per_agent: m.layer7.avg_tokens_per_agent(),
             avg_turns: m.layer7.avg_turns(),
             success_rate: m.layer7.success_rate(),
+            avg_cache_hit_rate: m.layer7.avg_cache_hit_rate(),
         },
         compact_circuit_breaker: CircuitBreakerSummary {
             state: compact_cb.state(),
@@ -339,6 +388,12 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
             summary.layer3.section_count
         ));
         output.push_str(&format!(
+            "║  ├─ Success: {} | Failed: {} | Token cost: {}\n",
+            summary.layer3.success_count,
+            summary.layer3.failure_count,
+            summary.layer3.total_token_cost
+        ));
+        output.push_str(&format!(
             "║  └─ Limits: max_total={:.0}K tokens, max_section={} chars\n",
             summary.layer3.max_total_tokens as f64 / 1000.0,
             summary.layer3.max_section_length
@@ -347,8 +402,9 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
 
     // Layer 4 - 重点层
     if layer_filter.is_none() || layer_filter == Some(4) {
-        let success_rate = if summary.layer4.compact_count > 0 {
-            1.0 - (summary.layer4.failed_count as f64 / summary.layer4.compact_count as f64)
+        let total = summary.layer4.compact_count + summary.layer4.failed_count;
+        let success_rate = if total > 0 {
+            1.0 - (summary.layer4.failed_count as f64 / total as f64)
         } else {
             1.0
         };
@@ -389,8 +445,12 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
             summary.layer4.average_compression_ratio * 100.0
         ));
         output.push_str(&format!(
-            "║  └─ Cache hit rate: {:.1}%\n",
+            "║  ├─ Cache hit rate: {:.1}%\n",
             summary.layer4.cache_hit_rate * 100.0
+        ));
+        output.push_str(&format!(
+            "║  └─ Retries: {} | Cache breaks: {}\n",
+            summary.layer4.retry_count, summary.layer4.cache_break_count
         ));
     }
 
@@ -399,8 +459,8 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
         output.push_str("║                                                               ║\n");
         output.push_str("║  🧠 Layer 5: Memory Extraction\n");
         output.push_str(&format!(
-            "║  ├─ Extractions: {}\n",
-            summary.layer5.extraction_count
+            "║  ├─ Extractions: {} (started: {})\n",
+            summary.layer5.extraction_count, summary.layer5.extraction_started_count
         ));
         output.push_str(&format!(
             "║  ├─ Memories: user({})/project({})/feedback({})/ref({})\n",
@@ -412,6 +472,10 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
         output.push_str(&format!(
             "║  ├─ Storage: {} total\n",
             format_bytes(summary.layer5.total_bytes_written)
+        ));
+        output.push_str(&format!(
+            "║  ├─ Injections: {} (separate count)\n",
+            summary.layer5.injection_count
         ));
         output.push_str(&format!(
             "║  └─ Config: min_msg={}, cooldown={}, max_file={:.0}K tokens\n",
@@ -426,8 +490,8 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
         output.push_str("║                                                               ║\n");
         output.push_str("║  💤 Layer 6: Auto Dream\n");
         output.push_str(&format!(
-            "║  ├─ Dream runs: {}\n",
-            summary.layer6.dream_count
+            "║  ├─ Dream runs: {} | Gates passed: {}\n",
+            summary.layer6.dream_count, summary.layer6.gate_passed_count
         ));
         output.push_str(&format!(
             "║  ├─ Memories: +{}/~{}/-{}\n",
@@ -467,6 +531,10 @@ pub fn format_metrics_table(summary: &MetricsSummary, layer_filter: Option<u8>) 
         output.push_str(&format!(
             "║  ├─ Avg duration: {:.1}s\n",
             summary.layer7.avg_completion_time_ms / 1000.0
+        ));
+        output.push_str(&format!(
+            "║  ├─ Avg cache hit rate: {:.1}%\n",
+            summary.layer7.avg_cache_hit_rate * 100.0
         ));
         output.push_str(&format!(
             "║  └─ Tool denied: {}\n",

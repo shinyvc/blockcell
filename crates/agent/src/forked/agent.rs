@@ -2296,6 +2296,8 @@ pub async fn run_forked_agent(
     let mut current_messages = messages.clone();
     let mut final_content = None;
     let mut truncated = false;
+    // Track the actual number of turns used (as opposed to max_turns cap).
+    let mut actual_turns: u32 = max_turns;
 
     for turn in 0..max_turns {
         // 检查取消（使用新的 AbortToken）
@@ -2680,6 +2682,7 @@ pub async fn run_forked_agent(
             );
             continue;
         }
+        actual_turns = turn + 1;
         break;
     }
 
@@ -2699,14 +2702,17 @@ pub async fn run_forked_agent(
         "[forked_agent] completed"
     );
 
-    // 记录 Layer 7 agent_completed 事件（带 duration）
+    let cache_hit_rate = total_usage.cache_hit_rate();
+
+    // 记录 Layer 7 agent_completed 事件（带 duration 和 cache_hit_rate）
     memory_event!(
         layer7,
         agent_completed_with_duration,
         params.fork_label,
-        max_turns,
+        actual_turns as u64,
         total_usage.input_tokens + total_usage.output_tokens,
-        duration_ms
+        duration_ms,
+        cache_hit_rate
     );
 
     Ok(ForkedAgentResult {

@@ -262,6 +262,11 @@ fn parse_summary_from_messages(messages: &[ChatMessage]) -> Result<CompactSummar
             let mut summary = CompactSummary::empty();
             parse_markdown_sections(&content, &mut summary);
 
+            // 检查摘要是否为空：所有 section 都无实际内容时视为无效
+            if summary.total_tokens() == 0 {
+                return Err(CompactError::NoSummary);
+            }
+
             Ok(summary)
         }
         None => Err(CompactError::NoSummary),

@@ -4,7 +4,8 @@
 
 use super::template::validate_session_memory;
 use crate::forked::{
-    create_memory_file_can_use_tool, run_forked_agent, CacheSafeParams, ForkedAgentParams,
+    build_forked_tool_schemas, create_memory_file_can_use_tool, run_forked_agent, CacheSafeParams,
+    ForkedAgentParams,
 };
 use crate::memory_event;
 use crate::token::estimate_tokens;
@@ -98,6 +99,9 @@ pub enum ExtractionError {
 
     #[error("Validation error: {0}")]
     Validation(String),
+
+    #[error("Extraction produced no changes")]
+    NoChange,
 }
 
 /// 判断是否应该提取 Session Memory
@@ -273,6 +277,9 @@ pub async fn extract_session_memory(
     template: &str,
     max_section_length: usize,
 ) -> Result<(), ExtractionError> {
+    // 保存原始内容用于后续变更检测
+    let original_content = current_memory.to_string();
+
     // 记录 Layer 3 提取开始事件
     let message_count = messages.len();
     let token_estimate = estimate_message_tokens(&messages);
@@ -314,13 +321,26 @@ pub async fn extract_session_memory(
         .fork_label("session_memory")
         .max_turns(1)
         .skip_transcript(true)
+        .tool_schemas(build_forked_tool_schemas(&[
+            "exec".to_string(),
+            "read_file".to_string(),
+            "list_dir".to_string(),
+            "grep".to_string(),
+            "glob".to_string(),
+            "write_file".to_string(),
+        ]))
         .build()
-        .map_err(|e| ExtractionError::ForkedAgent(e.to_string()))?;
+        .map_err(|e| {
+            memory_event!(layer3, extraction_completed, false, 0, 0);
+            ExtractionError::ForkedAgent(e.to_string())
+        })?;
 
     // 运行 Forked Agent
     let result = run_forked_agent(params)
         .await
         .map_err(|e| ExtractionError::ForkedAgent(e.to_string()))?;
+
+    let token_cost = result.total_usage.input_tokens + result.total_usage.output_tokens;
 
     tracing::info!(
         input_tokens = result.total_usage.input_tokens,
@@ -397,6 +417,9 @@ pub async fn extract_session_memory(
             })?;
         }
 
+        // 记录提取失败事件（验证失败）
+        memory_event!(layer3, extraction_completed, false, token_cost, 0);
+
         return Err(ExtractionError::Validation(format!(
             "Missing sections: {}, Malformed descriptions: {}",
             validation.missing_sections.join(", "),
@@ -407,6 +430,31 @@ pub async fn extract_session_memory(
     tracing::debug!(
         memory_path = %memory_path.display(),
         "[session_memory] Validation passed"
+    );
+
+    // 注意：内容变更检测使用写入前后的文件内容快照进行比较。
+    // 同一记忆类型的并发提取受冷却机制（cooldown）保护，
+    // 因此 TOCTOU 竞态在实际运行中不会发生。
+    // 检测内容是否发生了变化
+    if updated_content == original_content {
+        tracing::warn!(
+            memory_path = %memory_path.display(),
+            "[session_memory] Extraction produced no changes"
+        );
+        // 记录提取失败事件（无变更）
+        memory_event!(layer3, extraction_completed, false, token_cost, 0);
+        return Err(ExtractionError::NoChange);
+    }
+
+    // 计算 sections 数量用于指标
+    let sections_count = updated_content.matches("\n## ").count() as u64;
+    // 记录提取成功事件
+    memory_event!(
+        layer3,
+        extraction_completed,
+        true,
+        token_cost,
+        sections_count
     );
 
     Ok(())
@@ -439,7 +487,7 @@ Focus on:
 3. Errors & Corrections - Errors encountered and fixes
 4. Worklog - Brief step-by-step record
 
-Use the file_edit tool to update the memory file."#,
+Use the edit_file tool to update the memory file."#,
         memory_path.display(),
         if current_memory.is_empty() {
             template

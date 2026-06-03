@@ -367,6 +367,70 @@ impl Default for Layer7Config {
     }
 }
 
+// === 熔断器配置（用户配置结构，会被转换为运行时的 CircuitBreakerConfig） ===
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CircuitBreakerSettings {
+    #[serde(default = "default_cb_max_failures")]
+    pub max_failures: u64,
+    #[serde(default = "default_cb_reset_timeout_secs")]
+    pub reset_timeout_secs: u64,
+}
+
+fn default_cb_max_failures() -> u64 {
+    3
+}
+fn default_cb_reset_timeout_secs() -> u64 {
+    60
+}
+
+impl Default for CircuitBreakerSettings {
+    fn default() -> Self {
+        Self {
+            max_failures: 3,
+            reset_timeout_secs: 60,
+        }
+    }
+}
+
+// === 监控配置 ===
+// TODO: 接入运行时行为 — 当前仅定义配置结构体，尚未在业务路径中使用
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitoringConfig {
+    #[serde(default = "default_monitoring_enabled")]
+    pub enabled: bool,
+}
+
+fn default_monitoring_enabled() -> bool {
+    true
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+// === 压缩通知配置 ===
+// TODO: 接入运行时行为 — 当前仅定义配置结构体，尚未在业务路径中使用
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactNotificationConfig {
+    #[serde(default = "default_compact_notify_enabled")]
+    pub enabled: bool,
+}
+
+fn default_compact_notify_enabled() -> bool {
+    true
+}
+
+impl Default for CompactNotificationConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 // === 7 层记忆系统配置 ===
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -391,6 +455,14 @@ pub struct MemorySystemConfig {
     pub layer6: Layer6Config,
     #[serde(default)]
     pub layer7: Layer7Config,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerSettings,
+    #[doc(hidden)]
+    #[serde(default)]
+    pub monitoring: MonitoringConfig,
+    #[doc(hidden)]
+    #[serde(default)]
+    pub compact_notification: CompactNotificationConfig,
 }
 
 fn default_token_budget() -> usize {
@@ -410,6 +482,9 @@ impl Default for MemorySystemConfig {
             layer5: Layer5Config::default(),
             layer6: Layer6Config::default(),
             layer7: Layer7Config::default(),
+            circuit_breaker: CircuitBreakerSettings::default(),
+            monitoring: MonitoringConfig::default(),
+            compact_notification: CompactNotificationConfig::default(),
         }
     }
 }
