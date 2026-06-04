@@ -206,7 +206,7 @@ pub async fn list(all: bool, verbose: bool) -> anyhow::Result<()> {
     let records_dir = paths.workspace().join("evolution_records");
 
     let mut records = load_all_records(&records_dir);
-    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    records.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
     if !all {
         // Filter out built-in tool records
@@ -285,7 +285,7 @@ pub async fn show(skill_name: &str) -> anyhow::Result<()> {
     let records_dir = paths.workspace().join("evolution_records");
 
     let mut records = load_all_records(&records_dir);
-    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    records.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
     // Try to match by skill_name or evolution ID prefix
     let matched: Vec<&EvolutionRecord> = records
@@ -349,7 +349,7 @@ pub async fn rollback(skill_name: &str, to: Option<String>) -> anyhow::Result<()
     let records_dir = paths.workspace().join("evolution_records");
 
     let mut records = load_all_records(&records_dir);
-    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    records.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
     let skill_records: Vec<&EvolutionRecord> = records
         .iter()
@@ -824,7 +824,7 @@ fn print_pipeline_stage(name: &str, started: bool, passed: bool) {
 fn print_all_status(paths: &Paths) -> anyhow::Result<()> {
     let records_dir = paths.workspace().join("evolution_records");
     let mut records = load_all_records(&records_dir);
-    records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    records.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
 
     let active_count = records.iter().filter(|r| !is_terminal(&r.status)).count();
     let completed_count = records

@@ -249,7 +249,7 @@ fn print_skills_status(paths: &blockcell_core::Paths) -> String {
             }
         }
     }
-    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    records.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
     let mut seen = HashSet::new();
     let mut learning = Vec::new();

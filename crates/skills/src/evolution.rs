@@ -1559,7 +1559,7 @@ impl SkillEvolution {
             }
         }
 
-        summaries.sort_by(|a, b| b.0.cmp(&a.0));
+        summaries.sort_by_key(|b| std::cmp::Reverse(b.0));
         summaries.into_iter().take(max).map(|(_, s)| s).collect()
     }
 

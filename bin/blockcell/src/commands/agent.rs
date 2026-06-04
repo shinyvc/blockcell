@@ -1682,9 +1682,9 @@ fn read_line_with_command_picker(
                         println!();
                         return input;
                     }
-                    KeyCode::Tab => {
+                    KeyCode::Tab
                         // Select current item in picker
-                        if showing_picker && visible_count > 0 {
+                        if showing_picker && visible_count > 0 => {
                             let query = extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
                             let filtered = filter_items(&all_items, query);
 
@@ -1708,9 +1708,8 @@ fn read_line_with_command_picker(
                                 command_start_pos = None;
                             }
                         }
-                    }
-                    KeyCode::Up => {
-                        if showing_picker && visible_count > 0 && selected_index > 0 {
+                    KeyCode::Up
+                        if showing_picker && visible_count > 0 && selected_index > 0 => {
                             selected_index -= 1;
                             let query = extract_command_query(&input).map(|(_, q)| q).unwrap_or("");
                             visible_count = render_suggestions(
@@ -1725,9 +1724,8 @@ fn read_line_with_command_picker(
                             );
                             prev_visible_limit = visible_limit;
                         }
-                    }
-                    KeyCode::Down => {
-                        if showing_picker && visible_count > 0 {
+                    KeyCode::Down
+                        if showing_picker && visible_count > 0 => {
                             // visible_limit is how many we're showing, visible_count is total available
                             let displayed_count = visible_limit.min(visible_count);
                             let last_displayed_idx = displayed_count.saturating_sub(1);
@@ -1769,9 +1767,8 @@ fn read_line_with_command_picker(
                                 prev_visible_limit = visible_limit;
                             }
                         }
-                    }
-                    KeyCode::Backspace => {
-                        if cursor_pos > 0 {
+                    KeyCode::Backspace
+                        if cursor_pos > 0 => {
                             cursor_pos -= 1;
                             let byte_idx = grapheme_to_byte_index(&input, cursor_pos);
                             let next_byte_idx = grapheme_to_byte_index(&input, cursor_pos + 1);
@@ -1816,7 +1813,6 @@ fn read_line_with_command_picker(
                             use std::io::Write;
                             let _ = stdout.flush();
                         }
-                    }
                     // Delete 键：删除光标后面的字符（向前删除）
                     KeyCode::Delete => {
                         let grapheme_len = grapheme_count(&input);
@@ -1865,8 +1861,8 @@ fn read_line_with_command_picker(
                             let _ = stdout.flush();
                         }
                     }
-                    KeyCode::Left => {
-                        if cursor_pos > 0 {
+                    KeyCode::Left
+                        if cursor_pos > 0 => {
                             cursor_pos -= 1;
                             if let Ok(mut shared) = current_input.lock() {
                                 *shared = (input.clone(), cursor_pos);
@@ -1891,7 +1887,6 @@ fn read_line_with_command_picker(
                             use std::io::Write;
                             let _ = stdout.flush();
                         }
-                    }
                     KeyCode::Right => {
                         let grapheme_len = grapheme_count(&input);
                         if cursor_pos < grapheme_len {
@@ -1920,8 +1915,8 @@ fn read_line_with_command_picker(
                             let _ = stdout.flush();
                         }
                     }
-                    KeyCode::Home => {
-                        if cursor_pos > 0 {
+                    KeyCode::Home
+                        if cursor_pos > 0 => {
                             cursor_pos = 0;
                             if let Ok(mut shared) = current_input.lock() {
                                 *shared = (input.clone(), cursor_pos);
@@ -1946,7 +1941,6 @@ fn read_line_with_command_picker(
                             use std::io::Write;
                             let _ = stdout.flush();
                         }
-                    }
                     KeyCode::End => {
                         let grapheme_len = grapheme_count(&input);
                         if cursor_pos < grapheme_len {
@@ -1975,8 +1969,8 @@ fn read_line_with_command_picker(
                             let _ = stdout.flush();
                         }
                     }
-                    KeyCode::Esc => {
-                        if showing_picker {
+                    KeyCode::Esc
+                        if showing_picker => {
                             clear_suggestions(prev_visible_limit, &input, stdout, cursor_pos);
                             prev_visible_limit = 0;
                             showing_picker = false;
@@ -1986,7 +1980,6 @@ fn read_line_with_command_picker(
                             use std::io::Write;
                             let _ = stdout.flush();
                         }
-                    }
                     _ => {}
                 }
             }

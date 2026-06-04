@@ -101,7 +101,7 @@ impl FileTracker {
         let mut records: Vec<_> = self.records.values().collect();
 
         // 按读取时间降序排序（最近的优先）
-        records.sort_by(|a, b| b.read_at.cmp(&a.read_at));
+        records.sort_by_key(|b| std::cmp::Reverse(b.read_at));
 
         // 截断到最大文件数
         records.truncate(max_files);

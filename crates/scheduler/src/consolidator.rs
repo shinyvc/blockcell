@@ -893,7 +893,7 @@ impl DreamConsolidator {
         }
 
         // 按修改时间降序排序（最新的优先）
-        session_files.sort_by(|a, b| b.1.cmp(&a.1));
+        session_files.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         // 限制处理数量
         let files_to_process = session_files.iter().take(MAX_SESSIONS_TO_PROCESS);
@@ -1084,7 +1084,7 @@ impl DreamConsolidator {
     fn build_consolidation_prompt(&self, memory_dir: &Path, signals: &[GatheredSignal]) -> String {
         // 按重要性排序信号
         let mut sorted_signals = signals.to_vec();
-        sorted_signals.sort_by(|a, b| b.importance.cmp(&a.importance));
+        sorted_signals.sort_by_key(|b| std::cmp::Reverse(b.importance));
 
         // 构建信号摘要
         let signals_section = if sorted_signals.is_empty() {

@@ -2364,11 +2364,10 @@ pub async fn run_forked_agent(
         // 调用 LLM 前：发送进度事件，让用户知道子 agent 正在工作
         if let Some(ref event_tx) = params.event_tx {
             let agent_type_str = params.agent_type.as_deref().unwrap_or("fork");
-            let percent = if max_turns > 0 {
-                (turn * 100 / max_turns).min(100) as u8
-            } else {
-                0
-            };
+            let percent = max_turns
+                .checked_div(1)
+                .map(|mt| (turn * 100 / mt).min(100) as u8)
+                .unwrap_or(0);
             let event = serde_json::json!({
                 "type": "agent_progress",
                 "agent_type": agent_type_str,
@@ -2440,11 +2439,10 @@ pub async fn run_forked_agent(
                 format!("Calling: {}", tools.join(", "))
             };
             // 计算百分比：基于当前 turn / max_turns
-            let percent = if max_turns > 0 {
-                ((turn + 1) * 100 / max_turns).min(100) as u8
-            } else {
-                0
-            };
+            let percent = max_turns
+                .checked_div(1)
+                .map(|mt| ((turn + 1) * 100 / mt).min(100) as u8)
+                .unwrap_or(0);
             let event = serde_json::json!({
                 "type": "agent_progress",
                 "agent_type": agent_type_str,

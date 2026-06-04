@@ -162,7 +162,7 @@ impl Tool for SessionRecallTool {
 
                     if !candidates.is_empty() {
                         // 同一 tool_id 可能被多次调用（跨轮次），按修改时间降序取最新的
-                        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+                        candidates.sort_by_key(|b| std::cmp::Reverse(b.0));
                         if let Some((_, path)) = candidates.into_iter().next() {
                             found_content = tokio::fs::read_to_string(&path).await.ok();
                         }

@@ -73,7 +73,7 @@ impl SystemEventStoreOps for InMemorySystemEventStore {
             .filter(|event| &event.scope == scope)
             .cloned()
             .collect();
-        recent.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+        recent.sort_by_key(|right| std::cmp::Reverse(right.created_at_ms));
         recent.truncate(limit);
         recent
     }

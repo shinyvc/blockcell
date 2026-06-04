@@ -1013,7 +1013,7 @@ pub async fn cleanup_tool_results(
         }
 
         // 按修改时间降序排列（最新的在前）
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         // 阶段 1：TTL 过期清理
         let mut kept: Vec<&(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
@@ -1585,7 +1585,7 @@ pub fn apply_budget(
     // 需要持久化哪些结果？
     // 策略：按大小降序排列，持久化最大的，直到总大小低于预算
     let mut sorted_candidates: Vec<_> = candidates.iter().collect();
-    sorted_candidates.sort_by(|a, b| b.size.cmp(&a.size));
+    sorted_candidates.sort_by_key(|b| std::cmp::Reverse(b.size));
 
     // 标记需要持久化的候选
     let mut to_persist = std::collections::HashSet::new();
@@ -1688,7 +1688,7 @@ pub async fn apply_budget_async(
 
     // 需要持久化哪些结果？
     let mut sorted_candidates: Vec<_> = candidates.iter().collect();
-    sorted_candidates.sort_by(|a, b| b.size.cmp(&a.size));
+    sorted_candidates.sort_by_key(|b| std::cmp::Reverse(b.size));
 
     let mut to_persist = std::collections::HashSet::new();
     let mut current_size = total_size;
