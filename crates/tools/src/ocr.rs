@@ -467,7 +467,14 @@ mod tests {
     #[test]
     fn test_resolve_path() {
         let ws = std::path::Path::new("/workspace");
-        assert_eq!(resolve_path("/abs/path.png", ws), "/abs/path.png");
-        assert_eq!(resolve_path("rel/path.png", ws), "/workspace/rel/path.png");
+        // 使用 PathBuf 比较以兼容 Windows 路径分隔符
+        assert_eq!(
+            std::path::PathBuf::from(resolve_path("/abs/path.png", ws)),
+            std::path::PathBuf::from("/abs/path.png")
+        );
+        assert_eq!(
+            std::path::PathBuf::from(resolve_path("rel/path.png", ws)),
+            ws.join("rel/path.png")
+        );
     }
 }

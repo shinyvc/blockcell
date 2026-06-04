@@ -209,7 +209,11 @@ impl<'a> HistoryProjector<'a> {
         let last_timestamp = last_assistant_timestamp?;
 
         // 计算时间差（使用 wall clock，见上方文档说明）
-        let gap_minutes = (Utc::now() - last_timestamp).num_minutes() as u32;
+        let diff = Utc::now() - last_timestamp;
+        // 防御未来时间戳：如果 last_timestamp 因时钟偏移或迁移数据落在未来，
+        // diff 为负值，num_minutes() 返回负数，as u32 会溢出为巨大正数，
+        // 从而绕过阈值检查并错误触发 microcompact。
+        let gap_minutes: u32 = diff.num_minutes().try_into().unwrap_or(0);
 
         // 必须超过阈值
         if gap_minutes < config.gap_threshold_minutes {

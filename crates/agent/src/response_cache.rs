@@ -21,8 +21,8 @@ pub struct ResponseCacheConfig {
     pub cache_max_per_session: usize,
     /// 可缓存最小字符数（低于此数不缓存）
     pub cacheable_min_chars: usize,
-    /// 预览大小（字节）
-    pub preview_size_bytes: usize,
+    /// 预览大小（以字符为单位）
+    pub preview_size_chars: usize,
     /// 消息级别工具结果上限（字符数）
     pub max_tool_results_per_message_chars: usize,
     /// 内容替换最大条目数
@@ -35,7 +35,7 @@ impl Default for ResponseCacheConfig {
             max_result_size_chars: DEFAULT_MAX_RESULT_SIZE_CHARS,
             cache_max_per_session: default_l1_cache_max(),
             cacheable_min_chars: DEFAULT_CACHEABLE_MIN_CHARS,
-            preview_size_bytes: default_l1_preview_size(),
+            preview_size_chars: default_l1_preview_size(),
             max_tool_results_per_message_chars: default_l1_max_per_message(),
             max_replacement_entries: default_l1_max_replacement(),
         }
@@ -62,7 +62,7 @@ impl From<&blockcell_core::config::Layer1Config> for ResponseCacheConfig {
             max_result_size_chars: c.max_result_size_chars,
             cache_max_per_session: c.cache_max_per_session,
             cacheable_min_chars: c.cacheable_min_chars,
-            preview_size_bytes: c.preview_size_bytes,
+            preview_size_chars: c.preview_size_chars,
             max_tool_results_per_message_chars: c.max_tool_results_per_message_chars,
             max_replacement_entries: c.max_replacement_entries,
         }
@@ -107,6 +107,16 @@ impl ResponseCache {
                 config,
             })),
         }
+    }
+
+    /// 获取配置的最大工具结果字符数阈值（超过此值触发持久化）
+    pub fn max_result_size_chars(&self) -> usize {
+        self.get_lock().config.max_result_size_chars
+    }
+
+    /// 获取配置的预览大小（以字符为单位），用于持久化后的截断预览
+    pub fn preview_size_chars(&self) -> usize {
+        self.get_lock().config.preview_size_chars
     }
 
     /// 安全获取锁，处理锁中毒情况
@@ -348,8 +358,8 @@ use std::path::PathBuf;
 /// 工具结果存储子目录名
 pub const TOOL_RESULTS_SUBDIR: &str = "tool-results";
 
-/// 预览大小（字节）— 仅用作 Default 回退值，运行时使用 Layer1Config.preview_size_bytes
-pub const PREVIEW_SIZE_BYTES: usize = 2000;
+/// 预览大小（字符数）— 仅用作 Default 回退值，运行时使用 Layer1Config.preview_size_chars
+pub const PREVIEW_SIZE_CHARS: usize = 2000;
 
 /// 默认最大结果大小 (~50KB) — 仅用作 Default 回退值，运行时使用 Layer1Config.max_result_size_chars
 pub const DEFAULT_MAX_RESULT_SIZE_CHARS: usize = 50_000;
@@ -368,8 +378,8 @@ pub const IMAGE_MAX_TOKEN_SIZE: usize = 2000;
 pub struct PersistedToolResult {
     /// 持久化文件路径
     pub filepath: PathBuf,
-    /// 原始内容大小（字符数）
-    pub original_size: usize,
+    /// 原始内容大小（字节数，content.len()）
+    pub original_size_bytes: usize,
     /// 是否为 JSON 格式（数组内容）
     pub is_json: bool,
     /// 预览内容
@@ -624,32 +634,44 @@ impl ContentReplacementState {
     }
 }
 
-/// 生成内容预览
+/// 生成内容预览（按字符数截断）
 ///
-/// 在换行边界截断以保持可读性，确保在 UTF-8 字符边界处截断避免 panic
-pub fn generate_preview(content: &str, max_bytes: usize) -> (String, bool) {
-    if content.len() <= max_bytes {
+/// 在换行边界截断以保持可读性，确保按字符数（而非字节数）截断
+pub fn generate_preview(content: &str, max_chars: usize) -> (String, bool) {
+    // 按字符数判断是否需要截断
+    let char_count = content.chars().count();
+    if char_count <= max_chars {
         return (content.to_string(), false);
     }
 
-    // 确保在 UTF-8 字符边界处截断，避免 panic
-    // floor_char_boundary 返回不超过 max_bytes 的最大有效字符边界
-    let safe_boundary = content.floor_char_boundary(max_bytes);
+    // 在字符边界处截断，查找合适的新行断点
+    let char_boundary: usize = content.chars().take(max_chars).map(|c| c.len_utf8()).sum();
 
-    // 在安全边界内查找最后一个换行符，避免在行中间截断
-    let truncated = &content[..safe_boundary];
+    // 在截断范围内查找最后一个换行符，避免在行中间截断
+    let truncated = &content[..char_boundary];
     let last_newline = truncated.rfind('\n');
 
     // 如果找到换行符且位置合理（> 50% 限制），使用它
     let cut_point = last_newline
-        .filter(|&pos| pos > safe_boundary / 2)
-        .unwrap_or(safe_boundary);
+        .filter(|&pos| pos > char_boundary / 2)
+        .unwrap_or(char_boundary);
 
     (content[..cut_point].to_string(), true)
 }
 
-/// 格式化文件大小
-fn format_file_size(size: usize) -> String {
+/// 格式化字符数（用于 preview 大小显示）
+fn format_chars(size: usize) -> String {
+    if size < 1024 {
+        format!("{} chars", size)
+    } else if size < 1024 * 1024 {
+        format!("{:.1}K chars", size as f64 / 1024.0)
+    } else {
+        format!("{:.1}M chars", size as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// 格式化字节数（用于原始内容大小显示）
+fn format_bytes(size: usize) -> String {
     if size < 1024 {
         format!("{} B", size)
     } else if size < 1024 * 1024 {
@@ -780,19 +802,19 @@ pub fn sanitize_tool_use_id(tool_use_id: &str) -> String {
 fn build_memory_fallback_message(
     content: &str,
     tool_use_id: &str,
-    preview_size_bytes: usize,
+    preview_size_chars: usize,
 ) -> String {
     // 清理 tool_use_id 以防止换行符注入到日志/显示中
     let safe_tool_use_id = sanitize_tool_use_id(tool_use_id);
 
-    let (preview, has_more) = generate_preview(content, preview_size_bytes);
+    let (preview, has_more) = generate_preview(content, preview_size_chars);
 
     let mut message = format!(
         "{}\n{}\n\nTool ID: {}\nPreview (first {}):\n{}",
         MEMORY_FALLBACK_TAG,
         DISK_PERSIST_FAILED_WARNING,
         safe_tool_use_id,
-        format_file_size(preview_size_bytes),
+        format_chars(preview_size_chars),
         preview
     );
     if has_more {
@@ -809,21 +831,21 @@ fn build_memory_fallback_message(
 /// `session_recall(id="tool:{id}")` 恢复完整输出。
 pub fn build_large_tool_result_message(
     result: &PersistedToolResult,
-    preview_size_bytes: usize,
+    preview_size_chars: usize,
 ) -> String {
     let mut message = format!(
         "{}\nOutput too large ({}). Full output saved to: {}\n\
          Tool ID: {}\n\
          Recall with: session_recall(id=\"{}\")\n\n",
         PERSISTED_OUTPUT_TAG,
-        format_file_size(result.original_size),
+        format_bytes(result.original_size_bytes),
         result.filepath.display(),
         result.tool_ref,
         result.tool_ref,
     );
     message.push_str(&format!(
         "Preview (first {}):\n{}",
-        format_file_size(preview_size_bytes),
+        format_chars(preview_size_chars),
         result.preview
     ));
     if result.has_more {
@@ -845,7 +867,7 @@ pub async fn persist_tool_result(
     tool_use_id: &str,
     session_key: &str,
     workspace_dir: &std::path::Path,
-    preview_size_bytes: usize,
+    preview_size_chars: usize,
 ) -> Result<PersistedToolResult, PersistToolResultError> {
     // 清理 tool_use_id 防止路径注入
     let safe_tool_use_id = sanitize_tool_use_id(tool_use_id);
@@ -866,14 +888,11 @@ pub async fn persist_tool_result(
         .join(&dir_name);
 
     // 验证目录路径仍在工作目录内（防止路径遍历攻击）
-    let dir_canonical = match std::fs::canonicalize(
-        persistence_dir
-            .parent()
-            .unwrap_or(&persistence_dir),
-    ) {
-        Ok(p) => p,
-        Err(_) => persistence_dir.clone(), // 目录不存在时使用原始路径
-    };
+    let dir_canonical =
+        match std::fs::canonicalize(persistence_dir.parent().unwrap_or(&persistence_dir)) {
+            Ok(p) => p,
+            Err(_) => persistence_dir.clone(), // 目录不存在时使用原始路径
+        };
     let workspace_canonical = match std::fs::canonicalize(workspace_dir) {
         Ok(p) => p,
         Err(_) => workspace_dir.to_path_buf(),
@@ -907,7 +926,7 @@ pub async fn persist_tool_result(
         });
     }
 
-    let (preview, has_more) = generate_preview(content, preview_size_bytes);
+    let (preview, has_more) = generate_preview(content, preview_size_chars);
 
     // 构建可召回引用 ID，包含 UUID 后缀用于精确定位目录
     // 新格式 tool:{tool_id}:{call_uuid} — session_recall 优先按精确目录名匹配；
@@ -916,7 +935,7 @@ pub async fn persist_tool_result(
 
     Ok(PersistedToolResult {
         filepath: output_file,
-        original_size: content.len(),
+        original_size_bytes: content.len(),
         is_json: content.trim_start().starts_with('['),
         preview,
         has_more,
@@ -1076,10 +1095,11 @@ mod layer1_tests {
     fn test_generate_preview_long() {
         let content = "line1\nline2\nline3\nline4\nline5\n";
         let (preview, has_more) = generate_preview(content, 20);
-        assert!(preview.len() <= 20);
+        // 按字符数截断：预览字符数不超过 20
+        assert!(preview.chars().count() <= 20);
         assert!(has_more);
-        // Should break at newline
-        assert!(preview.ends_with('\n') || preview.len() < 20);
+        // 应在换行符处截断
+        assert!(preview.ends_with('\n') || preview.chars().count() < 20);
     }
 
     #[test]
@@ -1102,14 +1122,14 @@ mod layer1_tests {
     fn test_build_large_tool_result_message() {
         let result = PersistedToolResult {
             filepath: PathBuf::from("/path/to/file.json"),
-            original_size: 100_000,
+            original_size_bytes: 100_000,
             is_json: true,
             preview: "preview content".to_string(),
             has_more: true,
             tool_ref: "tool:call_abc123:a1b2c3d4e5f6a7b8".to_string(),
         };
 
-        let message = build_large_tool_result_message(&result, PREVIEW_SIZE_BYTES);
+        let message = build_large_tool_result_message(&result, PREVIEW_SIZE_CHARS);
         assert!(message.starts_with(PERSISTED_OUTPUT_TAG));
         assert!(message.ends_with(PERSISTED_OUTPUT_CLOSING_TAG));
         assert!(message.contains("97.7 KB"));
@@ -1120,10 +1140,17 @@ mod layer1_tests {
     }
 
     #[test]
-    fn test_format_file_size() {
-        assert_eq!(format_file_size(500), "500 B");
-        assert_eq!(format_file_size(1024), "1.0 KB");
-        assert_eq!(format_file_size(1024 * 1024), "1.0 MB");
+    fn test_format_chars() {
+        assert_eq!(format_chars(500), "500 chars");
+        assert_eq!(format_chars(1024), "1.0K chars");
+        assert_eq!(format_chars(1024 * 1024), "1.0M chars");
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
     }
 
     #[test]
@@ -1141,7 +1168,7 @@ mod layer1_tests {
                 &state,
                 DEFAULT_MAX_RESULT_SIZE_CHARS,
                 workspace,
-                PREVIEW_SIZE_BYTES,
+                PREVIEW_SIZE_CHARS,
             )
             .await;
 
@@ -1262,7 +1289,7 @@ mod layer1_tests {
         let mut state = ContentReplacementState::default();
         let budget = 100_000; // 150KB budget
 
-        let result = apply_budget(&messages, &candidates, &mut state, budget);
+        let result = apply_budget(&messages, &candidates, &mut state, budget, 2000);
 
         // 应该触发替换
         assert!(state.is_seen("call-1") || state.is_seen("call-2"));
@@ -1272,14 +1299,15 @@ mod layer1_tests {
 
     #[test]
     fn test_generate_preview_utf8_boundary() {
-        // 测试 UTF-8 边界处理
-        let content = "你好世界".repeat(1000); // 多字节字符
+        // 测试按字符数截断：每个中文字符 3 字节
+        let content = "你好世界".repeat(1000); // 多字节字符，共 4000 字符 / 12000 字节
         let (preview, has_more) = generate_preview(&content, 100);
 
-        // 预览应该在安全边界截断
-        assert!(preview.len() <= 105); // 允许一点误差
+        // 预览字符数不超过 100（字节长度可能 > 100，因为每字符 3 字节）
+        assert!(preview.chars().count() <= 100);
         assert!(has_more);
-        // 确保没有 panic
+        // 确保没有 panic 且字符串有效
+        assert!(preview.is_char_boundary(preview.len()));
     }
 
     #[test]
@@ -1376,10 +1404,15 @@ mod layer1_tests {
     #[tokio::test]
     async fn test_cleanup_tool_results_removes_old_entries() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let session_dir = tmp.path().join(".tool_results").join("test_session_abc12345");
+        let session_dir = tmp
+            .path()
+            .join(".tool_results")
+            .join("test_session_abc12345");
         let entry_dir = session_dir.join("tool_call_old_entry");
         tokio::fs::create_dir_all(&entry_dir).await.unwrap();
-        tokio::fs::write(entry_dir.join("output.txt"), "old content").await.unwrap();
+        tokio::fs::write(entry_dir.join("output.txt"), "old content")
+            .await
+            .unwrap();
 
         // 使用 TTL=0 天（立即清理所有条目）
         let (entries, _) = cleanup_tool_results(tmp.path(), 0, 50).await;
@@ -1392,12 +1425,17 @@ mod layer1_tests {
     #[tokio::test]
     async fn test_cleanup_tool_results_respects_max_entries() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let session_dir = tmp.path().join(".tool_results").join("test_session_def12345");
+        let session_dir = tmp
+            .path()
+            .join(".tool_results")
+            .join("test_session_def12345");
         // 创建 5 个条目
         for i in 0..5 {
             let entry_dir = session_dir.join(format!("tool_call_{i}_uuid{i}"));
             tokio::fs::create_dir_all(&entry_dir).await.unwrap();
-            tokio::fs::write(entry_dir.join("output.txt"), format!("content {i}")).await.unwrap();
+            tokio::fs::write(entry_dir.join("output.txt"), format!("content {i}"))
+                .await
+                .unwrap();
         }
         // 限制为 2 个条目，TTL=365 天（不过期）
         let (removed, _) = cleanup_tool_results(tmp.path(), 365, 2).await;
@@ -1433,7 +1471,7 @@ pub async fn process_tool_result(
     state: &ContentReplacementState,
     threshold: usize,
     workspace_dir: &std::path::Path,
-    preview_size_bytes: usize,
+    preview_size_chars: usize,
 ) -> Option<String> {
     // 检查是否已经处理过
     if state.is_seen(tool_use_id) {
@@ -1455,13 +1493,18 @@ pub async fn process_tool_result(
         tool_use_id,
         session_key,
         workspace_dir,
-        preview_size_bytes,
+        preview_size_chars,
     )
     .await
     {
         Ok(result) => {
-            memory_event!(layer1, preview_generated, tool_use_id, result.original_size);
-            let message = build_large_tool_result_message(&result, preview_size_bytes);
+            memory_event!(
+                layer1,
+                preview_generated,
+                tool_use_id,
+                result.original_size_bytes
+            );
+            let message = build_large_tool_result_message(&result, preview_size_chars);
             Some(message)
         }
         Err(e) => {
@@ -1472,7 +1515,7 @@ pub async fn process_tool_result(
                 "[process_tool_result] Failed to persist, using memory fallback"
             );
             let fallback_message =
-                build_memory_fallback_message(content, tool_use_id, preview_size_bytes);
+                build_memory_fallback_message(content, tool_use_id, preview_size_chars);
             Some(fallback_message)
         }
     }
@@ -1523,12 +1566,13 @@ pub fn collect_tool_result_candidates(
 /// - `candidates`: 工具结果候选列表
 /// - `state`: 内容替换状态（会被更新）
 /// - `budget`: 消息级别预算
-/// - `workspace_dir`: 工作目录
+/// - `preview_size_chars`: 预览字符数限制
 pub fn apply_budget(
     messages: &[blockcell_core::types::ChatMessage],
     candidates: &[ToolResultCandidate],
     state: &mut ContentReplacementState,
     budget: usize,
+    preview_size_chars: usize,
 ) -> Vec<blockcell_core::types::ChatMessage> {
     // 计算总大小
     let total_size: usize = candidates.iter().map(|c| c.size).sum();
@@ -1583,12 +1627,22 @@ pub fn apply_budget(
                 // 标记为已处理
                 state.mark_seen(tool_call_id.clone());
 
-                // 创建替换消息（实际路径需要持久化后获取）
+                // 同步路径无法执行磁盘持久化，使用 memory-fallback 标签
+                // 而非 persisted-output，避免产生可通过 session_recall 召回的假象。
+                // 如需真正的磁盘持久化，应使用 apply_budget_async。
+                let content_preview = match &msg.content {
+                    serde_json::Value::String(s) => {
+                        let (preview, _has_more) = generate_preview(s, preview_size_chars);
+                        preview
+                    }
+                    _ => String::new(),
+                };
                 let replacement = format!(
-                    "{}\nOutput too large, persisted to disk.\n\nPreview:\n{}\n{}",
-                    PERSISTED_OUTPUT_TAG,
-                    TIME_BASED_MC_CLEARED_MESSAGE,
-                    PERSISTED_OUTPUT_CLOSING_TAG
+                    "{}\nOutput too large for inline display. Not persisted to disk; preview only.\n\nPreview (first {}):\n{}\n\n{}",
+                    MEMORY_FALLBACK_TAG,
+                    format_chars(preview_size_chars),
+                    content_preview,
+                    MEMORY_FALLBACK_CLOSING_TAG
                 );
 
                 state.set_replacement(tool_call_id.clone(), replacement.clone());
@@ -1613,7 +1667,7 @@ pub async fn apply_budget_async(
     budget: usize,
     workspace_dir: &std::path::Path,
     session_key: &str,
-    preview_size_bytes: usize,
+    preview_size_chars: usize,
 ) -> Vec<blockcell_core::types::ChatMessage> {
     // 计算总大小
     let total_size: usize = candidates.iter().map(|c| c.size).sum();
@@ -1670,7 +1724,7 @@ pub async fn apply_budget_async(
             &candidate.tool_use_id,
             session_key,
             workspace_dir,
-            preview_size_bytes,
+            preview_size_chars,
         )
         .await
         {
@@ -1680,14 +1734,14 @@ pub async fn apply_budget_async(
                     layer1,
                     persisted,
                     &candidate.tool_use_id,
-                    result.original_size,
+                    result.original_size_bytes,
                     result.preview.len()
                 );
                 // 更新当前存储计数
                 crate::session_metrics::get_memory_metrics()
                     .layer1
                     .increment_stored_count();
-                let message = build_large_tool_result_message(&result, preview_size_bytes);
+                let message = build_large_tool_result_message(&result, preview_size_chars);
                 replacements.insert(candidate.tool_use_id.clone(), message);
             }
             Err(e) => {
@@ -1702,7 +1756,7 @@ pub async fn apply_budget_async(
                 let fallback_message = build_memory_fallback_message(
                     &candidate.content,
                     &candidate.tool_use_id,
-                    preview_size_bytes,
+                    preview_size_chars,
                 );
                 replacements.insert(candidate.tool_use_id.clone(), fallback_message);
             }

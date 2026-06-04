@@ -167,11 +167,7 @@ pub struct SwitchableFileLayer {
 }
 
 impl SwitchableFileLayer {
-    pub fn new(
-        enabled: Arc<Mutex<bool>>,
-        writer: RollingFileAppender,
-        json_format: bool,
-    ) -> Self {
+    pub fn new(enabled: Arc<Mutex<bool>>, writer: RollingFileAppender, json_format: bool) -> Self {
         Self {
             enabled,
             writer: Arc::new(Mutex::new(writer)),
@@ -314,7 +310,11 @@ fn format_event_json(event: &tracing::Event<'_>) -> String {
     let timestamp = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
     let level = event.metadata().level().to_string();
-    let target = event.metadata().module_path().unwrap_or("unknown").to_string();
+    let target = event
+        .metadata()
+        .module_path()
+        .unwrap_or("unknown")
+        .to_string();
 
     let mut visitor = JsonVisitor::new();
     event.record(&mut visitor);
@@ -349,7 +349,10 @@ impl tracing::field::Visit for JsonVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let val = format!("{:?}", value);
         if field.name() == "message" {
-            self.message = val;
+            // 尝试用 JSON 反解去除 Debug 格式化产生的引号和转义（如 "\"text\"" → "text"）。
+            // 失败时保留原始 debug 字符串，避免破坏非标准内容。
+            let decoded = serde_json::from_str::<String>(&val);
+            self.message = decoded.unwrap_or(val);
         } else {
             self.fields
                 .insert(field.name().to_string(), serde_json::Value::String(val));
@@ -431,8 +434,7 @@ pub fn init_logging(
     let console_enabled_flag = Arc::new(Mutex::new(console_enabled));
     let file_enabled_flag = Arc::new(Mutex::new(file_enabled));
 
-    let console_layer =
-        SwitchableConsoleLayer::new(console_enabled_flag.clone(), json_format);
+    let console_layer = SwitchableConsoleLayer::new(console_enabled_flag.clone(), json_format);
     let file_layer =
         SwitchableFileLayer::new(file_enabled_flag.clone(), file_appender, json_format);
 

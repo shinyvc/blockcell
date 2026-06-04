@@ -176,8 +176,9 @@ impl CacheSafeParams {
         if self.system_context != other.system_context {
             return false;
         }
-        // fork 上下文消息必须匹配（ChatMessage 无 PartialEq，通过规范化序列化比较）
-        // 比较所有字段：role、content、reasoning_content、tool_calls、tool_call_id、name、id
+        // fork 上下文消息必须匹配（排除 volatile id 字段，只比较语义字段）
+        // 比较字段：role、content、reasoning_content、tool_calls、tool_call_id、name
+        // 排除 id：ChatMessage::user() 每次生成随机 UUID，纳入比较会导致相同上下文不兼容
         if self.fork_context_messages.len() != other.fork_context_messages.len() {
             return false;
         }
@@ -186,10 +187,22 @@ impl CacheSafeParams {
             .iter()
             .zip(other.fork_context_messages.iter())
         {
-            // 序列化比较确保所有字段一致，避免仅比较 role/content 遗漏差异
-            let left_json = serde_json::to_string(left).ok();
-            let right_json = serde_json::to_string(right).ok();
-            if left_json != right_json {
+            // 序列化为 Value 后移除 id，确保语义字段一致
+            let mut left_val = match serde_json::to_value(left) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let mut right_val = match serde_json::to_value(right) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            if let (Some(l_obj), Some(r_obj)) =
+                (left_val.as_object_mut(), right_val.as_object_mut())
+            {
+                l_obj.remove("id");
+                r_obj.remove("id");
+            }
+            if left_val != right_val {
                 return false;
             }
         }

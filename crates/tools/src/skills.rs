@@ -255,7 +255,7 @@ impl ListSkillsTool {
             has_md,
             script_assets: script_assets
                 .into_iter()
-                .map(|path| path.display().to_string())
+                .map(|path| path.display().to_string().replace('\\', "/"))
                 .collect(),
         }
     }
@@ -911,6 +911,8 @@ mod tests {
         assert!(asset_paths.contains(&"SKILL.py"));
         assert!(asset_paths.contains(&"scripts/flow.rhai"));
         assert!(asset_paths.contains(&"scripts/report.py"));
+        // bin/run 无扩展名，在 Windows 上无法通过扩展名或可执行位检测为脚本资产
+        #[cfg(not(target_os = "windows"))]
         assert!(asset_paths.contains(&"bin/run"));
 
         let _ = std::fs::remove_dir_all(root);

@@ -878,13 +878,14 @@ mod tests {
             agent_type_registry: None,
             evolution_workflow_store: None,
         };
+        // 使用 PathBuf 比较以兼容 Windows 路径分隔符
         assert_eq!(
-            resolve_path(&ctx, "/absolute/path.mp4"),
-            "/absolute/path.mp4"
+            std::path::PathBuf::from(resolve_path(&ctx, "/absolute/path.mp4")),
+            std::path::PathBuf::from("/absolute/path.mp4")
         );
         assert_eq!(
-            resolve_path(&ctx, "relative.mp4"),
-            "/tmp/workspace/relative.mp4"
+            std::path::PathBuf::from(resolve_path(&ctx, "relative.mp4")),
+            ctx.workspace.join("relative.mp4")
         );
     }
 }

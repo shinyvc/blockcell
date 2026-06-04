@@ -109,9 +109,7 @@ impl Tool for SessionRecallTool {
                 }
             };
 
-            let session_dir = workspace_dir
-                .join(".tool_results")
-                .join(&session_id);
+            let session_dir = workspace_dir.join(".tool_results").join(&session_id);
 
             let mut found_content: Option<String> = None;
 
@@ -126,9 +124,7 @@ impl Tool for SessionRecallTool {
                 if let Some((base_id, call_uuid)) = tool_id.rsplit_once(':') {
                     if !call_uuid.is_empty() && !base_id.is_empty() {
                         let exact_dir_name = format!("{base_id}_{call_uuid}");
-                        let exact_path = session_dir
-                            .join(&exact_dir_name)
-                            .join("output.txt");
+                        let exact_path = session_dir.join(&exact_dir_name).join("output.txt");
                         if tokio::fs::metadata(&exact_path).await.is_ok() {
                             found_content = tokio::fs::read_to_string(&exact_path).await.ok();
                         }
@@ -174,15 +170,11 @@ impl Tool for SessionRecallTool {
                 }
             }
 
-            // 回退：旧路径格式 .tool_results/{tool_id}/output.txt（向后兼容）
-            // 仅旧格式走此路径；新格式精确匹配失败后不执行回退
-            if !is_new_format && found_content.is_none() {
-                let old_path = workspace_dir
-                    .join(".tool_results")
-                    .join(tool_id)
-                    .join("output.txt");
-                found_content = tokio::fs::read_to_string(&old_path).await.ok();
-            }
+            // 旧路径格式 .tool_results/{tool_id}/output.txt 已移除。
+            // 该路径没有 session 隔离，允许任何会话读取其他 session 的工具输出，
+            // 违背了 session scoped 目录的隔离目标。
+            // 迁移方式：通过离线脚本将旧目录迁到 .tool_results/{session_id}/...，
+            // 例如: for d in .tool_results/*/; do mv "$d" ".tool_results/{session_id}/$(basename $d)/"; done
 
             return match found_content {
                 Some(content) => Ok(json!({

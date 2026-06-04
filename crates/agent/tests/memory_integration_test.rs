@@ -431,14 +431,14 @@ mod tests {
     fn test_layer1_layer2_interaction() {
         use blockcell_agent::history_projector::COMPACTABLE_TOOLS;
         use blockcell_agent::response_cache::{
-            generate_preview, PREVIEW_SIZE_BYTES, TIME_BASED_MC_CLEARED_MESSAGE,
+            generate_preview, PREVIEW_SIZE_CHARS, TIME_BASED_MC_CLEARED_MESSAGE,
         };
 
         // Layer 1: 生成预览
         let large_content = "line1\nline2\nline3\nline4\nline5\n".repeat(1000);
-        let (preview, has_more) = generate_preview(&large_content, PREVIEW_SIZE_BYTES);
+        let (preview, has_more) = generate_preview(&large_content, PREVIEW_SIZE_CHARS);
         assert!(has_more);
-        assert!(preview.len() <= PREVIEW_SIZE_BYTES);
+        assert!(preview.len() <= PREVIEW_SIZE_CHARS);
 
         // Layer 2: 验证可压缩工具列表包含 read_file
         assert!(COMPACTABLE_TOOLS.contains(&"read_file"));
@@ -672,14 +672,14 @@ mod tests {
         };
         use blockcell_agent::response_cache::{
             DEFAULT_MAX_RESULT_SIZE_CHARS, IMAGE_MAX_TOKEN_SIZE,
-            MAX_TOOL_RESULTS_PER_MESSAGE_CHARS, PREVIEW_SIZE_BYTES,
+            MAX_TOOL_RESULTS_PER_MESSAGE_CHARS, PREVIEW_SIZE_CHARS,
         };
         use blockcell_agent::session_memory::{
             MAX_SECTION_LENGTH, MAX_TOTAL_SESSION_MEMORY_TOKENS,
         };
 
         // Layer 1 常量
-        assert_eq!(PREVIEW_SIZE_BYTES, 2000);
+        assert_eq!(PREVIEW_SIZE_CHARS, 2000);
         assert_eq!(DEFAULT_MAX_RESULT_SIZE_CHARS, 50_000);
         assert_eq!(MAX_TOOL_RESULTS_PER_MESSAGE_CHARS, 150_000);
         assert_eq!(IMAGE_MAX_TOKEN_SIZE, 2000);
@@ -1389,12 +1389,12 @@ _No errors encountered._
             MAX_FILE_RECOVERY_TOKENS, MAX_SINGLE_FILE_TOKENS, MAX_SKILL_RECOVERY_TOKENS,
         };
         use blockcell_agent::response_cache::{
-            DEFAULT_MAX_RESULT_SIZE_CHARS, MAX_TOOL_RESULTS_PER_MESSAGE_CHARS, PREVIEW_SIZE_BYTES,
+            DEFAULT_MAX_RESULT_SIZE_CHARS, MAX_TOOL_RESULTS_PER_MESSAGE_CHARS, PREVIEW_SIZE_CHARS,
         };
         use blockcell_agent::session_memory::MAX_SECTION_LENGTH;
 
         // Layer 1 预算
-        assert_eq!(PREVIEW_SIZE_BYTES, 2000);
+        assert_eq!(PREVIEW_SIZE_CHARS, 2000);
         assert_eq!(DEFAULT_MAX_RESULT_SIZE_CHARS, 50_000);
         assert_eq!(MAX_TOOL_RESULTS_PER_MESSAGE_CHARS, 150_000);
 

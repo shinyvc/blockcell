@@ -17,8 +17,7 @@ pub fn stable_hash_session_key(session_key: &str) -> String {
     // 取前 8 字节（64 位）作为十六进制后缀
     // SHA-256 输出固定 32 字节，直接索引构造 [u8; 8] 安全无 panic
     let hash_u64 = u64::from_be_bytes([
-        result[0], result[1], result[2], result[3],
-        result[4], result[5], result[6], result[7],
+        result[0], result[1], result[2], result[3], result[4], result[5], result[6], result[7],
     ]);
     format!("{:016x}", hash_u64)
 }

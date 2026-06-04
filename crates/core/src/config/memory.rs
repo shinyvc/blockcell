@@ -41,8 +41,12 @@ pub struct Layer1Config {
     pub max_result_size_chars: usize,
     #[serde(default = "default_l1_max_per_message")]
     pub max_tool_results_per_message_chars: usize,
-    #[serde(default = "default_l1_preview_size")]
-    pub preview_size_bytes: usize,
+    #[serde(
+        default = "default_l1_preview_size",
+        alias = "preview_size_bytes",
+        alias = "previewSizeBytes"
+    )]
+    pub preview_size_chars: usize,
     #[serde(default = "default_l1_max_replacement")]
     pub max_replacement_entries: usize,
     #[serde(default = "default_l1_cache_max")]
@@ -76,7 +80,7 @@ impl Default for Layer1Config {
         Self {
             max_result_size_chars: 50_000,
             max_tool_results_per_message_chars: 150_000,
-            preview_size_bytes: 2_000,
+            preview_size_chars: 2_000,
             max_replacement_entries: 1_000,
             cache_max_per_session: 10,
             cacheable_min_chars: 800,
@@ -565,6 +569,16 @@ impl MemorySystemConfig {
             ));
         }
 
+        // L1: preview_size_chars 不超过 max_result_size_chars，防止 fallback 截断路径下溢
+        // 注意：validate 为 &self，无法就地 clamp；超值时仅发 warning，运行时应做 saturating_sub 防御
+        if self.layer1.preview_size_chars > self.layer1.max_result_size_chars {
+            warnings.push(format!(
+                "layer1.previewSizeChars ({}) > layer1.maxResultSizeChars ({}). \
+                 Preview exceeds inline truncation budget; runtime uses saturating_sub to guard.",
+                self.layer1.preview_size_chars, self.layer1.max_result_size_chars
+            ));
+        }
+
         // L4: compact_threshold_ratio range
         if self.layer4.compact_threshold_ratio < 0.5 {
             warnings.push(format!(
@@ -791,5 +805,41 @@ impl Default for SelfImproveReviewConfig {
             enabled: true,
             max_rounds: 8,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试 previewSizeBytes（旧 camelCase 配置）能正确反序列化到 preview_size_chars
+    #[test]
+    fn test_preview_size_bytes_camel_case_alias() {
+        let json = r#"{"previewSizeBytes": 4096}"#;
+        let config: Layer1Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.preview_size_chars, 4096);
+    }
+
+    /// 测试 preview_size_bytes（旧 snake_case 配置）能正确反序列化
+    #[test]
+    fn test_preview_size_bytes_snake_case_alias() {
+        let json = r#"{"preview_size_bytes": 3000}"#;
+        let config: Layer1Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.preview_size_chars, 3000);
+    }
+
+    /// 测试新字段名 previewSizeChars（camelCase，与 rename_all 一致）正常工作
+    #[test]
+    fn test_preview_size_chars_current_name() {
+        let json = r#"{"previewSizeChars": 5000}"#;
+        let config: Layer1Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.preview_size_chars, 5000);
+    }
+
+    /// 测试默认值
+    #[test]
+    fn test_preview_size_default() {
+        let config: Layer1Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.preview_size_chars, 2000);
     }
 }

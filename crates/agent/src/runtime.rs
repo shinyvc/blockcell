@@ -2616,7 +2616,7 @@ impl AgentRuntime {
             layer1,
             config,
             memory_system.config().layer1.cache_max_per_session,
-            memory_system.config().layer1.preview_size_bytes
+            memory_system.config().layer1.preview_size_chars
         );
 
         // Layer 2: Micro Compact
@@ -3549,7 +3549,14 @@ impl AgentRuntime {
         // LLM-hallucinated lists from empty/error tool results.
         // A tool message with empty/null content (e.g. memory_query returning [])
         // should not qualify as "real" data backing the assistant's list.
-        let has_tool_results = history.iter().any(|m| {
+        // 注意：只扫描当前 turn（最后一条 user 消息之后）的 tool 结果，
+        // 而非整个历史，避免曾经的工具调用导致后续纯文本回复被错误缓存
+        let current_turn_start = history
+            .iter()
+            .rposition(|m| m.role == "user")
+            .map(|pos| pos + 1)
+            .unwrap_or(0);
+        let has_tool_results = history[current_turn_start..].iter().any(|m| {
             m.role == "tool"
                 && match &m.content {
                     serde_json::Value::String(s) => {
@@ -4540,11 +4547,11 @@ impl AgentRuntime {
                     .as_ref()
                     .map(|ms| ms.config().layer1.max_tool_results_per_message_chars)
                     .unwrap_or(crate::response_cache::MAX_TOOL_RESULTS_PER_MESSAGE_CHARS);
-                let preview_size_bytes = self
+                let preview_size_chars = self
                     .memory_system
                     .as_ref()
-                    .map(|ms| ms.config().layer1.preview_size_bytes)
-                    .unwrap_or(crate::response_cache::PREVIEW_SIZE_BYTES);
+                    .map(|ms| ms.config().layer1.preview_size_chars)
+                    .unwrap_or(crate::response_cache::PREVIEW_SIZE_CHARS);
 
                 if total_size > budget {
                     debug!(
@@ -4567,7 +4574,7 @@ impl AgentRuntime {
                         budget,
                         &self.paths.workspace(),
                         &session_key,
-                        preview_size_bytes,
+                        preview_size_chars,
                     )
                     .await;
 
@@ -5096,17 +5103,23 @@ impl AgentRuntime {
                     // e.g. web_fetch markdown, finance_api JSON arrays)
                     if let serde_json::Value::String(ref s) = tool_msg.content {
                         let char_count = s.chars().count();
-                        if char_count > 2400 {
+                        // 使用 Layer1 配置的 max_result_size_chars 而非硬编码值，
+                        // 确保用户配置的阈值（默认 50k）实际生效
+                        let max_size = self.response_cache.max_result_size_chars();
+                        if char_count > max_size {
                             // Layer 1: Attempt to persist large tool output to disk before truncation.
                             // This preserves the full output for later recovery by the memory system.
                             // 每次调用生成唯一 UUID，配合 session_key 避免 text_call_0/ollama_call_0
                             // 等通用 ID 跨轮次重复导致覆盖。
                             let call_uuid = uuid::Uuid::new_v4().simple().to_string();
+                            // 使用 persist_session_key 而非原始 session_key，
+                            // 确保 cron 投递场景下工具结果持久化目录与最终历史目录一致，
+                            // 否则 session_recall 按目标 session 查找时找不到文件
                             let persisted_stub = self
                                 .try_persist_large_tool_result(
                                     s,
                                     tool_msg.tool_call_id.as_deref(),
-                                    &session_key,
+                                    &persist_session_key,
                                     &call_uuid,
                                 )
                                 .await;
@@ -5115,20 +5128,25 @@ impl AgentRuntime {
                                 tool_msg.content = serde_json::Value::String(stub);
                             } else {
                                 // Fallback: inline truncation when persistence is unavailable
-                                let head: String = s.chars().take(1600).collect();
+                                // 使用配置的预览大小（以字符为单位），按 2/3 头部 + 1/3 尾部分配
+                                // 注意：preview_size 配置名为 bytes 但实际按字符数使用，
+                                // 使用 saturating_sub 防止 char_count < preview_size 时下溢
+                                let preview_size = self.response_cache.preview_size_chars();
+                                let head_size = preview_size * 2 / 3;
+                                let tail_size = preview_size - head_size;
+                                let head: String = s.chars().take(head_size).collect();
                                 let tail: String = s
                                     .chars()
                                     .rev()
-                                    .take(800)
+                                    .take(tail_size)
                                     .collect::<String>()
                                     .chars()
                                     .rev()
                                     .collect();
+                                let trimmed_chars = char_count.saturating_sub(preview_size);
                                 tool_msg.content = serde_json::Value::String(format!(
                                     "{}\n...<trimmed {} chars>...\n{}",
-                                    head,
-                                    char_count - 2400,
-                                    tail
+                                    head, trimmed_chars, tail
                                 ));
                             }
                         }
@@ -5964,18 +5982,21 @@ impl AgentRuntime {
             Ok(()) => {
                 let byte_size = content.len();
                 let char_count = content.chars().count();
-                // 保留与 fallback 一致的即时上下文量（1600头+800尾），
-                // 确保模型在同一轮后续回答仍能看到关键内容
-                let head: String = content.chars().take(1600).collect();
+                // 使用 Layer1 配置的预览大小（以字符为单位，默认 2000），
+                // 按 2/3 头部 + 1/3 尾部分配，与 fallback 截断路径保持一致
+                let preview_size = self.response_cache.preview_size_chars();
+                let head_size = preview_size * 2 / 3;
+                let tail_size = preview_size - head_size;
+                let head: String = content.chars().take(head_size).collect();
                 let tail: String = content
                     .chars()
                     .rev()
-                    .take(800)
+                    .take(tail_size)
                     .collect::<String>()
                     .chars()
                     .rev()
                     .collect();
-                let trimmed_chars = char_count.saturating_sub(2400);
+                let trimmed_chars = char_count.saturating_sub(preview_size);
                 // 包含完整 dir_name（含 UUID）作为精确引用 ID，
                 // session_recall 通过 tool: 前缀识别工具结果 ID，
                 // 格式 tool:{tool_id}:{call_uuid} 支持 UUID 精确匹配
@@ -6005,17 +6026,18 @@ impl AgentRuntime {
                     trimmed_chars = trimmed_chars,
                     tail = tail,
                 );
-                // Record metrics event
+                // Record metrics event — 使用真实的 session_key、preview 大小和 truncated 标志
                 let filepath_display = output_file.display().to_string();
+                let preview_size = head.len() + tail.len();
                 memory_event!(
                     layer1,
                     persisted,
                     tool_id,
                     byte_size as u64,
-                    stub.len() as u64,
+                    preview_size as u64,
                     filepath_display.as_str(),
-                    "unknown",
-                    false
+                    session_key,
+                    true // 工具输出已被截断替换为 preview
                 );
                 memory_event!(layer1, preview_generated, tool_id, stub.len() as u64);
                 tracing::info!(
@@ -10630,6 +10652,7 @@ description: script demo
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn test_skill_executor_uses_manual_not_file_type_to_choose_skill_script() {
         let mut runtime = test_runtime();
@@ -10760,6 +10783,7 @@ description: cli demo
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn test_prompt_skill_can_still_use_exec_local_inside_skill_scope_for_compat() {
         let mut runtime = test_runtime();
@@ -11242,7 +11266,7 @@ description: local demo
     async fn init_memory_system_uses_runtime_memory_config() {
         let mut config = Config::default();
         config.memory.memory_system.token_budget = 1_000;
-        config.memory.memory_system.layer1.preview_size_bytes = 123;
+        config.memory.memory_system.layer1.preview_size_chars = 123;
         config.memory.memory_system.layer2.gap_threshold_minutes = 7;
         config
             .memory
@@ -11275,7 +11299,7 @@ description: local demo
         let memory_system = runtime.memory_system().expect("memory system initialized");
         assert_eq!(memory_system.session_id(), "cli:configured-session");
         assert_eq!(memory_system.config().token_budget, 1_000);
-        assert_eq!(memory_system.config().layer1.preview_size_bytes, 123);
+        assert_eq!(memory_system.config().layer1.preview_size_chars, 123);
         assert_eq!(memory_system.config().layer2.gap_threshold_minutes, 7);
         assert_eq!(
             memory_system

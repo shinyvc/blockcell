@@ -10,7 +10,7 @@ use crate::forked::{
     ForkedAgentParams,
 };
 use crate::memory_event;
-use crate::session_metrics::get_memory_extraction_circuit_breaker;
+use crate::session_metrics::{get_memory_extraction_circuit_breaker, get_memory_metrics};
 use crate::unified_security_scanner::scan_learned_memory_content;
 use blockcell_core::types::ChatMessage;
 use blockcell_providers::ProviderPool;
@@ -270,6 +270,7 @@ impl AutoMemoryExtractor {
             Ok(p) => p,
             Err(e) => {
                 cb.record_failure();
+                get_memory_metrics().layer5.record_extraction_failure();
                 return ExtractionResult {
                     memory_type,
                     success: false,
@@ -294,6 +295,33 @@ impl AutoMemoryExtractor {
 
         match result {
             Ok(forked_result) => {
+                // 工具调用失败（权限拒绝、old_string not found 等）时不应视为提取成功
+                if forked_result.had_tool_error {
+                    tracing::warn!(
+                        memory_type = memory_type.name(),
+                        "[auto_memory] forked agent had tool errors, skipping extraction"
+                    );
+                    // 回滚到提取前的内容，避免部分写入的损坏文件残留
+                    if let Err(rollback_err) =
+                        atomic_rollback_write(&memory_path, &current_content).await
+                    {
+                        tracing::error!(
+                            memory_type = memory_type.name(),
+                            error = %rollback_err,
+                            "[auto_memory] 工具错误后回滚记忆文件失败！数据可能已损坏"
+                        );
+                    }
+                    cb.record_failure();
+                    get_memory_metrics().layer5.record_extraction_failure();
+                    return ExtractionResult {
+                        memory_type,
+                        success: false,
+                        input_tokens: forked_result.total_usage.input_tokens as usize,
+                        output_tokens: forked_result.total_usage.output_tokens as usize,
+                        error: Some("Forked agent had tool execution errors".to_string()),
+                        cursor_save_failed: false,
+                    };
+                }
                 // 安全扫描: 检查写入后的记忆文件内容
                 if let Ok(updated_content) = tokio::fs::read_to_string(&memory_path).await {
                     if let Err(err) = scan_learned_memory_content(&updated_content) {
@@ -313,6 +341,7 @@ impl AutoMemoryExtractor {
                             );
                         }
                         cb.record_failure();
+                        get_memory_metrics().layer5.record_extraction_failure();
                         return ExtractionResult {
                             memory_type,
                             success: false,
@@ -435,6 +464,7 @@ impl AutoMemoryExtractor {
             Err(e) => {
                 // 熔断器记录失败
                 cb.record_failure();
+                get_memory_metrics().layer5.record_extraction_failure();
 
                 tracing::error!(
                     memory_type = memory_type.name(),
@@ -673,6 +703,33 @@ pub async fn extract_auto_memory(
 
     match result {
         Ok(forked_result) => {
+            // 工具调用失败时不应视为提取成功
+            if forked_result.had_tool_error {
+                tracing::warn!(
+                    memory_type = memory_type.name(),
+                    "[auto_memory] deprecated path: forked agent had tool errors, skipping extraction"
+                );
+                // 回滚到提取前的内容，避免部分写入的损坏文件残留
+                if let Err(rollback_err) =
+                    atomic_rollback_write(&memory_path, &current_content).await
+                {
+                    tracing::error!(
+                        memory_type = memory_type.name(),
+                        error = %rollback_err,
+                        "[auto_memory] deprecated 路径工具错误后回滚记忆文件失败！数据可能已损坏"
+                    );
+                }
+                cb.record_failure();
+                get_memory_metrics().layer5.record_extraction_failure();
+                return ExtractionResult {
+                    memory_type,
+                    success: false,
+                    input_tokens: forked_result.total_usage.input_tokens as usize,
+                    output_tokens: forked_result.total_usage.output_tokens as usize,
+                    error: Some("Forked agent had tool execution errors".to_string()),
+                    cursor_save_failed: false,
+                };
+            }
             // 安全扫描: 检查写入后的记忆文件内容
             if let Ok(updated_content) = tokio::fs::read_to_string(&memory_path).await {
                 if let Err(err) = scan_learned_memory_content(&updated_content) {
@@ -690,6 +747,9 @@ pub async fn extract_auto_memory(
                             "[auto_memory] memory file rollback failed; data may be corrupted"
                         );
                     }
+                    // deprecated 路径仍需记录熔断失败，保持与 extract() 一致
+                    cb.record_failure();
+                    get_memory_metrics().layer5.record_extraction_failure();
                     return ExtractionResult {
                         memory_type,
                         success: false,
@@ -726,6 +786,7 @@ pub async fn extract_auto_memory(
         Err(e) => {
             // 熔断器记录失败
             cb.record_failure();
+            get_memory_metrics().layer5.record_extraction_failure();
 
             ExtractionResult {
                 memory_type,
