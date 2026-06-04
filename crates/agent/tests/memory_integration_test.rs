@@ -501,25 +501,38 @@ mod tests {
         // Layer 7: 验证 Forked Agent 工具权限
         let can_use = create_auto_mem_can_use_tool(memory_dir);
 
-        // Layer 5: 自动记忆提取允许的工具
-        // read_file 应该被允许（返回 Allow）
+        // Layer 5: 自动记忆提取允许读取记忆目录内的显式路径
+        let memory_file = temp_dir.join("user.md");
+        let memory_file_str = memory_file.to_string_lossy();
+        let result = can_use(
+            "read_file",
+            &serde_json::json!({"file_path": memory_file_str.as_ref()}),
+        );
+        assert!(matches!(result, ToolPermission::Allow));
+
+        // read_file 访问记忆目录外应该被拒绝
         let result = can_use(
             "read_file",
             &serde_json::json!({"file_path": "/tmp/test.md"}),
         );
+        assert!(matches!(result, ToolPermission::Deny { .. }));
+
+        // grep 必须显式限制在记忆目录内
+        let result = can_use(
+            "grep",
+            &serde_json::json!({"pattern": "test", "path": memory_file_str.as_ref()}),
+        );
         assert!(matches!(result, ToolPermission::Allow));
 
-        // grep 应该被允许
-        let result = can_use("grep", &serde_json::json!({"pattern": "test"}));
-        assert!(matches!(result, ToolPermission::Allow));
-
-        // glob 应该被允许
-        let result = can_use("glob", &serde_json::json!({"pattern": "*.md"}));
+        // glob 必须显式限制在记忆目录内
+        let memory_dir_str = temp_dir.to_string_lossy();
+        let result = can_use(
+            "glob",
+            &serde_json::json!({"pattern": "*.md", "path": memory_dir_str.as_ref()}),
+        );
         assert!(matches!(result, ToolPermission::Allow));
 
         // file_edit 在 memory 目录内应该被允许（使用临时目录路径）
-        let memory_file = temp_dir.join("user.md");
-        let memory_file_str = memory_file.to_string_lossy();
         let result = can_use(
             "file_edit",
             &serde_json::json!({"file_path": memory_file_str.as_ref()}),
@@ -830,16 +843,26 @@ mod tests {
         assert!(params1.is_compatible_with(&params2));
 
         // 验证工具权限检查函数存在
-        let can_use = blockcell_agent::forked::create_auto_mem_can_use_tool(std::path::Path::new(
-            "/tmp/memory",
-        ));
+        let temp_memory_dir = std::env::temp_dir().join("blockcell_memory_permission_test");
+        std::fs::create_dir_all(&temp_memory_dir).ok();
+        let can_use = blockcell_agent::forked::create_auto_mem_can_use_tool(&temp_memory_dir);
 
-        // read_file 应该被允许
+        // read_file 只允许记忆目录内的显式路径
+        let memory_file = temp_memory_dir.join("user.md");
+        let memory_file_str = memory_file.to_string_lossy();
+        let result = can_use(
+            "read_file",
+            &serde_json::json!({"file_path": memory_file_str.as_ref()}),
+        );
+        assert!(matches!(result, ToolPermission::Allow));
+
         let result = can_use(
             "read_file",
             &serde_json::json!({"file_path": "/tmp/test.md"}),
         );
-        assert!(matches!(result, ToolPermission::Allow));
+        assert!(matches!(result, ToolPermission::Deny { .. }));
+
+        std::fs::remove_dir_all(&temp_memory_dir).ok();
     }
 
     // ========================================================================

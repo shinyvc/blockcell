@@ -170,6 +170,20 @@ impl Layer1Metrics {
         self.current_stored_results.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// 清理后扣减已存储结果计数。
+    ///
+    /// 使用 saturating CAS/fetch_update 防止下溢：
+    /// 进程重启或 `/session-metrics --reset` 后内存计数器回到 0，
+    /// 但磁盘上的 `.tool_results` 仍可能被下一次 cleanup 删除，
+    /// 此时直接 `fetch_sub` 会将 0 下溢成接近 u64::MAX。
+    pub fn decrement_stored_count(&self, count: u64) {
+        let _ = self.current_stored_results.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(count)),
+        );
+    }
+
     /// Get max tool results limit.
     pub fn max_tool_results(&self) -> u64 {
         self.max_tool_results.load(Ordering::Relaxed)

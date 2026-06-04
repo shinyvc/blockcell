@@ -3,7 +3,7 @@
 //! 包含 MemoryVector, Layer1-7, MemorySystem,
 //!  SelfImprove, Evolution 等配置定义。
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -368,13 +368,22 @@ impl Default for Layer7Config {
 }
 
 // === 熔断器配置（用户配置结构，会被转换为运行时的 CircuitBreakerConfig） ===
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CircuitBreakerSettings {
-    #[serde(default = "default_cb_max_failures")]
     pub max_failures: u64,
-    #[serde(default = "default_cb_reset_timeout_secs")]
     pub reset_timeout_secs: u64,
+    #[serde(skip)]
+    configured: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CircuitBreakerSettingsWire {
+    #[serde(default = "default_cb_max_failures")]
+    max_failures: u64,
+    #[serde(default = "default_cb_reset_timeout_secs")]
+    reset_timeout_secs: u64,
 }
 
 fn default_cb_max_failures() -> u64 {
@@ -389,7 +398,38 @@ impl Default for CircuitBreakerSettings {
         Self {
             max_failures: 3,
             reset_timeout_secs: 60,
+            configured: false,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for CircuitBreakerSettings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CircuitBreakerSettingsWire::deserialize(deserializer)?;
+        Ok(Self {
+            max_failures: wire.max_failures,
+            reset_timeout_secs: wire.reset_timeout_secs,
+            configured: true,
+        })
+    }
+}
+
+impl CircuitBreakerSettings {
+    /// 返回用户配置文件中是否显式出现了 circuitBreaker。
+    pub fn is_configured(&self) -> bool {
+        self.configured
+    }
+
+    fn has_default_values(&self) -> bool {
+        self.max_failures == default_cb_max_failures()
+            && self.reset_timeout_secs == default_cb_reset_timeout_secs()
+    }
+
+    fn is_implicit_default(&self) -> bool {
+        !self.configured && self.has_default_values()
     }
 }
 
@@ -455,7 +495,10 @@ pub struct MemorySystemConfig {
     pub layer6: Layer6Config,
     #[serde(default)]
     pub layer7: Layer7Config,
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "CircuitBreakerSettings::is_implicit_default"
+    )]
     pub circuit_breaker: CircuitBreakerSettings,
     #[doc(hidden)]
     #[serde(default)]

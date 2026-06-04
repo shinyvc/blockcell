@@ -38,7 +38,7 @@ use crate::history_projector::{HistoryProjector, TimeBasedMCConfig};
 use crate::intent::{IntentCategory, IntentToolResolver};
 use crate::memory_event;
 use crate::memory_file_store::MemoryFileStore;
-use crate::response_cache::sanitize_tool_use_id;
+use crate::response_cache::{cleanup_tool_results, sanitize_session_key, sanitize_tool_use_id};
 use crate::session_metrics::{ProcessingMetrics, ScopedTimer};
 use crate::skill_executor::{determine_manual_load_mode, SkillExecutionResult};
 use crate::skill_file_store::SkillFileStore;
@@ -2599,13 +2599,14 @@ impl AgentRuntime {
         // Perform async initialization: load cursor state + mark session active
         memory_system.initialize().await?;
 
-        // 将配置中的熔断器阈值应用到运行时熔断器
+        // 仅当用户显式写了 circuitBreaker 时才覆盖分层默认值。
         {
             use crate::session_metrics::CircuitBreakerConfig as AgentCBConfig;
-            let cb_config = AgentCBConfig::from_memory_config(
-                &self.config.memory.memory_system.circuit_breaker,
-            );
-            crate::session_metrics::set_circuit_breaker_configs(&cb_config);
+            let cb_settings = &self.config.memory.memory_system.circuit_breaker;
+            if cb_settings.is_configured() {
+                let cb_config = AgentCBConfig::from_memory_config(cb_settings);
+                crate::session_metrics::set_circuit_breaker_configs(&cb_config);
+            }
         }
 
         // ========== Record config for all layers to metrics ==========
@@ -4556,12 +4557,15 @@ impl AgentRuntime {
                     let state = memory_system.content_replacement_state().clone();
                     let mut state_mut = state.clone();
 
+                    // 使用 self.paths.workspace() 而非 self.paths.base，
+                    // 保证写入的 .tool_results 目录与 session_recall 读取、
+                    // cleanup_tool_results 清理共用同一个根目录（base/workspace/.tool_results）
                     current_messages = crate::response_cache::apply_budget_async(
                         &current_messages,
                         &candidates,
                         &mut state_mut,
                         budget,
-                        &self.paths.base,
+                        &self.paths.workspace(),
                         &session_key,
                         preview_size_bytes,
                     )
@@ -5095,8 +5099,16 @@ impl AgentRuntime {
                         if char_count > 2400 {
                             // Layer 1: Attempt to persist large tool output to disk before truncation.
                             // This preserves the full output for later recovery by the memory system.
+                            // 每次调用生成唯一 UUID，配合 session_key 避免 text_call_0/ollama_call_0
+                            // 等通用 ID 跨轮次重复导致覆盖。
+                            let call_uuid = uuid::Uuid::new_v4().simple().to_string();
                             let persisted_stub = self
-                                .try_persist_large_tool_result(s, tool_msg.tool_call_id.as_deref())
+                                .try_persist_large_tool_result(
+                                    s,
+                                    tool_msg.tool_call_id.as_deref(),
+                                    &session_key,
+                                    &call_uuid,
+                                )
                                 .await;
 
                             if let Some(stub) = persisted_stub {
@@ -5910,15 +5922,30 @@ impl AgentRuntime {
     /// 如果持久化成功，返回 `<persisted-output>` 存根字符串；
     /// 如果失败则返回 `None`，由调用方进行内联截断。
     ///
-    /// TODO: `.tool_results/` 目录无自动清理机制，长期运行会累积磁盘占用。
-    /// 后续应添加基于 TTL 或 LRU 的清理策略。
+    /// 路径格式：`.tool_results/{session_key}/{tool_id}_{call_uuid}/output.txt`
+    /// 引入 `session_key` 和 `call_uuid` 避免 `text_call_0`/`ollama_call_0` 等
+    /// 通用 ID 跨轮次、跨会话重复，导致旧会话 recall 拿到被覆盖的错误内容。
+    ///
+    /// `.tool_results/` 目录通过 maintenance tick 中的 `cleanup_tool_results` 定期清理
+    ///（TTL 7 天 + 每会话上限 50 条目），长期运行不会无限累积磁盘占用。
     async fn try_persist_large_tool_result(
         &self,
         content: &str,
         tool_call_id: Option<&str>,
+        session_key: &str,
+        call_uuid: &str,
     ) -> Option<String> {
         let tool_id = sanitize_tool_use_id(tool_call_id.unwrap_or("unknown"));
-        let persistence_dir = self.paths.workspace().join(".tool_results").join(&tool_id);
+        // 使用 sanitize_session_key 替代 sanitize_tool_use_id，防止不同会话映射到同一目录
+        // （sanitize_tool_use_id 会删除分隔符，导致 "a.b" 和 "a-b" 冲突）
+        let session_id = sanitize_session_key(session_key);
+        let dir_name = format!("{}_{call_uuid}", tool_id);
+        let persistence_dir = self
+            .paths
+            .workspace()
+            .join(".tool_results")
+            .join(&session_id)
+            .join(&dir_name);
         let output_file = persistence_dir.join("output.txt");
 
         match tokio::fs::create_dir_all(&persistence_dir).await {
@@ -5937,19 +5964,46 @@ impl AgentRuntime {
             Ok(()) => {
                 let byte_size = content.len();
                 let char_count = content.chars().count();
-                let preview: String = content.chars().take(400).collect();
+                // 保留与 fallback 一致的即时上下文量（1600头+800尾），
+                // 确保模型在同一轮后续回答仍能看到关键内容
+                let head: String = content.chars().take(1600).collect();
+                let tail: String = content
+                    .chars()
+                    .rev()
+                    .take(800)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                let trimmed_chars = char_count.saturating_sub(2400);
+                // 包含完整 dir_name（含 UUID）作为精确引用 ID，
+                // session_recall 通过 tool: 前缀识别工具结果 ID，
+                // 格式 tool:{tool_id}:{call_uuid} 支持 UUID 精确匹配
+                let recall_id = format!(
+                    "tool:{tool_id}:{call_uuid}",
+                    tool_id = tool_id,
+                    call_uuid = call_uuid
+                );
                 let stub = format!(
                     "<persisted-output>\n\
                      tool_use_id: {tool_id}\n\
+                     recall_id: {recall_id}\n\
                      file: {output_path}\n\
                      size: {byte_size} bytes ({char_count} chars)\n\
-                     preview: {preview}...\n\
+                     \n\
+                     {head}\n\
+                     ...<trimmed {trimmed_chars} chars>...\n\
+                     {tail}\n\
+                     \n\
                      </persisted-output>",
                     tool_id = tool_id,
+                    recall_id = recall_id,
                     output_path = output_file.display(),
                     byte_size = byte_size,
                     char_count = char_count,
-                    preview = preview,
+                    head = head,
+                    trimmed_chars = trimmed_chars,
+                    tail = tail,
                 );
                 // Record metrics event
                 let filepath_display = output_file.display().to_string();
@@ -7124,6 +7178,28 @@ impl AgentRuntime {
                         if let Err(e) = store.maintenance(30) {
                             warn!(error = %e, "Memory maintenance error");
                         }
+                    }
+
+                    // .tool_results 磁盘清理：删除过期条目并限制每会话数量
+                    // 防止持久化大工具输出无限累积占用磁盘空间。
+                    // 使用 Layer1 配置中的 cache_max_per_session 而非硬编码值，
+                    // 保证清理策略与运行时配置一致
+                    let max_per_session = self
+                        .config
+                        .memory
+                        .memory_system
+                        .layer1
+                        .cache_max_per_session;
+                    let (removed_entries, _removed_dirs) = cleanup_tool_results(
+                        &self.paths.workspace(),
+                        7, // 7 天 TTL（磁盘持久化结果的标准保留期）
+                        max_per_session,
+                    ).await;
+                    // 同步更新 Layer1 指标，避免 /session-metrics 显示只增不减的存储数
+                    if removed_entries > 0 {
+                        crate::session_metrics::get_memory_metrics()
+                            .layer1
+                            .decrement_stored_count(removed_entries as u64);
                     }
 
                     let _ = self

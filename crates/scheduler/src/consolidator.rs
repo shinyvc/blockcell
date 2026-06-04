@@ -58,6 +58,12 @@ pub struct DreamStats {
     pub sessions_processed: usize,
 }
 
+impl DreamStats {
+    fn has_memory_changes(&self) -> bool {
+        self.memories_created > 0 || self.memories_updated > 0 || self.memories_deleted > 0
+    }
+}
+
 /// Memory 目录状态快照
 #[derive(Debug, Clone, Default)]
 struct MemoryDirState {
@@ -222,6 +228,24 @@ impl DreamState {
     /// 增加会话计数
     pub fn increment_session_count(&mut self) {
         self.current_session_count += 1;
+    }
+}
+
+fn apply_successful_dream_state(
+    state: &mut DreamState,
+    stats: &DreamStats,
+    processed_session_count: usize,
+    now_secs: u64,
+) {
+    state.last_consolidation_time = Some(now_secs);
+    // 成功执行过的会话批次都要推进游标；即使本轮没有产出记忆变更，
+    // 也不能让下一次时间门打开后反复处理同一批会话。
+    state.last_session_count = processed_session_count;
+
+    if stats.has_memory_changes() {
+        state.consolidation_count += 1;
+    } else {
+        tracing::info!("[dream] consolidation produced no changes");
     }
 }
 
@@ -511,33 +535,16 @@ impl DreamConsolidator {
 
         // 只有成功时才推进时间门和会话门，失败/超时保留原值以便重试
         if result.is_ok() {
-            // 检查是否产生了实际变化，避免无效果时推进 gate 状态
-            if stats.memories_created == 0
-                && stats.memories_updated == 0
-                && stats.memories_deleted == 0
-            {
-                tracing::info!("[dream] consolidation produced no changes");
-                // 仍推进时间门以防止无限重试循环，
-                // 但不推进会话门和整合计数（无实际产出）
-                self.state.last_consolidation_time = Some(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                );
-            } else {
-                self.state.last_consolidation_time = Some(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                );
-                // 只推进到整合开始前的快照值，而非 current_session_count。
-                // 整合期间新增的会话未必被本次 gather/prune 处理，
-                // 下一轮门控应仍能看到这些新会话。
-                self.state.last_session_count = processed_session_count;
-                self.state.consolidation_count += 1;
-            }
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            apply_successful_dream_state(
+                &mut self.state,
+                &stats,
+                processed_session_count,
+                now_secs,
+            );
         }
 
         // 最终保存：在同一个跨进程锁保护下完成 read-merge-write，
@@ -1013,6 +1020,7 @@ impl DreamConsolidator {
 
         // 构建整合提示（包含收集的信号）
         let memory_dir = self.config_dir.join("memory");
+        fs::create_dir_all(&memory_dir).await?;
         let prompt = self.build_consolidation_prompt(&memory_dir, signals);
 
         // 创建工具权限检查
@@ -1035,6 +1043,8 @@ impl DreamConsolidator {
             .prompt_messages(vec![ChatMessage::user(&prompt)])
             .cache_safe_params(cache_safe_params)
             .can_use_tool(can_use_tool)
+            // 将执行层也限制在记忆目录内，避免无 working_dir 时接受任意绝对路径。
+            .working_dir(memory_dir)
             .query_source("auto_dream")
             .fork_label("auto_dream")
             .max_turns(10)
@@ -1132,7 +1142,8 @@ impl DreamConsolidator {
 - 优化索引结构
 
 ## 工具限制
-- Bash: 仅限只读命令 (ls, find, grep, cat, stat, wc, head, tail)
+- 只读工具: read_file/list_dir/grep/glob 必须使用上方记忆目录内的显式路径
+- Shell/Exec: 默认不提供；如被调用，也必须限定在记忆目录内
 - Edit/Write: 仅限记忆目录内
 
 ## 注意事项
@@ -1505,6 +1516,47 @@ mod tests {
         let mut state = DreamState::default();
         state.increment_session_count();
         assert_eq!(state.current_session_count, 1);
+    }
+
+    #[test]
+    fn test_noop_dream_advances_session_cursor_without_incrementing_count() {
+        let mut state = DreamState {
+            last_consolidation_time: Some(1),
+            last_session_count: 5,
+            current_session_count: 10,
+            consolidation_count: 3,
+            is_consolidating: false,
+            consolidating_started_at: None,
+        };
+        let stats = DreamStats::default();
+
+        apply_successful_dream_state(&mut state, &stats, 10, 99);
+
+        assert_eq!(state.last_consolidation_time, Some(99));
+        assert_eq!(state.last_session_count, 10);
+        assert_eq!(state.consolidation_count, 3);
+    }
+
+    #[test]
+    fn test_changed_dream_advances_session_cursor_and_count() {
+        let mut state = DreamState {
+            last_consolidation_time: Some(1),
+            last_session_count: 5,
+            current_session_count: 10,
+            consolidation_count: 3,
+            is_consolidating: false,
+            consolidating_started_at: None,
+        };
+        let stats = DreamStats {
+            memories_updated: 1,
+            ..DreamStats::default()
+        };
+
+        apply_successful_dream_state(&mut state, &stats, 10, 99);
+
+        assert_eq!(state.last_consolidation_time, Some(99));
+        assert_eq!(state.last_session_count, 10);
+        assert_eq!(state.consolidation_count, 4);
     }
 
     #[tokio::test]

@@ -248,15 +248,16 @@ impl AutoMemoryExtractor {
                 "[auto_memory] 确保记忆目录存在失败"
             );
         }
+        let memory_dir = self.config_dir.join("memory");
 
         // 使用 Builder 模式构建 ForkedAgentParams（强制设置 provider_pool）
         let params = ForkedAgentParams::builder()
             .provider_pool(provider_pool)
             .prompt_messages(vec![ChatMessage::user(&extraction_prompt)])
             .cache_safe_params(cache_safe_params)
-            .can_use_tool(create_auto_mem_can_use_tool(
-                &self.config_dir.join("memory"),
-            ))
+            .can_use_tool(create_auto_mem_can_use_tool(&memory_dir))
+            // 将执行层也限制在记忆目录内，作为 can_use_tool 之外的第二道边界。
+            .working_dir(memory_dir)
             .query_source("auto_memory")
             .fork_label(memory_type.name())
             .max_turns(1)
@@ -330,20 +331,43 @@ impl AutoMemoryExtractor {
                 // 同一记忆类型的并发提取受冷却机制（cooldown）保护，
                 // 因此 TOCTOU 竞态在实际运行中不会发生。
                 // 内容变更检测：重新读取文件确认内容已变更
+                // "无变化"是正常情况（LLM 判断无需修改），不应视为失败。
+                // 仍需推进游标以避免重复触发，不计入熔断。
                 if let Ok(new_content) = tokio::fs::read_to_string(&memory_path).await {
                     if new_content == current_content {
-                        tracing::warn!(
+                        tracing::info!(
                             memory_type = memory_type.name(),
-                            "[auto_memory] 提取未产生内容变更"
+                            "[auto_memory] 提取未产生内容变更（正常 no-op）"
                         );
-                        cb.record_failure();
+                        cb.record_success();
+                        // 正常推进游标，防止下次继续触发
+                        let cursor = {
+                            let mut c = self.cursor_manager.get_cursor(memory_type);
+                            c.update_with_content(
+                                last_message_uuid,
+                                message_count,
+                                &message_content_signature,
+                            );
+                            c
+                        };
+                        let cursor_save_failed = match self
+                            .cursor_manager
+                            .merge_and_save(cursor)
+                            .await
+                        {
+                            Err(e) => {
+                                tracing::error!(error = %e, "[auto_memory] failed to save cursor (no-change path)");
+                                true
+                            }
+                            Ok(()) => false,
+                        };
                         return ExtractionResult {
                             memory_type,
-                            success: false,
+                            success: true, // 无变化视为成功
                             input_tokens: forked_result.total_usage.input_tokens as usize,
                             output_tokens: forked_result.total_usage.output_tokens as usize,
-                            error: Some("提取未产生内容变更".to_string()),
-                            cursor_save_failed: false,
+                            error: None,
+                            cursor_save_failed,
                         };
                     }
                 }
@@ -609,11 +633,21 @@ pub async fn extract_auto_memory(
 
     // 使用 Builder 模式构建 ForkedAgentParams
     // 这确保必需参数（provider_pool）在编译时被验证
+    if let Err(e) = ensure_memory_dir(config_dir).await {
+        tracing::warn!(
+            path = %config_dir.display(),
+            error = %e,
+            "[auto_memory] 确保记忆目录存在失败"
+        );
+    }
+    let memory_dir = config_dir.join("memory");
     let params = match ForkedAgentParams::builder()
         .provider_pool(provider_pool)
         .prompt_messages(vec![ChatMessage::user(&extraction_prompt)])
         .cache_safe_params(cache_safe_params)
-        .can_use_tool(create_auto_mem_can_use_tool(&config_dir.join("memory")))
+        .can_use_tool(create_auto_mem_can_use_tool(&memory_dir))
+        // 将执行层也限制在记忆目录内，作为 can_use_tool 之外的第二道边界。
+        .working_dir(memory_dir)
         .query_source("auto_memory")
         .fork_label(memory_type.name())
         .max_turns(1)

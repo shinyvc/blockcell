@@ -1669,6 +1669,48 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_circuit_breaker_tracks_explicit_presence() {
+        let omitted_raw = r#"{
+  "memory": {
+    "memorySystem": {}
+  }
+}"#;
+        let omitted: Config = serde_json::from_str(omitted_raw).unwrap();
+        assert!(!omitted.memory.memory_system.circuit_breaker.is_configured());
+
+        let explicit_default_raw = r#"{
+  "memory": {
+    "memorySystem": {
+      "circuitBreaker": {
+        "maxFailures": 3,
+        "resetTimeoutSecs": 60
+      }
+    }
+  }
+}"#;
+        let explicit_default: Config = serde_json::from_str(explicit_default_raw).unwrap();
+        assert!(explicit_default
+            .memory
+            .memory_system
+            .circuit_breaker
+            .is_configured());
+        assert_eq!(
+            explicit_default
+                .memory
+                .memory_system
+                .circuit_breaker
+                .reset_timeout_secs,
+            60
+        );
+
+        let implicit_json = serde_json::to_string(&omitted.memory.memory_system).unwrap();
+        assert!(!implicit_json.contains("circuitBreaker"));
+
+        let explicit_json = serde_json::to_string(&explicit_default.memory.memory_system).unwrap();
+        assert!(explicit_json.contains("circuitBreaker"));
+    }
+
+    #[test]
     fn test_community_hub_top_level() {
         let raw = r#"{
   "communityHub": { "hubUrl": "http://example.com/", "apiKey": "k" },

@@ -21,7 +21,7 @@ pub enum CircuitState {
 }
 
 /// Circuit breaker configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CircuitBreakerConfig {
     /// Maximum consecutive failures before opening.
     pub max_failures: u64,
@@ -296,6 +296,12 @@ pub fn reset_all_circuit_breakers() {
 
 /// 从全局配置更新所有熔断器阈值。仅在熔断器初始化时调用，
 /// 不会覆盖运行时状态（如当前失败计数）。
+///
+/// 调用方必须先确认用户显式配置了 circuitBreaker。这样既能让省略配置时
+/// 保留各层独立默认值，也能让用户显式写入 60 秒默认值时真正生效：
+/// - L4 Compact:      3 次失败, 60 秒恢复
+/// - L5 Extraction:   3 次失败, 300 秒恢复
+/// - L6 Dream:        2 次失败, 900 秒恢复
 pub fn set_circuit_breaker_configs(config: &CircuitBreakerConfig) {
     get_compact_circuit_breaker().apply_config(config);
     get_memory_extraction_circuit_breaker().apply_config(config);

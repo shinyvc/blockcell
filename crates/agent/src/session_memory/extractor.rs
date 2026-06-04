@@ -99,9 +99,6 @@ pub enum ExtractionError {
 
     #[error("Validation error: {0}")]
     Validation(String),
-
-    #[error("Extraction produced no changes")]
-    NoChange,
 }
 
 /// 判断是否应该提取 Session Memory
@@ -336,9 +333,14 @@ pub async fn extract_session_memory(
         })?;
 
     // 运行 Forked Agent
+    // 注意：run_forked_agent 失败（Provider 错误、取消、工具失败等）时需要记录
+    // Layer3 failure_count 和 token_cost，否则 /session-metrics 会偏乐观。
     let result = run_forked_agent(params)
         .await
-        .map_err(|e| ExtractionError::ForkedAgent(e.to_string()))?;
+        .map_err(|e| {
+            memory_event!(layer3, extraction_completed, false, 0, 0);
+            ExtractionError::ForkedAgent(e.to_string())
+        })?;
 
     let token_cost = result.total_usage.input_tokens + result.total_usage.output_tokens;
 
@@ -436,14 +438,16 @@ pub async fn extract_session_memory(
     // 同一记忆类型的并发提取受冷却机制（cooldown）保护，
     // 因此 TOCTOU 竞态在实际运行中不会发生。
     // 检测内容是否发生了变化
+    // "无变化"是正常情况（LLM 判断无需修改），应视为成功并推进游标，
+    // 否则调用方不会更新 token/消息游标，阈值持续满足导致反复触发。
     if updated_content == original_content {
-        tracing::warn!(
+        tracing::info!(
             memory_path = %memory_path.display(),
-            "[session_memory] Extraction produced no changes"
+            "[session_memory] Extraction produced no changes (normal no-op)"
         );
-        // 记录提取失败事件（无变更）
-        memory_event!(layer3, extraction_completed, false, token_cost, 0);
-        return Err(ExtractionError::NoChange);
+        // 记录提取成功事件（无变更但非失败）
+        memory_event!(layer3, extraction_completed, true, token_cost, 0);
+        return Ok(());
     }
 
     // 计算 sections 数量用于指标

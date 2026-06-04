@@ -376,6 +376,9 @@ pub struct PersistedToolResult {
     pub preview: String,
     /// 是否有更多内容被截断
     pub has_more: bool,
+    /// 可召回引用 ID，格式为 `tool:{sanitized_tool_use_id}`
+    /// session_recall 工具通过此 ID 恢复完整输出
+    pub tool_ref: String,
 }
 
 /// 持久化失败的错误结果
@@ -668,6 +671,40 @@ pub const MEMORY_FALLBACK_CLOSING_TAG: &str = "</memory-fallback>";
 pub const DISK_PERSIST_FAILED_WARNING: &str =
     "Warning: Disk persistence failed. Content preserved in memory preview.";
 
+/// 清理 session_key 用于文件系统路径，并追加哈希后缀保证不同会话的唯一性。
+///
+/// ## 问题背景
+/// `sanitize_tool_use_id` 对 session_key 过于激进：只保留 ascii 字母数字、`-`、`_`，
+/// 且截断到 64 字符。不同 session_key（如 `"wechat:user@domain"` 与 `"wechat:user#domain"`）
+/// 可能映射到同一目录名，导致 session_recall 跨会话读到错误工具输出。
+///
+/// ## 解决方案
+/// 1. 保留可读前缀（48 字符，留出空间给哈希后缀）
+/// 2. 对原始 session_key 计算 8 位十六进制哈希，保证唯一性
+/// 3. 即使两个 session_key 清洗后前缀相同，哈希后缀也不同
+///
+/// ## 使用位置
+/// - 写入侧：`runtime::try_persist_large_tool_result`、`response_cache::persist_tool_result`
+/// - 读取侧：`tools::session_recall`（需保持相同算法）
+pub fn sanitize_session_key(session_key: &str) -> String {
+    // 保留可读前缀：仅 ascii 字母数字、-、_，限制 48 字符
+    let clean: String = session_key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(48)
+        .collect();
+
+    // 使用 SHA-256 稳定哈希后缀保证唯一性和跨版本兼容性
+    // （与 tools/session_recall 复用同一实现，避免两边算法漂移）
+    let hash_suffix = blockcell_core::stable_hash_session_key(session_key);
+
+    if clean.is_empty() {
+        format!("session_{hash_suffix}")
+    } else {
+        format!("{clean}_{hash_suffix}")
+    }
+}
+
 /// 清理 tool_use_id 以防止路径注入
 ///
 /// `tool_use_id` 来自 LLM 输出，可能包含：
@@ -737,82 +774,6 @@ pub fn sanitize_tool_use_id(tool_use_id: &str) -> String {
     }
 }
 
-/// 清理 session_key 防止路径遍历攻击
-///
-/// 清理策略：
-/// 1. 使用 session_file_stem 替换特殊字符为下划线
-/// 2. 只保留字母、数字、连字符和下划线
-/// 3. 对非 ASCII 部分追加稳定短 hash 防止不同会话映射到同一目录
-/// 4. 限制长度（先为 hash 后缀预留空间，再截断 prefix，避免 hash 被截掉）
-fn sanitize_session_key(session_key: &str) -> String {
-    // 首先使用 session_file_stem 替换特殊字符（保持语义一致性）
-    let stem = blockcell_core::session_file_stem(session_key);
-
-    // 分离 ASCII-safe 部分和非 ASCII 部分
-    let ascii_safe: String = stem
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-
-    let has_non_ascii = stem
-        .chars()
-        .any(|c| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
-
-    // 如果有非 ASCII 字符被过滤掉，追加原始 session_key 的 SHA256 短 hash
-    // 以保证不同非 ASCII 会话不会映射到同一目录，且同一 session 多次清理结果一致
-    let result = if has_non_ascii {
-        // 使用原始 session_key（而非 stem）计算 hash，保证稳定性
-        let hash = sha256_short_hash(session_key);
-        // 关键修复：先为 hash 后缀预留空间，再截断 prefix
-        // 格式为 "{prefix}-{hash}"，hash 固定 12 字符，分隔符 1 字符
-        let suffix_len = 1 + hash.len(); // "-" + hash = 13
-        let max_total = 64usize;
-        let prefix_max = max_total.saturating_sub(suffix_len);
-        let prefix = truncate_ascii_boundary(&ascii_safe, prefix_max);
-        // 如果 prefix 截断后为空或只有分隔符，使用稳定 hash 作为前缀
-        if prefix.trim_matches('-').is_empty() {
-            format!("session-{}", hash)
-        } else {
-            format!("{}-{}", prefix.trim_end_matches('-'), hash)
-        }
-    } else {
-        ascii_safe
-    };
-
-    // 如果清理后为空（极端情况：纯非 ASCII + 无 ASCII-safe 部分），使用稳定 hash
-    if result.is_empty() || result.trim_matches('-').is_empty() {
-        return format!("session-{}", sha256_short_hash(session_key));
-    }
-
-    // 非 ASCII 情况已在上面保证不超过 64 字符，这里只处理纯 ASCII 的情况
-    if result.len() > 64 {
-        let boundary = result.floor_char_boundary(64);
-        result[..boundary].to_string()
-    } else {
-        result
-    }
-}
-
-/// 按字符边界安全截断 ASCII 字符串到指定字节长度
-fn truncate_ascii_boundary(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        return s.to_string();
-    }
-    let boundary = s.floor_char_boundary(max_len);
-    s[..boundary].to_string()
-}
-
-/// 计算 SHA256 的短 hash（前 12 字符），用于稳定区分非 ASCII 会话
-fn sha256_short_hash(input: &str) -> String {
-    use std::fmt::Write;
-    let digest = <sha2::Sha256 as sha2::Digest>::digest(input.as_bytes());
-    let mut hex = String::with_capacity(12);
-    for byte in &digest[..6] {
-        write!(hex, "{:02x}", byte).unwrap();
-    }
-    hex
-}
-
 /// 构建内存 fallback 替换消息（当磁盘持久化失败时）
 ///
 /// 包含预览内容，告知用户磁盘持久化失败但数据已通过预览保留。
@@ -842,16 +803,23 @@ fn build_memory_fallback_message(
     message
 }
 
-/// 构建大结果消息
+/// 构建大结果消息（含可召回 tool: 引用）
+///
+/// 生成的 stub 包含 `tool:{id}` 格式的引用，用户可通过
+/// `session_recall(id="tool:{id}")` 恢复完整输出。
 pub fn build_large_tool_result_message(
     result: &PersistedToolResult,
     preview_size_bytes: usize,
 ) -> String {
     let mut message = format!(
-        "{}\nOutput too large ({}). Full output saved to: {}\n\n",
+        "{}\nOutput too large ({}). Full output saved to: {}\n\
+         Tool ID: {}\n\
+         Recall with: session_recall(id=\"{}\")\n\n",
         PERSISTED_OUTPUT_TAG,
         format_file_size(result.original_size),
-        result.filepath.display()
+        result.filepath.display(),
+        result.tool_ref,
+        result.tool_ref,
     );
     message.push_str(&format!(
         "Preview (first {}):\n{}",
@@ -869,7 +837,9 @@ pub fn build_large_tool_result_message(
 
 /// 持久化工具结果到磁盘
 ///
-/// 异步函数，将大型工具输出保存到磁盘并返回预览
+/// 统一写入 `.tool_results/` 目录，与 `try_persist_large_tool_result` 使用相同的
+/// 路径格式，确保 `session_recall` 工具可通过 `tool:{id}` 恢复完整输出。
+/// 每次调用生成唯一 UUID 后缀，防止重复 tool_use_id 导致文件覆盖。
 pub async fn persist_tool_result(
     content: &str,
     tool_use_id: &str,
@@ -880,19 +850,29 @@ pub async fn persist_tool_result(
     // 清理 tool_use_id 防止路径注入
     let safe_tool_use_id = sanitize_tool_use_id(tool_use_id);
 
-    // 清理 session_key 防止路径遍历
+    // 使用 sanitize_session_key 替代 sanitize_tool_use_id，防止不同会话映射到同一目录
+    // （sanitize_tool_use_id 会删除分隔符，导致 "a.b" 和 "a-b" 冲突）
     let safe_session_key = sanitize_session_key(session_key);
 
-    let dir = workspace_dir
-        .join("sessions")
+    // 生成唯一后缀，防止重复 tool_use_id 导致文件覆盖
+    let call_uuid = uuid::Uuid::new_v4().simple();
+    let dir_name = format!("{}_{}", safe_tool_use_id, call_uuid);
+
+    // 统一使用 .tool_results/ 路径，与 runtime try_persist_large_tool_result 一致
+    // session_recall 通过 tool:{id} 格式在 .tool_results/{session_id}/{tool_id}_* 下搜索
+    let persistence_dir = workspace_dir
+        .join(".tool_results")
         .join(&safe_session_key)
-        .join(TOOL_RESULTS_SUBDIR);
+        .join(&dir_name);
 
     // 验证目录路径仍在工作目录内（防止路径遍历攻击）
-    // 注意：由于 session_key 已被清理，这主要是防御性编程
-    let dir_canonical = match std::fs::canonicalize(dir.parent().unwrap_or(&dir)) {
+    let dir_canonical = match std::fs::canonicalize(
+        persistence_dir
+            .parent()
+            .unwrap_or(&persistence_dir),
+    ) {
         Ok(p) => p,
-        Err(_) => dir.clone(), // 目录不存在时使用原始路径
+        Err(_) => persistence_dir.clone(), // 目录不存在时使用原始路径
     };
     let workspace_canonical = match std::fs::canonicalize(workspace_dir) {
         Ok(p) => p,
@@ -905,70 +885,178 @@ pub async fn persist_tool_result(
     }
 
     // 创建目录
-    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+    if let Err(e) = tokio::fs::create_dir_all(&persistence_dir).await {
         return Err(PersistToolResultError {
             error: format!("Failed to create directory: {}", e),
         });
     }
 
-    // 判断是否 JSON（数组内容）
-    let is_json = content.trim_start().starts_with('[');
-    let ext = if is_json { "json" } else { "txt" };
-    let filepath = dir.join(format!("{}.{}", safe_tool_use_id, ext));
+    let output_file = persistence_dir.join("output.txt");
 
     // 验证最终文件路径仍在预期目录内
-    if !filepath.starts_with(&dir) {
+    if !output_file.starts_with(&persistence_dir) {
         return Err(PersistToolResultError {
             error: "Path traversal detected: file escapes target directory".to_string(),
         });
     }
 
-    // 原子写入：使用 create_new 避免竞争
-    let content_str = if is_json {
-        // 格式化 JSON
-        match serde_json::from_str::<serde_json::Value>(content) {
-            Ok(value) => {
-                serde_json::to_string_pretty(&value).unwrap_or_else(|_| content.to_string())
-            }
-            Err(_) => content.to_string(),
-        }
-    } else {
-        content.to_string()
-    };
-
-    match tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&filepath)
-        .await
-    {
-        Ok(mut file) => {
-            use tokio::io::AsyncWriteExt;
-            if let Err(e) = file.write_all(content_str.as_bytes()).await {
-                return Err(PersistToolResultError {
-                    error: format!("Failed to write file: {}", e),
-                });
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // 文件已存在，说明之前已持久化，跳过写入
-        }
-        Err(e) => {
-            return Err(PersistToolResultError {
-                error: format!("Failed to open file: {}", e),
-            });
-        }
+    // 写入文件（UUID 后缀保证唯一性，无需 create_new）
+    if let Err(e) = tokio::fs::write(&output_file, content).await {
+        return Err(PersistToolResultError {
+            error: format!("Failed to write file: {}", e),
+        });
     }
 
     let (preview, has_more) = generate_preview(content, preview_size_bytes);
 
+    // 构建可召回引用 ID，包含 UUID 后缀用于精确定位目录
+    // 新格式 tool:{tool_id}:{call_uuid} — session_recall 优先按精确目录名匹配；
+    // 旧格式 tool:{tool_id} 仅作为回退（prefix latest），防止 tool_id 复用导致读错输出
+    let tool_ref = format!("tool:{}:{}", safe_tool_use_id, call_uuid);
+
     Ok(PersistedToolResult {
-        filepath,
+        filepath: output_file,
         original_size: content.len(),
-        is_json,
+        is_json: content.trim_start().starts_with('['),
         preview,
         has_more,
+        tool_ref,
     })
+}
+
+/// 清理 `.tool_results/` 目录中的过期条目。
+///
+/// ## 清理策略
+/// - **TTL 过期**：移除修改时间超过 `max_age_days` 的条目（默认 7 天）
+/// - **每会话上限**：每个会话目录最多保留 `max_entries_per_session` 个条目（默认 50），
+///   超出部分按修改时间最早的优先删除
+/// - **空目录清理**：清理后为空的会话目录一并删除
+///
+/// ## 参数
+/// - `workspace_dir`: 工作区根目录
+/// - `max_age_days`: 条目最大保留天数
+/// - `max_entries_per_session`: 每个会话目录最大条目数
+///
+/// ## 返回值
+/// `(removed_entries, removed_dirs)` — 删除的条目目录数和会话目录数
+pub async fn cleanup_tool_results(
+    workspace_dir: &std::path::Path,
+    max_age_days: i64,
+    max_entries_per_session: usize,
+) -> (usize, usize) {
+    let tool_results_dir = workspace_dir.join(".tool_results");
+    if !tool_results_dir.exists() {
+        return (0, 0);
+    }
+
+    let now = std::time::SystemTime::now();
+    let cutoff = now - std::time::Duration::from_secs((max_age_days * 86400) as u64);
+
+    let mut removed_entries: usize = 0;
+    let mut removed_dirs: usize = 0;
+
+    // 遍历每个会话目录
+    let mut session_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(&tool_results_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.path().is_dir() {
+                session_dirs.push(entry.path());
+            }
+        }
+    }
+
+    for session_dir in &session_dirs {
+        // 收集该会话下的所有条目目录及其修改时间
+        let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+        if let Ok(mut dir_entries) = tokio::fs::read_dir(session_dir).await {
+            while let Ok(Some(entry)) = dir_entries.next_entry().await {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                // 检查是否有 output.txt
+                if !path.join("output.txt").exists() {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata().await {
+                    if let Ok(modified) = meta.modified() {
+                        entries.push((path, modified));
+                        continue;
+                    }
+                }
+                // 无法获取元数据时用 epoch 作为保守估计
+                entries.push((path, std::time::UNIX_EPOCH));
+            }
+        }
+
+        if entries.is_empty() {
+            continue;
+        }
+
+        // 按修改时间降序排列（最新的在前）
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // 阶段 1：TTL 过期清理
+        let mut kept: Vec<&(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+        for entry in &entries {
+            if entry.1 < cutoff {
+                // 过期：删除
+                if let Err(e) = tokio::fs::remove_dir_all(&entry.0).await {
+                    tracing::warn!(
+                        path = %entry.0.display(),
+                        error = %e,
+                        "[tool_results cleanup] 删除过期条目目录失败"
+                    );
+                } else {
+                    removed_entries += 1;
+                }
+            } else {
+                kept.push(entry);
+            }
+        }
+
+        // 阶段 2：每会话上限清理（保留最新的 max_entries_per_session 个）
+        if kept.len() > max_entries_per_session {
+            for entry in kept.iter().skip(max_entries_per_session) {
+                if let Err(e) = tokio::fs::remove_dir_all(&entry.0).await {
+                    tracing::warn!(
+                        path = %entry.0.display(),
+                        error = %e,
+                        "[tool_results cleanup] 删除超限条目目录失败"
+                    );
+                } else {
+                    removed_entries += 1;
+                }
+            }
+        }
+
+        // 阶段 3：如果会话目录为空，删除它
+        if let Ok(mut remaining) = tokio::fs::read_dir(session_dir).await {
+            if remaining.next_entry().await.ok().flatten().is_none() {
+                if let Err(e) = tokio::fs::remove_dir(session_dir).await {
+                    tracing::warn!(
+                        dir = %session_dir.display(),
+                        error = %e,
+                        "[tool_results cleanup] 删除空会话目录失败"
+                    );
+                } else {
+                    removed_dirs += 1;
+                }
+            }
+        }
+    }
+
+    if removed_entries > 0 || removed_dirs > 0 {
+        tracing::info!(
+            removed_entries,
+            removed_dirs,
+            max_age_days,
+            max_entries_per_session,
+            "[tool_results cleanup] 清理完成"
+        );
+    }
+
+    (removed_entries, removed_dirs)
 }
 
 #[cfg(test)]
@@ -1018,6 +1106,7 @@ mod layer1_tests {
             is_json: true,
             preview: "preview content".to_string(),
             has_more: true,
+            tool_ref: "tool:call_abc123:a1b2c3d4e5f6a7b8".to_string(),
         };
 
         let message = build_large_tool_result_message(&result, PREVIEW_SIZE_BYTES);
@@ -1025,6 +1114,9 @@ mod layer1_tests {
         assert!(message.ends_with(PERSISTED_OUTPUT_CLOSING_TAG));
         assert!(message.contains("97.7 KB"));
         assert!(message.contains("preview content"));
+        // 验证 stub 包含可召回的 tool: 引用（含 UUID 后缀用于精确定位）
+        assert!(message.contains("Tool ID: tool:call_abc123:a1b2c3d4e5f6a7b8"));
+        assert!(message.contains("session_recall(id=\"tool:call_abc123:a1b2c3d4e5f6a7b8\")"));
     }
 
     #[test]
@@ -1221,6 +1313,104 @@ mod layer1_tests {
         // 非保留名不受影响
         let normal = sanitize_tool_use_id("normal_file");
         assert_eq!(normal, "normal_file");
+    }
+
+    #[test]
+    fn test_sanitize_session_key_uniqueness() {
+        // 不同 session_key 不应映射到同一目录名
+        let a = sanitize_session_key("wechat:user@domain");
+        let b = sanitize_session_key("wechat:user#domain");
+        let c = sanitize_session_key("wechat-user-domain");
+
+        // 三者必须不同（虽然前缀可能相似，但哈希后缀保证唯一性）
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+
+        // 同一个 session_key 产生确定性结果
+        assert_eq!(sanitize_session_key("test"), sanitize_session_key("test"));
+    }
+
+    #[test]
+    fn test_sanitize_session_key_format() {
+        // 正常 session_key 包含可读前缀 + SHA-256 哈希后缀
+        let key = sanitize_session_key("cli:test-session");
+        assert!(key.starts_with("clitest-session_"));
+        // 哈希后缀为 16 位十六进制（SHA-256 前 64 位）
+        let parts: Vec<&str> = key.rsplitn(2, '_').collect();
+        assert_eq!(parts[0].len(), 16);
+        assert!(parts[0].chars().all(|c| c.is_ascii_hexdigit()));
+
+        // 空 session_key 使用默认前缀
+        let empty = sanitize_session_key("");
+        assert!(empty.starts_with("session_"));
+    }
+
+    #[test]
+    fn test_sanitize_session_key_special_chars() {
+        // 特殊字符被过滤，但哈希保证唯一性
+        let key = sanitize_session_key("a.b/c\\d:e@f");
+        // 不包含路径分隔符
+        assert!(!key.contains('/'));
+        assert!(!key.contains('\\'));
+        // 点号、冒号、@ 被过滤
+        let prefix_part = key.rsplit_once('_').unwrap().0;
+        // 前缀仍然以 '_' 结尾（因为过滤后可能存在 trailing _）
+        // 关键是不包含危险字符
+        assert!(!prefix_part.contains('.'));
+        assert!(!prefix_part.contains('@'));
+        assert!(!prefix_part.contains(':'));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_tool_results_empty_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tool_results = tmp.path().join(".tool_results");
+        // 空目录或无目录都应返回 (0, 0)
+        let (entries, dirs) = cleanup_tool_results(tmp.path(), 7, 50).await;
+        assert_eq!(entries, 0);
+        assert_eq!(dirs, 0);
+        let _ = tool_results; // 未创建时也无错误
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_tool_results_removes_old_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_dir = tmp.path().join(".tool_results").join("test_session_abc12345");
+        let entry_dir = session_dir.join("tool_call_old_entry");
+        tokio::fs::create_dir_all(&entry_dir).await.unwrap();
+        tokio::fs::write(entry_dir.join("output.txt"), "old content").await.unwrap();
+
+        // 使用 TTL=0 天（立即清理所有条目）
+        let (entries, _) = cleanup_tool_results(tmp.path(), 0, 50).await;
+        assert!(entries >= 1, "应删除过期条目，实际删除: {entries}");
+
+        // 条目目录应已删除
+        assert!(!entry_dir.exists(), "过期条目目录应已删除");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_tool_results_respects_max_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_dir = tmp.path().join(".tool_results").join("test_session_def12345");
+        // 创建 5 个条目
+        for i in 0..5 {
+            let entry_dir = session_dir.join(format!("tool_call_{i}_uuid{i}"));
+            tokio::fs::create_dir_all(&entry_dir).await.unwrap();
+            tokio::fs::write(entry_dir.join("output.txt"), format!("content {i}")).await.unwrap();
+        }
+        // 限制为 2 个条目，TTL=365 天（不过期）
+        let (removed, _) = cleanup_tool_results(tmp.path(), 365, 2).await;
+        assert_eq!(removed, 3, "应删除超限的 3 个条目");
+
+        // 验证只剩下 2 个条目
+        let mut count = 0;
+        if let Ok(mut entries) = tokio::fs::read_dir(&session_dir).await {
+            while let Ok(Some(_)) = entries.next_entry().await {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 2, "应保留 2 个条目");
     }
 }
 

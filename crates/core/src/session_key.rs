@@ -1,3 +1,28 @@
+use sha2::{Digest, Sha256};
+
+/// 计算 session_key 的稳定哈希后缀（64 位，16 位十六进制字符）。
+///
+/// 使用 SHA-256 取前 8 字节，保证跨平台、跨 Rust 版本的一致性。
+/// 用于文件系统路径生成，避免 [`std::collections::hash_map::DefaultHasher`]
+/// 在不同 Rust 版本间不兼容的问题。
+///
+/// ## 设计决策
+/// - 使用 SHA-256 而非 DefaultHasher：保证输出是稳定持久化格式契约
+/// - 截取 64 bit（而非 32 bit）：session 数量较大时降低碰撞风险
+/// - 所有写入侧和读取侧（如 `session_recall`）必须使用同一实现
+pub fn stable_hash_session_key(session_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(session_key.as_bytes());
+    let result = hasher.finalize();
+    // 取前 8 字节（64 位）作为十六进制后缀
+    // SHA-256 输出固定 32 字节，直接索引构造 [u8; 8] 安全无 panic
+    let hash_u64 = u64::from_be_bytes([
+        result[0], result[1], result[2], result[3],
+        result[4], result[5], result[6], result[7],
+    ]);
+    format!("{:016x}", hash_u64)
+}
+
 pub fn build_session_key(channel: &str, chat_id: &str) -> String {
     format!("{}:{}", channel, chat_id)
 }
