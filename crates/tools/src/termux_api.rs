@@ -125,50 +125,50 @@ impl Tool for TermuxApiTool {
                     .get("number")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
-                    .is_empty()
-                => {
-                    return Err(Error::Tool(
-                        "'number' is required for telephony_call".into(),
-                    ));
-                }
+                    .is_empty() =>
+            {
+                return Err(Error::Tool(
+                    "'number' is required for telephony_call".into(),
+                ));
+            }
             "clipboard_set"
                 if params
                     .get("text")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
-                    .is_empty()
-                => {
-                    return Err(Error::Tool("'text' is required for clipboard_set".into()));
-                }
+                    .is_empty() =>
+            {
+                return Err(Error::Tool("'text' is required for clipboard_set".into()));
+            }
             "tts_speak"
                 if params
                     .get("text")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
-                    .is_empty()
-                => {
-                    return Err(Error::Tool("'text' is required for tts_speak".into()));
-                }
+                    .is_empty() =>
+            {
+                return Err(Error::Tool("'text' is required for tts_speak".into()));
+            }
             "open_url"
                 if params
                     .get("url")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
-                    .is_empty()
-                => {
-                    return Err(Error::Tool("'url' is required for open_url".into()));
-                }
+                    .is_empty() =>
+            {
+                return Err(Error::Tool("'url' is required for open_url".into()));
+            }
             "notification_remove"
                 if params
                     .get("notification_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
-                    .is_empty()
-                => {
-                    return Err(Error::Tool(
-                        "'notification_id' is required for notification_remove".into(),
-                    ));
-                }
+                    .is_empty() =>
+            {
+                return Err(Error::Tool(
+                    "'notification_id' is required for notification_remove".into(),
+                ));
+            }
             "infrared_transmit" => {
                 if params.get("frequency").is_none() {
                     return Err(Error::Tool(

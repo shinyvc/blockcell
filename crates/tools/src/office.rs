@@ -179,12 +179,11 @@ fn extract_text_from_xml(xml: &str, target_tag: &str) -> Result<String> {
                     current_paragraph.clear();
                 }
             }
-            Ok(Event::Text(ref e))
-                if inside_target => {
-                    if let Ok(text) = e.unescape() {
-                        current_paragraph.push_str(&text);
-                    }
+            Ok(Event::Text(ref e)) if inside_target => {
+                if let Ok(text) = e.unescape() {
+                    current_paragraph.push_str(&text);
                 }
+            }
             Ok(Event::Eof) => break,
             Err(e) => {
                 return Err(Error::Tool(format!("XML parse error: {}", e)));

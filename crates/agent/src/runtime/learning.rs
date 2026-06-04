@@ -285,10 +285,10 @@ impl super::AgentRuntime {
                         if data
                             .get("deleted")
                             .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                        => {
-                            actions.push("Memory updated".to_string());
-                        }
+                            .unwrap_or(false) =>
+                    {
+                        actions.push("Memory updated".to_string());
+                    }
                     Some("batch_delete") => {
                         let count = data
                             .get("deleted_count")
@@ -302,10 +302,10 @@ impl super::AgentRuntime {
                         if data
                             .get("restored")
                             .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                        => {
-                            actions.push("Memory item restored".to_string());
-                        }
+                            .unwrap_or(false) =>
+                    {
+                        actions.push("Memory item restored".to_string());
+                    }
                     _ => {}
                 }
             }
