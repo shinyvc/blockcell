@@ -32,7 +32,7 @@ pub use message::{InboundMessage, OutboundMessage};
 pub use paths::Paths;
 pub use session_key::{
     build_session_key, resolve_session_key_from_id, session_file_stem, session_id_from_file_stem,
-    session_title_from_id,
+    session_title_from_id, stable_hash_session_key,
 };
 
 /// 每 token 约 4 个字符的粗略估算比例。

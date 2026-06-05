@@ -325,7 +325,7 @@ pub async fn list(all: bool, enabled_only: bool) -> anyhow::Result<()> {
     })
     .await
     .unwrap_or_default();
-    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    records.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
     // Categorize: deduplicate by skill_name (keep latest record per skill)
     let mut seen = std::collections::HashSet::new();
@@ -537,7 +537,7 @@ pub async fn show(name: &str) -> anyhow::Result<()> {
     })
     .await
     .unwrap_or_default();
-    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    records.sort_by_key(|b| std::cmp::Reverse(b.created_at));
     if !records.is_empty() {
         println!();
         println!("  Evolution records ({}):", records.len());

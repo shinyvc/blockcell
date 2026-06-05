@@ -4,7 +4,8 @@
 
 use super::template::validate_session_memory;
 use crate::forked::{
-    create_memory_file_can_use_tool, run_forked_agent, CacheSafeParams, ForkedAgentParams,
+    build_forked_tool_schemas, create_memory_file_can_use_tool, run_forked_agent, CacheSafeParams,
+    ForkedAgentParams,
 };
 use crate::memory_event;
 use crate::token::estimate_tokens;
@@ -107,9 +108,21 @@ pub enum ExtractionError {
 /// 2. Tool Calls 阈值可选满足
 /// 3. 安全条件：最后一条消息无 tool_calls
 pub fn should_extract_memory(messages: &[ChatMessage], state: &SessionMemoryState) -> bool {
-    // 0. 防重入守卫：如果提取正在进行中，不触发新的提取
-    if state.extraction_started_at.is_some() {
-        return false;
+    // 0. 防重入守卫：如果提取正在进行中，不触发新的提取。
+    // 但如果提取已 pending 超过 stale threshold（默认 60s），
+    // 说明上一次提取可能已 panic/abort（如 runtime drop），
+    // 此时允许重新触发，避免 pending 状态永久卡住。
+    if let Some(started_at) = state.extraction_started_at {
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+        if elapsed_ms < state.config.extraction_stale_threshold_ms {
+            return false;
+        }
+        // 已过期，记录警告并允许重新触发
+        tracing::warn!(
+            elapsed_ms = elapsed_ms,
+            stale_threshold_ms = state.config.extraction_stale_threshold_ms,
+            "[session_memory] 提取任务已过期（可能 panic/abort），允许重新触发"
+        );
     }
 
     let current_token_count = estimate_message_tokens(messages);
@@ -273,6 +286,9 @@ pub async fn extract_session_memory(
     template: &str,
     max_section_length: usize,
 ) -> Result<(), ExtractionError> {
+    // 保存原始内容用于后续变更检测
+    let original_content = current_memory.to_string();
+
     // 记录 Layer 3 提取开始事件
     let message_count = messages.len();
     let token_estimate = estimate_message_tokens(&messages);
@@ -314,13 +330,60 @@ pub async fn extract_session_memory(
         .fork_label("session_memory")
         .max_turns(1)
         .skip_transcript(true)
+        .tool_schemas(build_forked_tool_schemas(&[
+            "exec".to_string(),
+            "read_file".to_string(),
+            "list_dir".to_string(),
+            "grep".to_string(),
+            "glob".to_string(),
+            "write_file".to_string(),
+        ]))
         .build()
-        .map_err(|e| ExtractionError::ForkedAgent(e.to_string()))?;
+        .map_err(|e| {
+            memory_event!(layer3, extraction_completed, false, 0, 0);
+            ExtractionError::ForkedAgent(e.to_string())
+        })?;
 
     // 运行 Forked Agent
-    let result = run_forked_agent(params)
-        .await
-        .map_err(|e| ExtractionError::ForkedAgent(e.to_string()))?;
+    // 注意：run_forked_agent 失败（Provider 错误、取消、工具失败等）时需要记录
+    // Layer3 failure_count 和 token_cost，否则 /session-metrics 会偏乐观。
+    let result = run_forked_agent(params).await.map_err(|e| {
+        memory_event!(layer3, extraction_completed, false, 0, 0);
+        ExtractionError::ForkedAgent(e.to_string())
+    })?;
+
+    // 工具调用失败（权限拒绝、old_string not found 等）时不应视为提取成功
+    if result.had_tool_error {
+        tracing::warn!(
+            memory_path = %memory_path.display(),
+            "[session_memory] forked agent had tool errors, extraction skipped"
+        );
+        // 回滚到提取前的内容，避免部分写入的损坏文件残留
+        let rollback_content = if !original_content.is_empty() {
+            &original_content
+        } else {
+            template
+        };
+        if let Err(rollback_err) = fs::write(memory_path, rollback_content).await {
+            tracing::error!(
+                memory_path = %memory_path.display(),
+                error = %rollback_err,
+                "[session_memory] 工具错误后回滚记忆文件失败！数据可能已损坏"
+            );
+        }
+        memory_event!(
+            layer3,
+            extraction_completed,
+            false,
+            result.total_usage.input_tokens + result.total_usage.output_tokens,
+            0
+        );
+        return Err(ExtractionError::ForkedAgent(
+            "Forked agent had tool execution errors".to_string(),
+        ));
+    }
+
+    let token_cost = result.total_usage.input_tokens + result.total_usage.output_tokens;
 
     tracing::info!(
         input_tokens = result.total_usage.input_tokens,
@@ -397,6 +460,9 @@ pub async fn extract_session_memory(
             })?;
         }
 
+        // 记录提取失败事件（验证失败）
+        memory_event!(layer3, extraction_completed, false, token_cost, 0);
+
         return Err(ExtractionError::Validation(format!(
             "Missing sections: {}, Malformed descriptions: {}",
             validation.missing_sections.join(", "),
@@ -407,6 +473,33 @@ pub async fn extract_session_memory(
     tracing::debug!(
         memory_path = %memory_path.display(),
         "[session_memory] Validation passed"
+    );
+
+    // 注意：内容变更检测使用写入前后的文件内容快照进行比较。
+    // 同一记忆类型的并发提取受冷却机制（cooldown）保护，
+    // 因此 TOCTOU 竞态在实际运行中不会发生。
+    // 检测内容是否发生了变化
+    // "无变化"是正常情况（LLM 判断无需修改），应视为成功并推进游标，
+    // 否则调用方不会更新 token/消息游标，阈值持续满足导致反复触发。
+    if updated_content == original_content {
+        tracing::info!(
+            memory_path = %memory_path.display(),
+            "[session_memory] Extraction produced no changes (normal no-op)"
+        );
+        // 记录提取成功事件（无变更但非失败）
+        memory_event!(layer3, extraction_completed, true, token_cost, 0);
+        return Ok(());
+    }
+
+    // 计算 sections 数量用于指标
+    let sections_count = updated_content.matches("\n## ").count() as u64;
+    // 记录提取成功事件
+    memory_event!(
+        layer3,
+        extraction_completed,
+        true,
+        token_cost,
+        sections_count
     );
 
     Ok(())
@@ -439,7 +532,7 @@ Focus on:
 3. Errors & Corrections - Errors encountered and fixes
 4. Worklog - Brief step-by-step record
 
-Use the file_edit tool to update the memory file."#,
+Use the edit_file tool to update the memory file."#,
         memory_path.display(),
         if current_memory.is_empty() {
             template

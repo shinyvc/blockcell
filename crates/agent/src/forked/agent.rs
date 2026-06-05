@@ -608,6 +608,9 @@ pub struct ForkedAgentResult {
     pub final_content: Option<String>,
     /// 是否因达到 max_turns 而截断（未完成所有工具调用）
     pub truncated: bool,
+    /// 是否有工具调用执行失败（权限拒绝、old_string not found 等）
+    /// memory extraction 应据此判断是否跳过游标推进和 record_success
+    pub had_tool_error: bool,
 }
 
 /// Forked Agent 错误
@@ -728,6 +731,58 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
     normalized
 }
 
+/// 将路径规范化为"最近存在祖先的 canonical 路径 + 剩余后缀"。
+///
+/// 当路径不存在时，逐步向上查找存在的祖先，对其进行 canonicalize，
+/// 再拼接被剥离的后缀分量。确保在 Windows 下 `\\?\` 前缀一致性。
+///
+/// 安全性：如果某个祖先目录存在但 canonicalize 失败（权限不足、坏 symlink/junction），
+/// 直接返回错误，避免回退到词法路径绕过隔离校验。
+fn resolve_to_existing_ancestor(path: &Path) -> Result<PathBuf, ForkedAgentError> {
+    match std::fs::canonicalize(path) {
+        Ok(real) => Ok(real),
+        Err(_) => {
+            let mut existing_ancestor = path.to_path_buf();
+            let mut suffix = PathBuf::new();
+            loop {
+                if existing_ancestor.as_os_str().is_empty() {
+                    // 路径完全不存在且无任何已存在祖先，使用词法规范化
+                    // （此时无法构成逃逸风险，因为路径本身不在磁盘上）
+                    break Ok(normalize_path_lexically(path));
+                }
+                if existing_ancestor.exists() {
+                    match std::fs::canonicalize(&existing_ancestor) {
+                        Ok(real_ancestor) => {
+                            break Ok(real_ancestor.join(suffix));
+                        }
+                        Err(e) => {
+                            // 已存在祖先目录但 canonicalize 失败（权限/symlink/junction）
+                            // 出于安全考虑直接拒绝，不回退到词法路径
+                            break Err(ForkedAgentError::ToolError(format!(
+                                "无法解析路径 '{}': \
+                                 已存在祖先 '{}' 的 canonicalize 失败: {}。\
+                                 可能是权限不足或符号链接损坏",
+                                path.display(),
+                                existing_ancestor.display(),
+                                e
+                            )));
+                        }
+                    }
+                }
+                if let Some(parent) = existing_ancestor.parent() {
+                    if let Some(file_name) = existing_ancestor.file_name() {
+                        suffix = PathBuf::from(file_name).join(suffix);
+                    }
+                    existing_ancestor = parent.to_path_buf();
+                } else {
+                    // 已到达文件系统根目录且不存在，使用词法规范化
+                    break Ok(normalize_path_lexically(path));
+                }
+            }
+        }
+    }
+}
+
 fn resolve_forked_path(
     input_path: &str,
     working_dir: &Option<PathBuf>,
@@ -744,56 +799,10 @@ fn resolve_forked_path(
     };
 
     if let Some(base) = working_dir {
-        let base = match std::fs::canonicalize(base) {
-            Ok(real) => real,
-            Err(_) => normalize_path_lexically(base),
-        };
-
-        // Resolve the nearest existing ancestor to get the real path,
-        // then append the remaining non-existent suffix. This prevents
-        // symlink escape when the target path doesn't fully exist yet
-        // (e.g. workdir/link_to_outside/new_file where new_file doesn't exist).
-        let resolved = match std::fs::canonicalize(&resolved) {
-            Ok(real) => real,
-            Err(_) => {
-                // Walk up to find the nearest existing ancestor, canonicalize it,
-                // then append the remaining components.
-                let mut existing_ancestor = resolved.clone();
-                let mut suffix = PathBuf::new();
-                loop {
-                    if existing_ancestor.as_os_str().is_empty() {
-                        // Reached root without finding existing path —
-                        // fall back to lexical check (no symlinks possible above root)
-                        break normalize_path_lexically(&resolved);
-                    }
-                    if existing_ancestor.exists() {
-                        match std::fs::canonicalize(&existing_ancestor) {
-                            Ok(real_ancestor) => {
-                                break real_ancestor.join(suffix);
-                            }
-                            Err(_) => {
-                                // canonicalize failed even though path exists
-                                // (e.g. permission error) — reject for safety
-                                return Err(ForkedAgentError::ToolError(format!(
-                                    "Cannot resolve real path of '{}': permission denied or broken symlink",
-                                    existing_ancestor.display()
-                                )));
-                            }
-                        }
-                    }
-                    // Move up one component
-                    if let Some(parent) = existing_ancestor.parent() {
-                        if let Some(file_name) = existing_ancestor.file_name() {
-                            suffix = PathBuf::from(file_name).join(suffix);
-                        }
-                        existing_ancestor = parent.to_path_buf();
-                    } else {
-                        // Reached filesystem root
-                        break normalize_path_lexically(&resolved);
-                    }
-                }
-            }
-        };
+        // 对 base 和 resolved 使用同一个规范化策略，
+        // 避免 Windows 下 canonical/non-canonical 前缀混比（\\?\ 前缀问题）
+        let base = resolve_to_existing_ancestor(base)?;
+        let resolved = resolve_to_existing_ancestor(&resolved)?;
 
         if !resolved.starts_with(&base) {
             return Err(ForkedAgentError::ToolError(format!(
@@ -894,6 +903,19 @@ async fn execute_shell_command(
 
     let stdout = truncate_output(String::from_utf8_lossy(&output.stdout).to_string(), 10_000);
     let stderr = truncate_output(String::from_utf8_lossy(&output.stderr).to_string(), 10_000);
+
+    // 命令非零退出码视为工具失败，防止失败的命令被误记为提取成功
+    if !output.status.success() {
+        return Err(ForkedAgentError::ToolError(format!(
+            "Command exited with non-zero status (exit_code: {})\nstdout: {}\nstderr: {}",
+            output
+                .status
+                .code()
+                .map_or("N/A".to_string(), |c| c.to_string()),
+            stdout,
+            stderr,
+        )));
+    }
 
     Ok(json!({
         "exit_code": output.status.code(),
@@ -996,7 +1018,12 @@ async fn execute_forked_tool(
         ToolPermission::Deny { message } => {
             // 记录 Layer 7 tool_denied 事件
             crate::memory_event!(layer7, tool_denied, tool_name, &message);
-            return Ok(format!("Tool '{}' denied: {}", tool_name, message));
+            // 权限拒绝视为工具失败（而非 Ok），避免上层 tool_result.is_ok() 误判为成功，
+            // 进而防止 memory extraction 跳过失败记录、推进游标。
+            return Err(ForkedAgentError::ToolError(format!(
+                "Tool '{}' denied: {}",
+                tool_name, message
+            )));
         }
     }
 
@@ -1181,7 +1208,8 @@ async fn execute_forked_tool(
                     }
                 }
             } else {
-                return Ok(format!("old_string not found in {}", file_path));
+                // old_string 未找到视为工具失败，避免上层误判为编辑成功
+                return Err(ForkedAgentError::ToolError(format!("old_string not found in {}", file_path)));
             };
 
             // 原子写回文件 (temp file + rename, 防止崩溃时损坏)
@@ -2296,6 +2324,11 @@ pub async fn run_forked_agent(
     let mut current_messages = messages.clone();
     let mut final_content = None;
     let mut truncated = false;
+    // 跟踪是否有工具调用失败（权限拒绝、old_string not found 等），
+    // memory extraction 据此决定是否推进游标和 record_success
+    let mut had_tool_error = false;
+    // Track the actual number of turns used (as opposed to max_turns cap).
+    let mut actual_turns: u32 = max_turns;
 
     for turn in 0..max_turns {
         // 检查取消（使用新的 AbortToken）
@@ -2331,11 +2364,10 @@ pub async fn run_forked_agent(
         // 调用 LLM 前：发送进度事件，让用户知道子 agent 正在工作
         if let Some(ref event_tx) = params.event_tx {
             let agent_type_str = params.agent_type.as_deref().unwrap_or("fork");
-            let percent = if max_turns > 0 {
-                (turn * 100 / max_turns).min(100) as u8
-            } else {
-                0
-            };
+            let percent = max_turns
+                .checked_div(1)
+                .map(|mt| (turn * 100 / mt).min(100) as u8)
+                .unwrap_or(0);
             let event = serde_json::json!({
                 "type": "agent_progress",
                 "agent_type": agent_type_str,
@@ -2407,11 +2439,10 @@ pub async fn run_forked_agent(
                 format!("Calling: {}", tools.join(", "))
             };
             // 计算百分比：基于当前 turn / max_turns
-            let percent = if max_turns > 0 {
-                ((turn + 1) * 100 / max_turns).min(100) as u8
-            } else {
-                0
-            };
+            let percent = max_turns
+                .checked_div(1)
+                .map(|mt| ((turn + 1) * 100 / mt).min(100) as u8)
+                .unwrap_or(0);
             let event = serde_json::json!({
                 "type": "agent_progress",
                 "agent_type": agent_type_str,
@@ -2564,6 +2595,9 @@ pub async fn run_forked_agent(
 
                 // 构建工具结果消息，包含详细的错误上下文
                 let tool_success = tool_result.is_ok();
+                if !tool_success {
+                    had_tool_error = true;
+                }
                 let result_content = match tool_result {
                     Ok(result) => {
                         // 跟踪修改的文件（edit_file / write_file）
@@ -2680,6 +2714,7 @@ pub async fn run_forked_agent(
             );
             continue;
         }
+        actual_turns = turn + 1;
         break;
     }
 
@@ -2699,14 +2734,17 @@ pub async fn run_forked_agent(
         "[forked_agent] completed"
     );
 
-    // 记录 Layer 7 agent_completed 事件（带 duration）
+    let cache_hit_rate = total_usage.cache_hit_rate();
+
+    // 记录 Layer 7 agent_completed 事件（带 duration 和 cache_hit_rate）
     memory_event!(
         layer7,
         agent_completed_with_duration,
         params.fork_label,
-        max_turns,
+        actual_turns as u64,
         total_usage.input_tokens + total_usage.output_tokens,
-        duration_ms
+        duration_ms,
+        cache_hit_rate
     );
 
     Ok(ForkedAgentResult {
@@ -2715,6 +2753,7 @@ pub async fn run_forked_agent(
         files_modified,
         final_content,
         truncated,
+        had_tool_error,
     })
 }
 
@@ -3057,7 +3096,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "The absolute or relative path to the file to read."
+                            "description": "The absolute path to the file to read. Must be within the allowed memory directory."
                         }
                     },
                     "required": ["file_path"]
@@ -3075,9 +3114,10 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The directory path to list. Defaults to current directory."
+                            "description": "The absolute directory path to list. Must be within the allowed memory directory."
                         }
-                    }
+                    },
+                    "required": ["path"]
                 }
             }
         }),
@@ -3099,7 +3139,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                             "description": "The file path to search in."
                         }
                     },
-                    "required": ["pattern"]
+                    "required": ["pattern", "path"]
                 }
             }
         }),
@@ -3118,10 +3158,10 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                         },
                         "path": {
                             "type": "string",
-                            "description": "The directory to search in. Defaults to current directory."
+                            "description": "The absolute directory path to search in. Must be within the allowed memory directory."
                         }
                     },
-                    "required": ["pattern"]
+                    "required": ["pattern", "path"]
                 }
             }
         }),
@@ -3460,7 +3500,20 @@ mod tests {
         let base = std::env::temp_dir().join("blockcell-agent-wt");
         let worktree = Some(base.clone());
         let resolved = resolve_forked_path("src/main.rs", &worktree).unwrap();
-        assert_eq!(resolved, base.join("src").join("main.rs"));
+        // 验证解析路径在 worktree 内（语义检查，兼容 Windows \\?\ UNC 前缀）
+        let canonical_base = resolve_to_existing_ancestor(&base).unwrap();
+        assert!(
+            resolved.starts_with(&canonical_base),
+            "resolved '{}' should start with canonical base '{}'",
+            resolved.display(),
+            canonical_base.display()
+        );
+        // 验证路径以预期的相对分量结尾
+        assert!(
+            resolved.ends_with(Path::new("src").join("main.rs")),
+            "resolved '{}' should end with 'src/main.rs'",
+            resolved.display()
+        );
     }
 
     #[test]

@@ -81,7 +81,7 @@ impl SkillTracker {
             .collect();
 
         // 按加载时间降序排序（最近的优先）
-        records.sort_by(|a, b| b.loaded_at.cmp(&a.loaded_at));
+        records.sort_by_key(|b| std::cmp::Reverse(b.loaded_at));
 
         records
     }

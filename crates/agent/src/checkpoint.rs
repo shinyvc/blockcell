@@ -153,7 +153,7 @@ impl CheckpointManager {
         }
 
         // 按创建时间降序排列（最新的在前），保留最多 MAX_FIND_UNFINISHED 条
-        result.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        result.sort_by_key(|b| std::cmp::Reverse(b.created_at));
         result.truncate(MAX_FIND_UNFINISHED);
         result
     }

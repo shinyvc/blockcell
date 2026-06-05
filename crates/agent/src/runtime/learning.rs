@@ -281,14 +281,13 @@ impl super::AgentRuntime {
 
                 // ── memory_forget 结果: {"action": "delete", "deleted": true, ...} ──
                 match data.get("action").and_then(|v| v.as_str()) {
-                    Some("delete") => {
+                    Some("delete")
                         if data
                             .get("deleted")
                             .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                        {
-                            actions.push("Memory updated".to_string());
-                        }
+                            .unwrap_or(false) =>
+                    {
+                        actions.push("Memory updated".to_string());
                     }
                     Some("batch_delete") => {
                         let count = data
@@ -299,14 +298,13 @@ impl super::AgentRuntime {
                             actions.push(format!("Memory updated ({} items forgotten)", count));
                         }
                     }
-                    Some("restore") => {
+                    Some("restore")
                         if data
                             .get("restored")
                             .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                        {
-                            actions.push("Memory item restored".to_string());
-                        }
+                            .unwrap_or(false) =>
+                    {
+                        actions.push("Memory item restored".to_string());
                     }
                     _ => {}
                 }

@@ -6,9 +6,11 @@ use super::{
     MAX_MEMORY_FILE_TOKENS,
 };
 use crate::forked::{
-    create_auto_mem_can_use_tool, run_forked_agent, CacheSafeParams, ForkedAgentParams,
+    build_forked_tool_schemas, create_auto_mem_can_use_tool, run_forked_agent, CacheSafeParams,
+    ForkedAgentParams,
 };
 use crate::memory_event;
+use crate::session_metrics::{get_memory_extraction_circuit_breaker, get_memory_metrics};
 use crate::unified_security_scanner::scan_learned_memory_content;
 use blockcell_core::types::ChatMessage;
 use blockcell_providers::ProviderPool;
@@ -201,6 +203,20 @@ impl AutoMemoryExtractor {
         } = params;
 
         let memory_path = get_memory_file_path(&self.config_dir, memory_type);
+
+        // 熔断器检查：如果熔断器打开，快速失败避免浪费资源
+        let cb = get_memory_extraction_circuit_breaker();
+        if !cb.allow() {
+            return ExtractionResult {
+                memory_type,
+                success: false,
+                input_tokens: 0,
+                output_tokens: 0,
+                error: Some("电路熔断器打开，记忆提取被阻止".to_string()),
+                cursor_save_failed: false,
+            };
+        }
+
         let message_content_signature = build_message_content_signature(&messages);
 
         // 璇诲彇褰撳墠璁板繂鍐呭
@@ -213,6 +229,7 @@ impl AutoMemoryExtractor {
             memory_type,
             &current_content,
             self.config.max_memory_file_tokens,
+            &memory_path,
         );
 
         // 鍒涘缓 CacheSafeParams
@@ -231,23 +248,29 @@ impl AutoMemoryExtractor {
                 "[auto_memory] 确保记忆目录存在失败"
             );
         }
+        let memory_dir = self.config_dir.join("memory");
 
         // 使用 Builder 模式构建 ForkedAgentParams（强制设置 provider_pool）
         let params = ForkedAgentParams::builder()
             .provider_pool(provider_pool)
             .prompt_messages(vec![ChatMessage::user(&extraction_prompt)])
             .cache_safe_params(cache_safe_params)
-            .can_use_tool(create_auto_mem_can_use_tool(&self.config_dir))
+            .can_use_tool(create_auto_mem_can_use_tool(&memory_dir))
+            // 将执行层也限制在记忆目录内，作为 can_use_tool 之外的第二道边界。
+            .working_dir(memory_dir)
             .query_source("auto_memory")
             .fork_label(memory_type.name())
             .max_turns(1)
             .skip_transcript(true)
+            .tool_schemas(build_forked_tool_schemas(&["exec".to_string()]))
             .build();
 
         // 如果 builder 失败（理论上不会，因为已经设置 provider_pool）
         let params = match params {
             Ok(p) => p,
             Err(e) => {
+                cb.record_failure();
+                get_memory_metrics().layer5.record_extraction_failure();
                 return ExtractionResult {
                     memory_type,
                     success: false,
@@ -260,10 +283,45 @@ impl AutoMemoryExtractor {
         };
 
         // 杩愯 Forked Agent
+        // 记录提取开始事件
+        memory_event!(
+            layer5,
+            extraction_started,
+            memory_type.name(),
+            memory_path.display().to_string()
+        );
+
         let result = run_forked_agent(params).await;
 
         match result {
             Ok(forked_result) => {
+                // 工具调用失败（权限拒绝、old_string not found 等）时不应视为提取成功
+                if forked_result.had_tool_error {
+                    tracing::warn!(
+                        memory_type = memory_type.name(),
+                        "[auto_memory] forked agent had tool errors, skipping extraction"
+                    );
+                    // 回滚到提取前的内容，避免部分写入的损坏文件残留
+                    if let Err(rollback_err) =
+                        atomic_rollback_write(&memory_path, &current_content).await
+                    {
+                        tracing::error!(
+                            memory_type = memory_type.name(),
+                            error = %rollback_err,
+                            "[auto_memory] 工具错误后回滚记忆文件失败！数据可能已损坏"
+                        );
+                    }
+                    cb.record_failure();
+                    get_memory_metrics().layer5.record_extraction_failure();
+                    return ExtractionResult {
+                        memory_type,
+                        success: false,
+                        input_tokens: forked_result.total_usage.input_tokens as usize,
+                        output_tokens: forked_result.total_usage.output_tokens as usize,
+                        error: Some("Forked agent had tool execution errors".to_string()),
+                        cursor_save_failed: false,
+                    };
+                }
                 // 安全扫描: 检查写入后的记忆文件内容
                 if let Ok(updated_content) = tokio::fs::read_to_string(&memory_path).await {
                     if let Err(err) = scan_learned_memory_content(&updated_content) {
@@ -282,6 +340,8 @@ impl AutoMemoryExtractor {
                                 "[auto_memory] 回滚记忆文件失败！数据可能已损坏"
                             );
                         }
+                        cb.record_failure();
+                        get_memory_metrics().layer5.record_extraction_failure();
                         return ExtractionResult {
                             memory_type,
                             success: false,
@@ -296,6 +356,51 @@ impl AutoMemoryExtractor {
                     }
                 }
 
+                // 注意：内容变更检测使用写入前后的文件内容快照进行比较。
+                // 同一记忆类型的并发提取受冷却机制（cooldown）保护，
+                // 因此 TOCTOU 竞态在实际运行中不会发生。
+                // 内容变更检测：重新读取文件确认内容已变更
+                // "无变化"是正常情况（LLM 判断无需修改），不应视为失败。
+                // 仍需推进游标以避免重复触发，不计入熔断。
+                if let Ok(new_content) = tokio::fs::read_to_string(&memory_path).await {
+                    if new_content == current_content {
+                        tracing::info!(
+                            memory_type = memory_type.name(),
+                            "[auto_memory] 提取未产生内容变更（正常 no-op）"
+                        );
+                        cb.record_success();
+                        // 正常推进游标，防止下次继续触发
+                        let cursor = {
+                            let mut c = self.cursor_manager.get_cursor(memory_type);
+                            c.update_with_content(
+                                last_message_uuid,
+                                message_count,
+                                &message_content_signature,
+                            );
+                            c
+                        };
+                        let cursor_save_failed = match self
+                            .cursor_manager
+                            .merge_and_save(cursor)
+                            .await
+                        {
+                            Err(e) => {
+                                tracing::error!(error = %e, "[auto_memory] failed to save cursor (no-change path)");
+                                true
+                            }
+                            Ok(()) => false,
+                        };
+                        return ExtractionResult {
+                            memory_type,
+                            success: true, // 无变化视为成功
+                            input_tokens: forked_result.total_usage.input_tokens as usize,
+                            output_tokens: forked_result.total_usage.output_tokens as usize,
+                            error: None,
+                            cursor_save_failed,
+                        };
+                    }
+                }
+
                 // 更新游标
                 let cursor = {
                     let mut c = self.cursor_manager.get_cursor(memory_type);
@@ -306,6 +411,14 @@ impl AutoMemoryExtractor {
                     );
                     c
                 };
+
+                // 记录游标更新事件
+                memory_event!(
+                    layer5,
+                    cursor_updated,
+                    memory_type.name(),
+                    message_count as u64
+                );
 
                 // 合并磁盘上的最新状态并保存游标（防止并发覆盖）
                 let cursor_save_failed = match self.cursor_manager.merge_and_save(cursor).await {
@@ -336,6 +449,9 @@ impl AutoMemoryExtractor {
                     );
                 }
 
+                // 熔断器记录成功
+                cb.record_success();
+
                 ExtractionResult {
                     memory_type,
                     success: true,
@@ -346,6 +462,10 @@ impl AutoMemoryExtractor {
                 }
             }
             Err(e) => {
+                // 熔断器记录失败
+                cb.record_failure();
+                get_memory_metrics().layer5.record_extraction_failure();
+
                 tracing::error!(
                     memory_type = memory_type.name(),
                     error = %e,
@@ -385,6 +505,7 @@ fn build_extraction_prompt(
     memory_type: MemoryType,
     current_content: &str,
     max_memory_file_tokens: usize,
+    memory_path: &Path,
 ) -> String {
     format!(
         r#"Update the {} memory file.
@@ -404,13 +525,14 @@ fn build_extraction_prompt(
 - Preserve all existing important information
 - Add new information that matches this memory type's purpose
 {}
-Use the file_edit tool to update the memory file at the configured path.
+Use the edit_file tool to update the memory file at: {}.
 "#,
         memory_type.name(),
         current_content,
         memory_type.usage_guide(),
         max_memory_file_tokens,
         EXTRACTION_ENHANCEMENT,
+        memory_path.display(),
     )
 }
 
@@ -505,14 +627,31 @@ pub async fn extract_auto_memory(
 
     let memory_path = get_memory_file_path(config_dir, memory_type);
 
+    // 熔断器检查：如果熔断器打开，快速失败避免浪费资源
+    let cb = get_memory_extraction_circuit_breaker();
+    if !cb.allow() {
+        return ExtractionResult {
+            memory_type,
+            success: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            error: Some("电路熔断器打开，记忆提取被阻止".to_string()),
+            cursor_save_failed: false,
+        };
+    }
+
     // 读取当前内容
     let current_content = tokio::fs::read_to_string(&memory_path)
         .await
         .unwrap_or_else(|_| memory_type.template().to_string());
 
     // 构建 prompt
-    let extraction_prompt =
-        build_extraction_prompt(memory_type, &current_content, MAX_MEMORY_FILE_TOKENS);
+    let extraction_prompt = build_extraction_prompt(
+        memory_type,
+        &current_content,
+        MAX_MEMORY_FILE_TOKENS,
+        &memory_path,
+    );
 
     // 创建 CacheSafeParams
     let cache_safe_params = CacheSafeParams {
@@ -524,15 +663,26 @@ pub async fn extract_auto_memory(
 
     // 使用 Builder 模式构建 ForkedAgentParams
     // 这确保必需参数（provider_pool）在编译时被验证
+    if let Err(e) = ensure_memory_dir(config_dir).await {
+        tracing::warn!(
+            path = %config_dir.display(),
+            error = %e,
+            "[auto_memory] 确保记忆目录存在失败"
+        );
+    }
+    let memory_dir = config_dir.join("memory");
     let params = match ForkedAgentParams::builder()
         .provider_pool(provider_pool)
         .prompt_messages(vec![ChatMessage::user(&extraction_prompt)])
         .cache_safe_params(cache_safe_params)
-        .can_use_tool(create_auto_mem_can_use_tool(config_dir))
+        .can_use_tool(create_auto_mem_can_use_tool(&memory_dir))
+        // 将执行层也限制在记忆目录内，作为 can_use_tool 之外的第二道边界。
+        .working_dir(memory_dir)
         .query_source("auto_memory")
         .fork_label(memory_type.name())
         .max_turns(1)
         .skip_transcript(true)
+        .tool_schemas(build_forked_tool_schemas(&["exec".to_string()]))
         .build()
     {
         Ok(p) => p,
@@ -553,6 +703,33 @@ pub async fn extract_auto_memory(
 
     match result {
         Ok(forked_result) => {
+            // 工具调用失败时不应视为提取成功
+            if forked_result.had_tool_error {
+                tracing::warn!(
+                    memory_type = memory_type.name(),
+                    "[auto_memory] deprecated path: forked agent had tool errors, skipping extraction"
+                );
+                // 回滚到提取前的内容，避免部分写入的损坏文件残留
+                if let Err(rollback_err) =
+                    atomic_rollback_write(&memory_path, &current_content).await
+                {
+                    tracing::error!(
+                        memory_type = memory_type.name(),
+                        error = %rollback_err,
+                        "[auto_memory] deprecated 路径工具错误后回滚记忆文件失败！数据可能已损坏"
+                    );
+                }
+                cb.record_failure();
+                get_memory_metrics().layer5.record_extraction_failure();
+                return ExtractionResult {
+                    memory_type,
+                    success: false,
+                    input_tokens: forked_result.total_usage.input_tokens as usize,
+                    output_tokens: forked_result.total_usage.output_tokens as usize,
+                    error: Some("Forked agent had tool execution errors".to_string()),
+                    cursor_save_failed: false,
+                };
+            }
             // 安全扫描: 检查写入后的记忆文件内容
             if let Ok(updated_content) = tokio::fs::read_to_string(&memory_path).await {
                 if let Err(err) = scan_learned_memory_content(&updated_content) {
@@ -570,6 +747,9 @@ pub async fn extract_auto_memory(
                             "[auto_memory] memory file rollback failed; data may be corrupted"
                         );
                     }
+                    // deprecated 路径仍需记录熔断失败，保持与 extract() 一致
+                    cb.record_failure();
+                    get_memory_metrics().layer5.record_extraction_failure();
                     return ExtractionResult {
                         memory_type,
                         success: false,
@@ -591,6 +771,9 @@ pub async fn extract_auto_memory(
                 "[auto_memory] extraction completed"
             );
 
+            // 熔断器记录成功
+            cb.record_success();
+
             ExtractionResult {
                 memory_type,
                 success: true,
@@ -600,14 +783,20 @@ pub async fn extract_auto_memory(
                 cursor_save_failed: false,
             }
         }
-        Err(e) => ExtractionResult {
-            memory_type,
-            success: false,
-            input_tokens: 0,
-            output_tokens: 0,
-            error: Some(e.to_string()),
-            cursor_save_failed: false,
-        },
+        Err(e) => {
+            // 熔断器记录失败
+            cb.record_failure();
+            get_memory_metrics().layer5.record_extraction_failure();
+
+            ExtractionResult {
+                memory_type,
+                success: false,
+                input_tokens: 0,
+                output_tokens: 0,
+                error: Some(e.to_string()),
+                cursor_save_failed: false,
+            }
+        }
     }
 }
 /// 检查是否应该提取自动记忆（使用默认常量）
@@ -630,10 +819,16 @@ mod tests {
 
     #[test]
     fn test_build_extraction_prompt() {
-        let prompt = build_extraction_prompt(MemoryType::User, "current content", 4000);
+        let prompt = build_extraction_prompt(
+            MemoryType::User,
+            "current content",
+            4000,
+            std::path::Path::new("/config/memory/user.md"),
+        );
         assert!(prompt.contains("user memory file"));
         assert!(prompt.contains("current content"));
         assert!(prompt.contains("4000 tokens"));
+        assert!(prompt.contains("/config/memory/user.md"));
     }
 
     #[test]

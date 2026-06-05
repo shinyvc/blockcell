@@ -55,8 +55,8 @@ pub fn create_memory_file_can_use_tool(memory_path: &Path) -> CanUseToolFn {
 ///
 /// 允许：
 /// - REPL（内部会重新调用此函数）
-/// - Read/Grep/Glob（只读）
-/// - Bash 只读命令
+/// - Read/Grep/Glob/ListDir（只读，且仅限记忆目录内的显式路径）
+/// - Shell/Exec 只读命令（必须指定记忆目录内的工作目录，且命令参数不能逃逸）
 /// - Edit/Write 仅限 memory 目录内
 pub fn create_auto_mem_can_use_tool(memory_dir: &Path) -> CanUseToolFn {
     let memory_dir = memory_dir.to_path_buf();
@@ -66,21 +66,14 @@ pub fn create_auto_mem_can_use_tool(memory_dir: &Path) -> CanUseToolFn {
             return ToolPermission::Allow;
         }
 
-        // 允许 Read/Grep/Glob/ListDir（只读工具）
+        // 只读文件工具也必须限制在记忆目录内，避免后台 agent 读取任意本地路径。
         if matches!(tool_name, "read_file" | "grep" | "glob" | "list_dir") {
-            return ToolPermission::Allow;
+            return allow_read_only_path(tool_name, input, &memory_dir);
         }
 
-        // 允许只读 Bash 命令
-        if tool_name == "shell" || tool_name == "bash" {
-            if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-                if is_read_only_command(cmd) {
-                    return ToolPermission::Allow;
-                }
-            }
-            return ToolPermission::Deny {
-                message: "Only read-only shell commands permitted".to_string(),
-            };
+        // shell/exec 难以完整解析参数，必须额外要求工作目录和命令参数都不逃逸记忆目录。
+        if matches!(tool_name, "shell" | "bash" | "exec") {
+            return allow_restricted_shell(input, &memory_dir);
         }
 
         // Edit/Write 仅限记忆目录内
@@ -100,14 +93,14 @@ pub fn create_auto_mem_can_use_tool(memory_dir: &Path) -> CanUseToolFn {
 
         // 其他工具全部拒绝
         ToolPermission::Deny {
-            message: "only Read/Grep/Glob and Edit/Write within memory dir".to_string(),
+            message: "仅允许记忆目录内的只读文件工具和写入工具".to_string(),
         }
     })
 }
 
 /// 创建 Dream 整合的工具权限检查
 ///
-/// 与 auto_mem 类似，但允许更广泛的只读操作
+/// 与 auto_mem 类似，但所有文件读写都限制在记忆根目录内
 pub fn create_dream_can_use_tool(memory_root: &Path) -> CanUseToolFn {
     let memory_root = memory_root.to_path_buf();
     Arc::new(move |tool_name: &str, input: &serde_json::Value| {
@@ -116,21 +109,14 @@ pub fn create_dream_can_use_tool(memory_root: &Path) -> CanUseToolFn {
             return ToolPermission::Allow;
         }
 
-        // 允许只读工具
+        // 只读工具必须显式访问记忆根目录内的路径，避免 dream agent 泄露本地敏感文件。
         if matches!(tool_name, "read_file" | "grep" | "glob" | "ls" | "list_dir") {
-            return ToolPermission::Allow;
+            return allow_read_only_path(tool_name, input, &memory_root);
         }
 
-        // Bash 只允许只读命令
-        if tool_name == "shell" || tool_name == "bash" {
-            if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-                if is_read_only_command(cmd) {
-                    return ToolPermission::Allow;
-                }
-            }
-            return ToolPermission::Deny {
-                message: "Only read-only shell commands permitted".to_string(),
-            };
+        // shell/exec 只在工作目录和参数都受限时允许。
+        if matches!(tool_name, "shell" | "bash" | "exec") {
+            return allow_restricted_shell(input, &memory_root);
         }
 
         // Edit/Write 仅限记忆目录
@@ -564,6 +550,117 @@ fn build_list_dir_schema() -> serde_json::Value {
     )
 }
 
+fn allow_read_only_path(
+    tool_name: &str,
+    input: &serde_json::Value,
+    allowed_dir: &Path,
+) -> ToolPermission {
+    let Some(path) = read_only_tool_path(tool_name, input) else {
+        return ToolPermission::Deny {
+            message: format!("{} 必须显式提供记忆目录内的路径", tool_name),
+        };
+    };
+
+    if is_path_within_directory(path, allowed_dir) {
+        ToolPermission::Allow
+    } else {
+        ToolPermission::Deny {
+            message: format!(
+                "{} 只能访问记忆目录内的路径: {}",
+                tool_name,
+                allowed_dir.display()
+            ),
+        }
+    }
+}
+
+fn read_only_tool_path<'a>(tool_name: &str, input: &'a serde_json::Value) -> Option<&'a str> {
+    match tool_name {
+        "read_file" => input.get("file_path").and_then(|v| v.as_str()),
+        "grep" | "glob" | "ls" => input.get("path").and_then(|v| v.as_str()),
+        "list_dir" => input
+            .get("path")
+            .or_else(|| input.get("dir_path"))
+            .and_then(|v| v.as_str()),
+        _ => None,
+    }
+}
+
+fn allow_restricted_shell(input: &serde_json::Value, allowed_dir: &Path) -> ToolPermission {
+    let Some(cmd) = input.get("command").and_then(|v| v.as_str()) else {
+        return ToolPermission::Deny {
+            message: "shell/exec 必须提供 command".to_string(),
+        };
+    };
+
+    if !is_read_only_command(cmd) {
+        return ToolPermission::Deny {
+            message: "shell/exec 仅允许只读命令".to_string(),
+        };
+    }
+
+    let Some(working_dir) = input.get("working_dir").and_then(|v| v.as_str()) else {
+        return ToolPermission::Deny {
+            message: "shell/exec 必须显式指定记忆目录内的 working_dir".to_string(),
+        };
+    };
+
+    if !is_path_within_directory(working_dir, allowed_dir) {
+        return ToolPermission::Deny {
+            message: format!(
+                "shell/exec 的 working_dir 只能位于记忆目录内: {}",
+                allowed_dir.display()
+            ),
+        };
+    }
+
+    // 只读命令本身还不能携带绝对路径、环境变量或父目录跳转，
+    // 否则即使 current_dir 受限，也可能读取到记忆目录外的文件。
+    if !shell_command_paths_are_confined(cmd) {
+        return ToolPermission::Deny {
+            message: "shell/exec 命令参数不能包含绝对路径、环境变量或父目录跳转".to_string(),
+        };
+    }
+
+    ToolPermission::Allow
+}
+
+fn shell_command_paths_are_confined(cmd: &str) -> bool {
+    cmd.split_whitespace().all(|raw_token| {
+        let token = raw_token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | ',' | ':' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+        });
+        if token.is_empty() {
+            return true;
+        }
+
+        let path_like = token
+            .split_once('=')
+            .map(|(_, value)| value)
+            .unwrap_or(token);
+
+        if path_like.is_empty() || (token.starts_with('-') && !token.contains('=')) {
+            return true;
+        }
+
+        if path_like.starts_with('~')
+            || path_like.starts_with('/')
+            || path_like.starts_with('\\')
+            || path_like.contains("..")
+            || path_like.contains('$')
+            || path_like.contains('%')
+            || Path::new(path_like).is_absolute()
+        {
+            return false;
+        }
+
+        true
+    })
+}
+
 /// 检查是否只读命令
 ///
 /// 安全检查：
@@ -571,8 +668,9 @@ fn build_list_dir_schema() -> serde_json::Value {
 /// 2. 不能包含输出重定向符号 (>, >>)
 /// 3. 不能包含管道符号 (|)
 /// 4. 不能包含命令替换 ($(), ``)
-/// 5. 不能包含换行符（防止命令注入）
-/// 6. 不能包含 null 字节
+/// 5. 不能包含输入重定向 (<)
+/// 6. 不能包含换行符（防止命令注入）
+/// 7. 不能包含 null 字节
 ///
 /// 注意：`env` 和 `printenv` 已从允许列表中移除，因为可能泄露敏感环境变量。
 fn is_read_only_command(cmd: &str) -> bool {
@@ -613,9 +711,10 @@ fn is_read_only_command(cmd: &str) -> bool {
     // 2. 命令替换 ($(), ``) - 可能执行任意命令
     // 3. 分号 (;) 和逻辑运算符 (&&, ||) - 可能链接多个命令
     // 4. 后台执行 (&) - 可能在后台执行危险操作
-    // 5. 换行转义 (\n, \r) - 可能注入新命令
+    // 5. 输入重定向 (<) - 可能绕过路径限制读取外部文件
+    // 6. 换行转义 (\n, \r) - 可能注入新命令
     let dangerous_patterns = [
-        "|", "$(", "`", ";", "&&", "||", "&", "\\n", "\\r", "\n", "\r",
+        "|", "$(", "`", ";", "&&", "||", "&", "<", "\\n", "\\r", "\n", "\r",
     ];
 
     for pattern in &dangerous_patterns {
@@ -775,6 +874,9 @@ mod tests {
         assert!(!is_read_only_command("echo $(cat secret)"));
         assert!(!is_read_only_command("echo `whoami`"));
 
+        // 输入重定向 - 应该被拒绝，避免绕过路径限制读取外部文件
+        assert!(!is_read_only_command("cat < /etc/passwd"));
+
         // 分号和逻辑运算符 - 应该被拒绝
         assert!(!is_read_only_command("ls; rm file"));
         assert!(!is_read_only_command("ls && rm file"));
@@ -820,21 +922,54 @@ mod tests {
 
         let can_use = create_auto_mem_can_use_tool(memory_dir);
 
-        // 允许只读工具
+        // 允许读取记忆目录内的显式路径
+        let memory_read_file = temp_dir.join("reference.md");
+        let memory_read_file_str = memory_read_file.to_string_lossy();
         assert!(matches!(
-            can_use("read_file", &json!({"file_path": "/any/file"})),
+            can_use(
+                "read_file",
+                &json!({"file_path": memory_read_file_str.as_ref()})
+            ),
             ToolPermission::Allow
         ));
 
-        // 允许只读 shell 命令
+        // 拒绝读取记忆目录外的路径
+        assert!(matches!(
+            can_use("read_file", &json!({"file_path": "/any/file"})),
+            ToolPermission::Deny { .. }
+        ));
+
+        // 允许受限的只读 shell 命令
+        let memory_dir_str = temp_dir.to_string_lossy();
+        assert!(matches!(
+            can_use(
+                "shell",
+                &json!({"command": "ls -la", "working_dir": memory_dir_str.as_ref()})
+            ),
+            ToolPermission::Allow
+        ));
+
+        // 拒绝未指定受限工作目录的 shell 命令
         assert!(matches!(
             can_use("shell", &json!({"command": "ls -la"})),
-            ToolPermission::Allow
+            ToolPermission::Deny { .. }
+        ));
+
+        // 拒绝 shell 读取绝对路径
+        assert!(matches!(
+            can_use(
+                "shell",
+                &json!({"command": "cat /etc/passwd", "working_dir": memory_dir_str.as_ref()})
+            ),
+            ToolPermission::Deny { .. }
         ));
 
         // 拒绝写入 shell 命令
         assert!(matches!(
-            can_use("shell", &json!({"command": "rm file"})),
+            can_use(
+                "shell",
+                &json!({"command": "rm file", "working_dir": memory_dir_str.as_ref()})
+            ),
             ToolPermission::Deny { .. }
         ));
 
@@ -853,6 +988,34 @@ mod tests {
         ));
 
         // 清理临时目录
+        fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn test_dream_read_tools_are_limited_to_memory_root() {
+        use std::fs;
+
+        let temp_dir = std::env::temp_dir().join("blockcell_test_dream_memory");
+        fs::create_dir_all(&temp_dir).ok();
+        let can_use = create_dream_can_use_tool(&temp_dir);
+
+        let memory_file = temp_dir.join("project.md");
+        let memory_file_str = memory_file.to_string_lossy();
+        assert!(matches!(
+            can_use("read_file", &json!({"file_path": memory_file_str.as_ref()})),
+            ToolPermission::Allow
+        ));
+
+        assert!(matches!(
+            can_use("read_file", &json!({"file_path": "/etc/passwd"})),
+            ToolPermission::Deny { .. }
+        ));
+
+        assert!(matches!(
+            can_use("glob", &json!({"pattern": "*.md"})),
+            ToolPermission::Deny { .. }
+        ));
+
         fs::remove_dir_all(&temp_dir).ok();
     }
 

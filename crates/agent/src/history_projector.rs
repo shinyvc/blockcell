@@ -209,7 +209,11 @@ impl<'a> HistoryProjector<'a> {
         let last_timestamp = last_assistant_timestamp?;
 
         // 计算时间差（使用 wall clock，见上方文档说明）
-        let gap_minutes = (Utc::now() - last_timestamp).num_minutes() as u32;
+        let diff = Utc::now() - last_timestamp;
+        // 防御未来时间戳：如果 last_timestamp 因时钟偏移或迁移数据落在未来，
+        // diff 为负值，num_minutes() 返回负数，as u32 会溢出为巨大正数，
+        // 从而绕过阈值检查并错误触发 microcompact。
+        let gap_minutes: u32 = diff.num_minutes().try_into().unwrap_or(0);
 
         // 必须超过阈值
         if gap_minutes < config.gap_threshold_minutes {
@@ -237,7 +241,19 @@ impl<'a> HistoryProjector<'a> {
         config: &TimeBasedMCConfig,
     ) -> Option<Vec<ChatMessage>> {
         let trigger =
-            self.evaluate_time_based_trigger(last_assistant_timestamp, query_source, config)?;
+            self.evaluate_time_based_trigger(last_assistant_timestamp, query_source, config);
+        let triggered = trigger.is_some();
+        memory_event!(
+            layer2,
+            evaluated,
+            triggered,
+            if triggered {
+                "time_threshold_met"
+            } else {
+                "conditions_not_met"
+            }
+        );
+        let trigger = trigger?;
 
         // 记录 Layer 2 触发事件
         memory_event!(
@@ -311,6 +327,9 @@ fn collect_compactable_tool_ids(messages: &[ChatMessage]) -> Vec<String> {
 }
 
 /// 清理工具结果内容
+///
+/// 如果内容包含 `<persisted-output>` 标签，保留标签内的持久化输出存根，
+/// 否则使用标准的清理消息替换。
 fn maybe_clear_tool_result(message: &ChatMessage, clear_set: &HashSet<String>) -> ChatMessage {
     if message.role != "tool" {
         return message.clone();
@@ -319,6 +338,26 @@ fn maybe_clear_tool_result(message: &ChatMessage, clear_set: &HashSet<String>) -
     // 检查 tool_call_id 是否在清理集合中
     if let Some(tool_call_id) = &message.tool_call_id {
         if clear_set.contains(tool_call_id) {
+            // 检查是否包含持久化输出标签，如果包含则保留最小存根
+            if let Some(content) = message.content.as_str() {
+                if let Some(start) = content.find(crate::response_cache::PERSISTED_OUTPUT_TAG) {
+                    // 从起始标签之后搜索闭合标签，避免找到起始标签之前的闭合标签
+                    let after_start = start + crate::response_cache::PERSISTED_OUTPUT_TAG.len();
+                    if let Some(end) = content[after_start..]
+                        .find(crate::response_cache::PERSISTED_OUTPUT_CLOSING_TAG)
+                    {
+                        let end = after_start + end;
+                        let mut cleared = message.clone();
+                        cleared.content = Value::String(
+                            content[start
+                                ..end + crate::response_cache::PERSISTED_OUTPUT_CLOSING_TAG.len()]
+                                .to_string(),
+                        );
+                        return cleared;
+                    }
+                }
+            }
+
             let mut cleared = message.clone();
             cleared.content =
                 Value::String(crate::response_cache::TIME_BASED_MC_CLEARED_MESSAGE.to_string());

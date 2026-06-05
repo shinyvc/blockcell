@@ -100,7 +100,7 @@ impl FileStateCache {
             .collect();
 
         // 按时间戳倒序排序
-        files.sort_by(|a, b| b.2.cmp(&a.2));
+        files.sort_by_key(|b| std::cmp::Reverse(b.2));
         files.truncate(max_files);
         files
     }

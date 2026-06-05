@@ -79,6 +79,11 @@ pub trait SlashCommand: Send + Sync {
     /// 命令名称 (不含斜杠)
     fn name(&self) -> &str;
 
+    /// 命令别名列表，可用于兼容旧命令名或下划线/连字符变体
+    fn aliases(&self) -> &[&str] {
+        &[]
+    }
+
     /// 命令描述 (用于 /help 显示)
     fn description(&self) -> &str;
 
@@ -190,9 +195,9 @@ impl SlashCommandHandler {
             return CommandResult::NotACommand;
         }
 
-        // 查找命令处理器
+        // 查找命令处理器（先匹配主名称，再匹配别名）
         for command in &self.commands {
-            if command.name() == cmd_name {
+            if command.name() == cmd_name || command.aliases().contains(&cmd_name) {
                 // 渠道限制检查
                 if let Some(channels) = command.available_channels() {
                     if !channels.iter().any(|c| *c == ctx.source.channel) {

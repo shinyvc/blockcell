@@ -14,9 +14,11 @@
 //! 4. Prune - 修剪索引
 
 use blockcell_agent::forked::{
-    create_dream_can_use_tool, run_forked_agent, CacheSafeParams, ForkedAgentParams,
+    build_forked_tool_schemas, create_dream_can_use_tool, run_forked_agent, CacheSafeParams,
+    ForkedAgentParams,
 };
 use blockcell_agent::memory_event;
+use blockcell_agent::session_metrics::get_dream_circuit_breaker;
 use blockcell_agent::CrossProcessLock;
 use blockcell_core::types::ChatMessage;
 use serde::{Deserialize, Serialize};
@@ -54,6 +56,12 @@ pub struct DreamStats {
     pub sessions_pruned: usize,
     /// 处理的会话数
     pub sessions_processed: usize,
+}
+
+impl DreamStats {
+    fn has_memory_changes(&self) -> bool {
+        self.memories_created > 0 || self.memories_updated > 0 || self.memories_deleted > 0
+    }
 }
 
 /// Memory 目录状态快照
@@ -223,6 +231,24 @@ impl DreamState {
     }
 }
 
+fn apply_successful_dream_state(
+    state: &mut DreamState,
+    stats: &DreamStats,
+    processed_session_count: usize,
+    now_secs: u64,
+) {
+    state.last_consolidation_time = Some(now_secs);
+    // 成功执行过的会话批次都要推进游标；即使本轮没有产出记忆变更，
+    // 也不能让下一次时间门打开后反复处理同一批会话。
+    state.last_session_count = processed_session_count;
+
+    if stats.has_memory_changes() {
+        state.consolidation_count += 1;
+    } else {
+        tracing::info!("[dream] consolidation produced no changes");
+    }
+}
+
 /// 收集到的信号
 #[derive(Debug, Clone)]
 pub struct GatheredSignal {
@@ -374,6 +400,7 @@ pub async fn check_gates(
         return GateCheckResult::SessionGateFailed;
     }
 
+    memory_event!(layer6, gate_passed, "all_gates");
     GateCheckResult::Passed
 }
 
@@ -477,13 +504,17 @@ impl DreamConsolidator {
         let mut stats = DreamStats::default();
         let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
             self.orient().await?;
+            memory_event!(layer6, phase_completed, "orient");
             let signals = self.gather().await?;
+            memory_event!(layer6, phase_completed, "gather");
             self.consolidate(&signals).await?;
+            memory_event!(layer6, phase_completed, "consolidate");
             // 在 consolidate 后计算 memory 变化
             let post_memory_state = self.scan_memory_dir(&memory_dir).await;
             stats = self.compute_memory_diff(&pre_memory_state, &post_memory_state);
             // prune 返回修剪统计
             let prune_stats = self.prune().await?;
+            memory_event!(layer6, phase_completed, "prune");
             stats.sessions_pruned = prune_stats.sessions_pruned;
             stats.sessions_processed = prune_stats.sessions_processed;
             Ok::<(), DreamError>(())
@@ -504,17 +535,16 @@ impl DreamConsolidator {
 
         // 只有成功时才推进时间门和会话门，失败/超时保留原值以便重试
         if result.is_ok() {
-            self.state.last_consolidation_time = Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            apply_successful_dream_state(
+                &mut self.state,
+                &stats,
+                processed_session_count,
+                now_secs,
             );
-            // 只推进到整合开始前的快照值，而非 current_session_count。
-            // 整合期间新增的会话未必被本次 gather/prune 处理，
-            // 下一轮门控应仍能看到这些新会话。
-            self.state.last_session_count = processed_session_count;
-            self.state.consolidation_count += 1;
         }
 
         // 最终保存：在同一个跨进程锁保护下完成 read-merge-write，
@@ -659,6 +689,7 @@ impl DreamConsolidator {
                 );
             }
             Err(e) => {
+                memory_event!(layer6, dream_failed, e.to_string());
                 tracing::error!(
                     elapsed_ms = elapsed.as_millis() as u64,
                     error = %e,
@@ -862,7 +893,7 @@ impl DreamConsolidator {
         }
 
         // 按修改时间降序排序（最新的优先）
-        session_files.sort_by(|a, b| b.1.cmp(&a.1));
+        session_files.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         // 限制处理数量
         let files_to_process = session_files.iter().take(MAX_SESSIONS_TO_PROCESS);
@@ -989,6 +1020,7 @@ impl DreamConsolidator {
 
         // 构建整合提示（包含收集的信号）
         let memory_dir = self.config_dir.join("memory");
+        fs::create_dir_all(&memory_dir).await?;
         let prompt = self.build_consolidation_prompt(&memory_dir, signals);
 
         // 创建工具权限检查
@@ -997,6 +1029,13 @@ impl DreamConsolidator {
         // 创建 CacheSafeParams（使用默认系统提示）
         let cache_safe_params = CacheSafeParams::default();
 
+        // 熔断器检查：如果熔断器打开，跳过整合
+        let cb = get_dream_circuit_breaker();
+        if !cb.allow() {
+            tracing::warn!("[dream] Circuit breaker is open, skipping consolidation");
+            return Err(DreamError::CircuitBreakerOpen);
+        }
+
         // 运行 Forked Agent 进行整合
         // 使用 Builder 模式构建参数
         let params = ForkedAgentParams::builder()
@@ -1004,10 +1043,13 @@ impl DreamConsolidator {
             .prompt_messages(vec![ChatMessage::user(&prompt)])
             .cache_safe_params(cache_safe_params)
             .can_use_tool(can_use_tool)
+            // 将执行层也限制在记忆目录内，避免无 working_dir 时接受任意绝对路径。
+            .working_dir(memory_dir)
             .query_source("auto_dream")
             .fork_label("auto_dream")
             .max_turns(10)
             .skip_transcript(true)
+            .tool_schemas(build_forked_tool_schemas(&["exec".to_string()]))
             .build()
             .map_err(|e| {
                 DreamError::ConsolidationFailed(format!("Failed to build params: {}", e))
@@ -1017,6 +1059,9 @@ impl DreamConsolidator {
 
         match result {
             Ok(agent_result) => {
+                // 熔断器记录成功
+                cb.record_success();
+
                 tracing::info!(
                     input_tokens = agent_result.total_usage.input_tokens,
                     output_tokens = agent_result.total_usage.output_tokens,
@@ -1026,6 +1071,9 @@ impl DreamConsolidator {
                 Ok(())
             }
             Err(e) => {
+                // 熔断器记录失败
+                cb.record_failure();
+
                 tracing::error!(error = %e, "[dream] Forked Agent failed");
                 Err(DreamError::ConsolidationFailed(format!("{}", e)))
             }
@@ -1036,7 +1084,7 @@ impl DreamConsolidator {
     fn build_consolidation_prompt(&self, memory_dir: &Path, signals: &[GatheredSignal]) -> String {
         // 按重要性排序信号
         let mut sorted_signals = signals.to_vec();
-        sorted_signals.sort_by(|a, b| b.importance.cmp(&a.importance));
+        sorted_signals.sort_by_key(|b| std::cmp::Reverse(b.importance));
 
         // 构建信号摘要
         let signals_section = if sorted_signals.is_empty() {
@@ -1094,7 +1142,8 @@ impl DreamConsolidator {
 - 优化索引结构
 
 ## 工具限制
-- Bash: 仅限只读命令 (ls, find, grep, cat, stat, wc, head, tail)
+- 只读工具: read_file/list_dir/grep/glob 必须使用上方记忆目录内的显式路径
+- Shell/Exec: 默认不提供；如被调用，也必须限定在记忆目录内
 - Edit/Write: 仅限记忆目录内
 
 ## 注意事项
@@ -1444,6 +1493,9 @@ pub enum DreamError {
 
     #[error("Consolidation timed out after {0}s")]
     Timeout(u64),
+
+    #[error("Circuit breaker is open, dream consolidation blocked")]
+    CircuitBreakerOpen,
 }
 
 #[cfg(test)]
@@ -1464,6 +1516,47 @@ mod tests {
         let mut state = DreamState::default();
         state.increment_session_count();
         assert_eq!(state.current_session_count, 1);
+    }
+
+    #[test]
+    fn test_noop_dream_advances_session_cursor_without_incrementing_count() {
+        let mut state = DreamState {
+            last_consolidation_time: Some(1),
+            last_session_count: 5,
+            current_session_count: 10,
+            consolidation_count: 3,
+            is_consolidating: false,
+            consolidating_started_at: None,
+        };
+        let stats = DreamStats::default();
+
+        apply_successful_dream_state(&mut state, &stats, 10, 99);
+
+        assert_eq!(state.last_consolidation_time, Some(99));
+        assert_eq!(state.last_session_count, 10);
+        assert_eq!(state.consolidation_count, 3);
+    }
+
+    #[test]
+    fn test_changed_dream_advances_session_cursor_and_count() {
+        let mut state = DreamState {
+            last_consolidation_time: Some(1),
+            last_session_count: 5,
+            current_session_count: 10,
+            consolidation_count: 3,
+            is_consolidating: false,
+            consolidating_started_at: None,
+        };
+        let stats = DreamStats {
+            memories_updated: 1,
+            ..DreamStats::default()
+        };
+
+        apply_successful_dream_state(&mut state, &stats, 10, 99);
+
+        assert_eq!(state.last_consolidation_time, Some(99));
+        assert_eq!(state.last_session_count, 10);
+        assert_eq!(state.consolidation_count, 4);
     }
 
     #[tokio::test]

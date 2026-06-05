@@ -75,41 +75,38 @@ impl Tool for OfficeWriteTool {
             ));
         }
         match action {
-            "create_pptx" => {
+            "create_pptx"
                 if params
                     .get("slides")
                     .and_then(|v| v.as_array())
                     .map(|a| a.is_empty())
-                    .unwrap_or(true)
-                {
-                    return Err(Error::Tool(
-                        "'slides' array is required for create_pptx".into(),
-                    ));
-                }
+                    .unwrap_or(true) =>
+            {
+                return Err(Error::Tool(
+                    "'slides' array is required for create_pptx".into(),
+                ));
             }
-            "create_docx" => {
+            "create_docx"
                 if params
                     .get("sections")
                     .and_then(|v| v.as_array())
                     .map(|a| a.is_empty())
-                    .unwrap_or(true)
-                {
-                    return Err(Error::Tool(
-                        "'sections' array is required for create_docx".into(),
-                    ));
-                }
+                    .unwrap_or(true) =>
+            {
+                return Err(Error::Tool(
+                    "'sections' array is required for create_docx".into(),
+                ));
             }
-            "create_xlsx" => {
+            "create_xlsx"
                 if params
                     .get("sheets")
                     .and_then(|v| v.as_array())
                     .map(|a| a.is_empty())
-                    .unwrap_or(true)
-                {
-                    return Err(Error::Tool(
-                        "'sheets' array is required for create_xlsx".into(),
-                    ));
-                }
+                    .unwrap_or(true) =>
+            {
+                return Err(Error::Tool(
+                    "'sheets' array is required for create_xlsx".into(),
+                ));
             }
             _ => {}
         }

@@ -73,6 +73,10 @@ pub struct Layer1Metrics {
     preview_size_limit: AtomicU64,
     /// Current stored results count (实时状态)
     current_stored_results: AtomicU64,
+    /// Number of previews generated.
+    preview_generated_count: AtomicU64,
+    /// Number of replacements frozen.
+    replacement_frozen_count: AtomicU64,
 }
 
 impl Layer1Metrics {
@@ -85,9 +89,37 @@ impl Layer1Metrics {
             .fetch_add(preview_size, Ordering::Relaxed);
     }
 
+    /// Record a tool result persisted with additional metadata fields。
+    pub fn record_persisted_with_fields(
+        &self,
+        original_size: u64,
+        preview_size: u64,
+        _filepath: &str,
+        _session_key: &str,
+        _truncated: bool,
+    ) {
+        self.total_original_size
+            .fetch_add(original_size, Ordering::Relaxed);
+        self.total_preview_size
+            .fetch_add(preview_size, Ordering::Relaxed);
+        self.persisted_count.fetch_add(1, Ordering::Relaxed);
+        self.current_stored_results.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record a budget exceeded event.
     pub fn record_budget_exceeded(&self) {
         self.budget_exceeded_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a preview generated event.
+    pub fn record_preview_generated(&self) {
+        self.preview_generated_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a replacement frozen event.
+    pub fn record_replacement_frozen(&self) {
+        self.replacement_frozen_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the number of persisted tool results.
@@ -110,6 +142,16 @@ impl Layer1Metrics {
         self.budget_exceeded_count.load(Ordering::Relaxed)
     }
 
+    /// Get the preview generated count.
+    pub fn preview_generated_count(&self) -> u64 {
+        self.preview_generated_count.load(Ordering::Relaxed)
+    }
+
+    /// Get the replacement frozen count.
+    pub fn replacement_frozen_count(&self) -> u64 {
+        self.replacement_frozen_count.load(Ordering::Relaxed)
+    }
+
     // --- 新增方法 ---
     /// Record config settings for Layer 1.
     pub fn record_config(&self, max_results: u64, preview_limit: u64) {
@@ -126,6 +168,20 @@ impl Layer1Metrics {
     /// Increment stored results count by 1.
     pub fn increment_stored_count(&self) {
         self.current_stored_results.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 清理后扣减已存储结果计数。
+    ///
+    /// 使用 saturating CAS/fetch_update 防止下溢：
+    /// 进程重启或 `/session-metrics --reset` 后内存计数器回到 0，
+    /// 但磁盘上的 `.tool_results` 仍可能被下一次 cleanup 删除，
+    /// 此时直接 `fetch_sub` 会将 0 下溢成接近 u64::MAX。
+    pub fn decrement_stored_count(&self, count: u64) {
+        let _ = self.current_stored_results.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(count)),
+        );
     }
 
     /// Get max tool results limit.
@@ -160,6 +216,8 @@ impl Layer1Metrics {
         self.total_original_size.store(0, Ordering::Relaxed);
         self.total_preview_size.store(0, Ordering::Relaxed);
         self.budget_exceeded_count.store(0, Ordering::Relaxed);
+        self.preview_generated_count.store(0, Ordering::Relaxed);
+        self.replacement_frozen_count.store(0, Ordering::Relaxed);
         // 新增字段不重置（配置值保留）
         self.current_stored_results.store(0, Ordering::Relaxed);
     }
@@ -185,6 +243,10 @@ pub struct Layer2Metrics {
     keep_recent: AtomicU64,
     /// Last trigger timestamp (Unix ms)
     last_trigger_timestamp: AtomicU64,
+    /// Number of evaluation checks performed.
+    evaluated_count: AtomicU64,
+    /// Number of times evaluation did not trigger.
+    not_triggered_count: AtomicU64,
 }
 
 impl Layer2Metrics {
@@ -198,6 +260,14 @@ impl Layer2Metrics {
                 .as_millis() as u64,
             Ordering::Relaxed,
         );
+    }
+
+    /// Record an evaluation event.
+    pub fn record_evaluated(&self, triggered: bool) {
+        self.evaluated_count.fetch_add(1, Ordering::Relaxed);
+        if !triggered {
+            self.not_triggered_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Record cleared items.
@@ -243,11 +313,23 @@ impl Layer2Metrics {
         self.last_trigger_timestamp.load(Ordering::Relaxed)
     }
 
+    /// Get the evaluated count.
+    pub fn evaluated_count(&self) -> u64 {
+        self.evaluated_count.load(Ordering::Relaxed)
+    }
+
+    /// Get the not triggered count.
+    pub fn not_triggered_count(&self) -> u64 {
+        self.not_triggered_count.load(Ordering::Relaxed)
+    }
+
     /// Reset all counters to zero.
     pub fn reset(&self) {
         self.trigger_count.store(0, Ordering::Relaxed);
         self.cleared_count.store(0, Ordering::Relaxed);
         self.kept_count.store(0, Ordering::Relaxed);
+        self.evaluated_count.store(0, Ordering::Relaxed);
+        self.not_triggered_count.store(0, Ordering::Relaxed);
         // 新增字段不重置（配置值和时间戳保留）
     }
 }
@@ -276,6 +358,12 @@ pub struct Layer3Metrics {
     last_extraction_timestamp: AtomicU64,
     /// Current section count
     section_count: AtomicU64,
+    /// 成功提取次数
+    success_count: AtomicU64,
+    /// 失败提取次数
+    failure_count: AtomicU64,
+    /// 总 token 消耗
+    total_token_cost: AtomicU64,
 }
 
 impl Layer3Metrics {
@@ -297,6 +385,17 @@ impl Layer3Metrics {
     pub fn record_load(&self, size: u64) {
         self.load_count.fetch_add(1, Ordering::Relaxed);
         self.current_size.store(size, Ordering::Relaxed);
+    }
+
+    /// Record an extraction completed event.
+    pub fn record_extraction_completed(&self, success: bool, token_cost: u64, _sections: u64) {
+        if success {
+            self.success_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failure_count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.total_token_cost
+            .fetch_add(token_cost, Ordering::Relaxed);
     }
 
     /// Record config settings for Layer 3.
@@ -357,6 +456,21 @@ impl Layer3Metrics {
         self.section_count.load(Ordering::Relaxed)
     }
 
+    /// Get success count.
+    pub fn success_count(&self) -> u64 {
+        self.success_count.load(Ordering::Relaxed)
+    }
+
+    /// Get failure count.
+    pub fn failure_count(&self) -> u64 {
+        self.failure_count.load(Ordering::Relaxed)
+    }
+
+    /// Get total token cost.
+    pub fn total_token_cost(&self) -> u64 {
+        self.total_token_cost.load(Ordering::Relaxed)
+    }
+
     /// Reset all counters to zero.
     pub fn reset(&self) {
         self.extraction_count.store(0, Ordering::Relaxed);
@@ -364,6 +478,9 @@ impl Layer3Metrics {
         self.total_token_estimate.store(0, Ordering::Relaxed);
         self.current_size.store(0, Ordering::Relaxed);
         self.section_count.store(0, Ordering::Relaxed);
+        self.success_count.store(0, Ordering::Relaxed);
+        self.failure_count.store(0, Ordering::Relaxed);
+        self.total_token_cost.store(0, Ordering::Relaxed);
         // 配置值和时间戳保留
     }
 }
@@ -404,6 +521,12 @@ pub struct Layer4Metrics {
     last_compact_timestamp: AtomicU64,
     /// Total recovery budget (文件 50K + 技能 25K + Session 12K = 87K)
     total_recovery_budget: AtomicU64,
+    /// Number of retries.
+    retry_count: AtomicU64,
+    /// Number of cache break events.
+    cache_break_count: AtomicU64,
+    /// Total recovery tokens used.
+    total_recovery_tokens: AtomicU64,
 }
 
 impl Layer4Metrics {
@@ -462,6 +585,22 @@ impl Layer4Metrics {
     pub fn record_compact_failure(&self) {
         self.compact_failed_count.fetch_add(1, Ordering::Relaxed);
         self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a retry event.
+    pub fn record_retry(&self) {
+        self.retry_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a cache break event.
+    pub fn record_cache_break(&self) {
+        self.cache_break_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record recovery tokens used.
+    pub fn record_recovery_tokens(&self, tokens: u64) {
+        self.total_recovery_tokens
+            .fetch_add(tokens, Ordering::Relaxed);
     }
 
     /// Record config settings for Layer 4.
@@ -586,6 +725,21 @@ impl Layer4Metrics {
         self.total_recovery_budget.load(Ordering::Relaxed)
     }
 
+    /// Get the retry count.
+    pub fn retry_count(&self) -> u64 {
+        self.retry_count.load(Ordering::Relaxed)
+    }
+
+    /// Get the cache break count.
+    pub fn cache_break_count(&self) -> u64 {
+        self.cache_break_count.load(Ordering::Relaxed)
+    }
+
+    /// Get total recovery tokens.
+    pub fn total_recovery_tokens(&self) -> u64 {
+        self.total_recovery_tokens.load(Ordering::Relaxed)
+    }
+
     /// Reset all counters to zero.
     pub fn reset(&self) {
         self.compact_count.store(0, Ordering::Relaxed);
@@ -599,6 +753,9 @@ impl Layer4Metrics {
         self.total_cache_creation_tokens.store(0, Ordering::Relaxed);
         // 新增字段：配置值保留，状态值重置
         self.current_tokens.store(0, Ordering::Relaxed);
+        self.retry_count.store(0, Ordering::Relaxed);
+        self.cache_break_count.store(0, Ordering::Relaxed);
+        self.total_recovery_tokens.store(0, Ordering::Relaxed);
     }
 }
 
@@ -638,6 +795,16 @@ pub struct Layer5Metrics {
     feedback_bytes: AtomicU64,
     /// Reference memory bytes
     reference_bytes: AtomicU64,
+    /// Injection count (separate from memory counts to avoid inflation).
+    injection_count: AtomicU64,
+    /// Number of extractions started.
+    extraction_started_count: AtomicU64,
+    /// Number of cursor updates.
+    cursor_updated_count: AtomicU64,
+    /// Number of extraction failures.
+    /// TODO: 当前未接入业务路径 — 提取失败通过 `cb.record_failure()` 熔断器记录，
+    /// 此计数器预留用于细粒度失败分类统计。
+    extraction_failure_count: AtomicU64,
 }
 
 impl Layer5Metrics {
@@ -677,14 +844,27 @@ impl Layer5Metrics {
         };
     }
 
-    /// Record a memory injection event.
-    pub fn record_injection(&self, user: u64, project: u64, feedback: u64, reference: u64) {
-        self.user_memories.fetch_add(user, Ordering::Relaxed);
-        self.project_memories.fetch_add(project, Ordering::Relaxed);
-        self.feedback_memories
-            .fetch_add(feedback, Ordering::Relaxed);
-        self.reference_memories
-            .fetch_add(reference, Ordering::Relaxed);
+    /// Record a memory injection event (increments only injection_count,
+    /// not the individual memory counters, to avoid count inflation).
+    pub fn record_injection(&self, _user: u64, _project: u64, _feedback: u64, _reference: u64) {
+        self.injection_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an extraction started event.
+    pub fn record_extraction_started(&self) {
+        self.extraction_started_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a cursor updated event.
+    pub fn record_cursor_updated(&self) {
+        self.cursor_updated_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an extraction failure event.
+    pub fn record_extraction_failure(&self) {
+        self.extraction_failure_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record config settings for Layer 5.
@@ -764,6 +944,26 @@ impl Layer5Metrics {
         self.reference_bytes.load(Ordering::Relaxed)
     }
 
+    /// Get injection count (number of batch injection events).
+    pub fn injection_count(&self) -> u64 {
+        self.injection_count.load(Ordering::Relaxed)
+    }
+
+    /// Get the extraction started count.
+    pub fn extraction_started_count(&self) -> u64 {
+        self.extraction_started_count.load(Ordering::Relaxed)
+    }
+
+    /// Get the cursor updated count.
+    pub fn cursor_updated_count(&self) -> u64 {
+        self.cursor_updated_count.load(Ordering::Relaxed)
+    }
+
+    /// Get the extraction failure count.
+    pub fn extraction_failure_count(&self) -> u64 {
+        self.extraction_failure_count.load(Ordering::Relaxed)
+    }
+
     /// Reset all counters to zero.
     pub fn reset(&self) {
         self.extraction_count.store(0, Ordering::Relaxed);
@@ -777,6 +977,10 @@ impl Layer5Metrics {
         self.project_bytes.store(0, Ordering::Relaxed);
         self.feedback_bytes.store(0, Ordering::Relaxed);
         self.reference_bytes.store(0, Ordering::Relaxed);
+        self.injection_count.store(0, Ordering::Relaxed);
+        self.extraction_started_count.store(0, Ordering::Relaxed);
+        self.cursor_updated_count.store(0, Ordering::Relaxed);
+        self.extraction_failure_count.store(0, Ordering::Relaxed);
         // 配置值保留
     }
 }
@@ -805,6 +1009,12 @@ pub struct Layer6Metrics {
     last_dream_timestamp: AtomicU64,
     /// Sessions processed
     sessions_processed: AtomicU64,
+    /// Number of gate checks passed.
+    gate_passed_count: AtomicU64,
+    /// Number of phases completed.
+    phase_completed_count: AtomicU64,
+    /// Number of dream failures.
+    failure_count: AtomicU64,
 }
 
 impl Layer6Metrics {
@@ -818,6 +1028,21 @@ impl Layer6Metrics {
                 .as_millis() as u64,
             Ordering::Relaxed,
         );
+    }
+
+    /// Record a gate passed event.
+    pub fn record_gate_passed(&self) {
+        self.gate_passed_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a phase completed event.
+    pub fn record_phase_completed(&self) {
+        self.phase_completed_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a dream failure event.
+    pub fn record_failure(&self) {
+        self.failure_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a dream finished event.
@@ -883,6 +1108,21 @@ impl Layer6Metrics {
         self.sessions_processed.load(Ordering::Relaxed)
     }
 
+    /// Get the gate passed count.
+    pub fn gate_passed_count(&self) -> u64 {
+        self.gate_passed_count.load(Ordering::Relaxed)
+    }
+
+    /// Get the phase completed count.
+    pub fn phase_completed_count(&self) -> u64 {
+        self.phase_completed_count.load(Ordering::Relaxed)
+    }
+
+    /// Get the dream failure count.
+    pub fn failure_count(&self) -> u64 {
+        self.failure_count.load(Ordering::Relaxed)
+    }
+
     /// Calculate consolidation rate.
     pub fn consolidation_rate(&self) -> f64 {
         let processed = self.sessions_processed.load(Ordering::Relaxed);
@@ -903,6 +1143,9 @@ impl Layer6Metrics {
         self.memories_deleted.store(0, Ordering::Relaxed);
         self.sessions_pruned.store(0, Ordering::Relaxed);
         self.sessions_processed.store(0, Ordering::Relaxed);
+        self.gate_passed_count.store(0, Ordering::Relaxed);
+        self.phase_completed_count.store(0, Ordering::Relaxed);
+        self.failure_count.store(0, Ordering::Relaxed);
         // 配置值和时间戳保留
     }
 }
@@ -933,6 +1176,10 @@ pub struct Layer7Metrics {
     active_count: AtomicU64,
     /// Total completion time in ms
     total_completion_time_ms: AtomicU64,
+    /// Cumulative cache hit rate sum (for avg calculation).
+    cache_hit_rate_sum: AtomicU64,
+    /// Number of cache hit rate samples.
+    cache_hit_rate_samples: AtomicU64,
 }
 
 impl Layer7Metrics {
@@ -947,23 +1194,45 @@ impl Layer7Metrics {
         self.completed_count.fetch_add(1, Ordering::Relaxed);
         self.total_turns_used.fetch_add(turns, Ordering::Relaxed);
         self.total_tokens_used.fetch_add(tokens, Ordering::Relaxed);
-        self.active_count.fetch_sub(1, Ordering::Relaxed);
+        let _ = self
+            .active_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_sub(1));
     }
 
     /// Record an agent completed event with duration.
     pub fn record_completed_with_duration(&self, turns: u64, tokens: u64, duration_ms: u64) {
+        self.record_completed_with_duration_and_rate(turns, tokens, duration_ms, 0.0);
+    }
+
+    /// Record an agent completed event with duration and cache hit rate.
+    pub fn record_completed_with_duration_and_rate(
+        &self,
+        turns: u64,
+        tokens: u64,
+        duration_ms: u64,
+        cache_hit_rate: f64,
+    ) {
         self.completed_count.fetch_add(1, Ordering::Relaxed);
         self.total_turns_used.fetch_add(turns, Ordering::Relaxed);
         self.total_tokens_used.fetch_add(tokens, Ordering::Relaxed);
         self.total_completion_time_ms
             .fetch_add(duration_ms, Ordering::Relaxed);
-        self.active_count.fetch_sub(1, Ordering::Relaxed);
+        // 累加 cache_hit_rate（乘以 1000 保留精度）
+        let rate_scaled = (cache_hit_rate * 1000.0) as u64;
+        self.cache_hit_rate_sum
+            .fetch_add(rate_scaled, Ordering::Relaxed);
+        self.cache_hit_rate_samples.fetch_add(1, Ordering::Relaxed);
+        let _ = self
+            .active_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_sub(1));
     }
 
     /// Record an agent failed event.
     pub fn record_failed(&self) {
         self.failed_count.fetch_add(1, Ordering::Relaxed);
-        self.active_count.fetch_sub(1, Ordering::Relaxed);
+        let _ = self
+            .active_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| x.checked_sub(1));
     }
 
     /// Record a tool denied event.
@@ -1021,6 +1290,27 @@ impl Layer7Metrics {
         self.total_completion_time_ms.load(Ordering::Relaxed)
     }
 
+    /// Get the cache hit rate sum (scaled by 1000).
+    pub fn cache_hit_rate_sum(&self) -> u64 {
+        self.cache_hit_rate_sum.load(Ordering::Relaxed)
+    }
+
+    /// Get the cache hit rate samples count.
+    pub fn cache_hit_rate_samples(&self) -> u64 {
+        self.cache_hit_rate_samples.load(Ordering::Relaxed)
+    }
+
+    /// Calculate average cache hit rate.
+    pub fn avg_cache_hit_rate(&self) -> f64 {
+        let sum = self.cache_hit_rate_sum.load(Ordering::Relaxed);
+        let samples = self.cache_hit_rate_samples.load(Ordering::Relaxed);
+        if samples > 0 {
+            sum as f64 / samples as f64 / 1000.0
+        } else {
+            0.0
+        }
+    }
+
     /// Calculate average completion time in ms.
     pub fn avg_completion_time_ms(&self) -> f64 {
         let completed = self.completed_count.load(Ordering::Relaxed);
@@ -1076,6 +1366,8 @@ impl Layer7Metrics {
         self.total_turns_used.store(0, Ordering::Relaxed);
         self.active_count.store(0, Ordering::Relaxed);
         self.total_completion_time_ms.store(0, Ordering::Relaxed);
+        self.cache_hit_rate_sum.store(0, Ordering::Relaxed);
+        self.cache_hit_rate_samples.store(0, Ordering::Relaxed);
         // 配置值保留
     }
 }

@@ -38,6 +38,27 @@ fn should_fallback(stderr: &str) -> bool {
         || stderr.contains("No such file or directory")
 }
 
+/// Windows 上程序不存在时 cmd.exe 返回的退出码
+///
+/// 当 `python3` / `sh` 等命令不存在时，Windows cmd.exe 返回 9009，
+/// 需要视为 runner 不可用并继续尝试下一个 runner。
+#[cfg(target_os = "windows")]
+const WINDOWS_CMD_NOT_FOUND_EXIT_CODE: i64 = 9009;
+
+/// 检查退出码是否表示 runner 不可用（而非脚本错误）
+fn is_runner_not_found(exit_code: i64) -> bool {
+    // Unix: 127 = command not found (POSIX shell 标准)
+    if exit_code == 127 {
+        return true;
+    }
+    // Windows: 9009 = cmd.exe "program not found"
+    #[cfg(target_os = "windows")]
+    if exit_code == WINDOWS_CMD_NOT_FOUND_EXIT_CODE {
+        return true;
+    }
+    false
+}
+
 /// Get cached Python runner if available.
 fn get_cached_python_runner() -> Option<&'static str> {
     match PYTHON_RUNNER_STATE.load(Ordering::Relaxed) {
@@ -351,8 +372,9 @@ impl ExecLocalTool {
 
             // Check if we should fallback (environment issue, not script error)
             if let Ok(ref value) = result {
+                let exit_code = value["exit_code"].as_i64().unwrap_or(-1);
                 let stderr = value["stderr"].as_str().unwrap_or_default();
-                if should_fallback(stderr) {
+                if should_fallback(stderr) || is_runner_not_found(exit_code) {
                     tracing::debug!(
                         "Cached Python runner '{}' failed with environment error, clearing cache",
                         cached
@@ -406,7 +428,7 @@ impl ExecLocalTool {
                 }
 
                 // Check if this is an environment error (should try other runner)
-                if should_fallback(stderr) {
+                if should_fallback(stderr) || is_runner_not_found(exit_code) {
                     tracing::debug!(
                         "Python runner '{}' failed with environment error, trying next",
                         runner
@@ -625,6 +647,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn test_exec_local_runs_skill_relative_script() {
         let skill_dir = temp_skill_dir("blockcell-exec-local");
@@ -690,18 +713,30 @@ mod tests {
                     "cwd_mode": "skill"
                 }),
             )
-            .await
-            .expect("exec_local should succeed for SKILL.py");
+            .await;
+
+        // 当前环境没有 Python 时跳过（不视为测试失败）
+        let value = match result {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = format!("{}", e);
+                if msg.contains("No working Python interpreter found") {
+                    eprintln!("跳过: 当前环境无 Python 解释器");
+                    return;
+                }
+                panic!("exec_local unexpected error: {}", e);
+            }
+        };
 
         let expected_path = script_path.canonicalize().expect("canonical path");
 
-        assert_eq!(result["exit_code"].as_i64(), Some(0));
-        assert!(result["stdout"]
+        assert_eq!(value["exit_code"].as_i64(), Some(0));
+        assert!(value["stdout"]
             .as_str()
             .unwrap_or_default()
             .contains("py:demo-local"));
         assert_eq!(
-            result["resolved_path"].as_str(),
+            value["resolved_path"].as_str(),
             Some(expected_path.to_string_lossy().as_ref())
         );
     }

@@ -115,14 +115,23 @@ impl LogController {
     }
 }
 
-/// 可开关的控制台输出层
+/// 可开关的控制台输出层。
+///
+/// 支持两种输出格式：
+/// - 纯文本（默认）：`timestamp [LEVEL] module: message | fields`
+/// - JSON（设置 `RUST_LOG_FORMAT=json`）：每行一条 JSON 记录
 pub struct SwitchableConsoleLayer {
     enabled: Arc<Mutex<bool>>,
+    /// 是否使用 JSON 格式输出（由 `RUST_LOG_FORMAT=json` 环境变量控制）
+    json_format: bool,
 }
 
 impl SwitchableConsoleLayer {
-    pub fn new(enabled: Arc<Mutex<bool>>) -> Self {
-        Self { enabled }
+    pub fn new(enabled: Arc<Mutex<bool>>, json_format: bool) -> Self {
+        Self {
+            enabled,
+            json_format,
+        }
     }
 }
 
@@ -137,42 +146,32 @@ where
 
         let mut stdout = std::io::stdout().lock();
 
-        let now = chrono::Local::now();
-        let timestamp = now.format("%Y-%m-%d %H:%M:%S%.3f");
-
-        let level = event.metadata().level();
-        let module = event.metadata().module_path().unwrap_or("unknown");
-
-        let mut visitor = MessageVisitor::new();
-        event.record(&mut visitor);
-
-        if visitor.fields.is_empty() {
-            let _ = writeln!(
-                stdout,
-                "{} [{}] {}: {}",
-                timestamp, level, module, visitor.message
-            );
+        if self.json_format {
+            let _ = writeln!(stdout, "{}", format_event_json(event));
         } else {
-            let _ = writeln!(
-                stdout,
-                "{} [{}] {}: {} | {}",
-                timestamp, level, module, visitor.message, visitor.fields
-            );
+            let _ = writeln!(stdout, "{}", format_event_text(event));
         }
     }
 }
 
-/// 可开关的文件输出层
+/// 可开关的文件输出层。
+///
+/// 支持两种输出格式（与 [`SwitchableConsoleLayer`] 一致）：
+/// - 纯文本（默认）
+/// - JSON（设置 `RUST_LOG_FORMAT=json`）
 pub struct SwitchableFileLayer {
     enabled: Arc<Mutex<bool>>,
     writer: Arc<Mutex<RollingFileAppender>>,
+    /// 是否使用 JSON 格式输出
+    json_format: bool,
 }
 
 impl SwitchableFileLayer {
-    pub fn new(enabled: Arc<Mutex<bool>>, writer: RollingFileAppender) -> Self {
+    pub fn new(enabled: Arc<Mutex<bool>>, writer: RollingFileAppender, json_format: bool) -> Self {
         Self {
             enabled,
             writer: Arc::new(Mutex::new(writer)),
+            json_format,
         }
     }
 }
@@ -186,28 +185,12 @@ where
             return;
         }
 
-        let now = chrono::Local::now();
-        let timestamp = now.format("%Y-%m-%d %H:%M:%S%.3f");
-
-        let level = event.metadata().level();
-        let module = event.metadata().module_path().unwrap_or("unknown");
-
-        let mut visitor = MessageVisitor::new();
-        event.record(&mut visitor);
-
         let mut writer = self.writer.lock().unwrap();
-        if visitor.fields.is_empty() {
-            let _ = writeln!(
-                writer,
-                "{} [{}] {}: {}",
-                timestamp, level, module, visitor.message
-            );
+
+        if self.json_format {
+            let _ = writeln!(writer, "{}", format_event_json(event));
         } else {
-            let _ = writeln!(
-                writer,
-                "{} [{}] {}: {} | {}",
-                timestamp, level, module, visitor.message, visitor.fields
-            );
+            let _ = writeln!(writer, "{}", format_event_text(event));
         }
     }
 }
@@ -293,6 +276,132 @@ impl tracing::field::Visit for MessageVisitor {
     }
 }
 
+/// 将事件格式化为纯文本日志行。
+fn format_event_text(event: &tracing::Event<'_>) -> String {
+    let now = chrono::Local::now();
+    let timestamp = now.format("%Y-%m-%d %H:%M:%S%.3f");
+
+    let level = event.metadata().level();
+    let module = event.metadata().module_path().unwrap_or("unknown");
+
+    let mut visitor = MessageVisitor::new();
+    event.record(&mut visitor);
+
+    if visitor.fields.is_empty() {
+        format!("{} [{}] {}: {}", timestamp, level, module, visitor.message)
+    } else {
+        format!(
+            "{} [{}] {}: {} | {}",
+            timestamp, level, module, visitor.message, visitor.fields
+        )
+    }
+}
+
+/// 将事件格式化为 JSON 日志行。
+///
+/// 输出的 JSON 结构类似 tracing-subscriber JSON 格式：
+/// ```json
+/// {"timestamp":"2025-01-01T00:00:00.000Z","level":"INFO","target":"module::path","message":"...","fields":{}}
+/// ```
+fn format_event_json(event: &tracing::Event<'_>) -> String {
+    use serde_json::json;
+
+    let now = chrono::Utc::now();
+    let timestamp = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+
+    let level = event.metadata().level().to_string();
+    let target = event
+        .metadata()
+        .module_path()
+        .unwrap_or("unknown")
+        .to_string();
+
+    let mut visitor = JsonVisitor::new();
+    event.record(&mut visitor);
+
+    let record = json!({
+        "timestamp": timestamp,
+        "level": level,
+        "target": target,
+        "message": visitor.message,
+        "fields": visitor.fields,
+    });
+
+    record.to_string()
+}
+
+/// JSON 格式的字段访问器。
+struct JsonVisitor {
+    message: String,
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl JsonVisitor {
+    fn new() -> Self {
+        Self {
+            message: String::new(),
+            fields: serde_json::Map::new(),
+        }
+    }
+}
+
+impl tracing::field::Visit for JsonVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let val = format!("{:?}", value);
+        if field.name() == "message" {
+            // 尝试用 JSON 反解去除 Debug 格式化产生的引号和转义（如 "\"text\"" → "text"）。
+            // 失败时保留原始 debug 字符串，避免破坏非标准内容。
+            let decoded = serde_json::from_str::<String>(&val);
+            self.message = decoded.unwrap_or(val);
+        } else {
+            self.fields
+                .insert(field.name().to_string(), serde_json::Value::String(val));
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields.insert(
+                field.name().to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.fields
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.fields
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.fields
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        self.fields
+            .insert(field.name().to_string(), serde_json::json!(value));
+    }
+
+    fn record_error(
+        &mut self,
+        field: &tracing::field::Field,
+        value: &(dyn std::error::Error + 'static),
+    ) {
+        self.fields.insert(
+            field.name().to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+    }
+}
+
 /// 初始化日志系统
 /// 参数：
 /// - logs_dir: 日志目录路径
@@ -311,6 +420,12 @@ pub fn init_logging(
         return Err(format!("Failed to create logs directory: {}", e));
     }
 
+    // 读取 RUST_LOG_FORMAT 环境变量决定输出格式
+    // json 模式不再跳过 file layer 和 LOG_CONTROLLER 初始化，
+    // 而是作为 console/file layer 的输出格式选项
+    let log_format = std::env::var("RUST_LOG_FORMAT").unwrap_or_default();
+    let json_format = log_format == "json";
+
     let file_appender = RollingFileAppender::new(Rotation::DAILY, logs_dir, "agent.log");
 
     let filter = EnvFilter::new(level);
@@ -319,8 +434,9 @@ pub fn init_logging(
     let console_enabled_flag = Arc::new(Mutex::new(console_enabled));
     let file_enabled_flag = Arc::new(Mutex::new(file_enabled));
 
-    let console_layer = SwitchableConsoleLayer::new(console_enabled_flag.clone());
-    let file_layer = SwitchableFileLayer::new(file_enabled_flag.clone(), file_appender);
+    let console_layer = SwitchableConsoleLayer::new(console_enabled_flag.clone(), json_format);
+    let file_layer =
+        SwitchableFileLayer::new(file_enabled_flag.clone(), file_appender, json_format);
 
     tracing_subscriber::registry()
         .with(filter_layer)

@@ -21,7 +21,7 @@ pub enum CircuitState {
 }
 
 /// Circuit breaker configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CircuitBreakerConfig {
     /// Maximum consecutive failures before opening.
     pub max_failures: u64,
@@ -29,6 +29,20 @@ pub struct CircuitBreakerConfig {
     pub reset_timeout: Duration,
     /// Maximum calls allowed in half-open state.
     pub half_open_max_calls: u64,
+}
+
+impl CircuitBreakerConfig {
+    /// 从 blockcell_core 的配置结构创建运行时熔断器配置。
+    ///
+    /// 将用户配置（`CircuitBreakerSettings`）转换为运行时使用的
+    /// `CircuitBreakerConfig`，其中 `half_open_max_calls` 固定为 1。
+    pub fn from_memory_config(config: &blockcell_core::config::CircuitBreakerSettings) -> Self {
+        Self {
+            max_failures: config.max_failures,
+            reset_timeout: Duration::from_secs(config.reset_timeout_secs),
+            half_open_max_calls: 1,
+        }
+    }
 }
 
 impl Default for CircuitBreakerConfig {
@@ -53,8 +67,12 @@ pub struct CircuitBreaker {
     last_failure_time_ns: AtomicU64,
     /// Number of calls in half-open state.
     half_open_calls: AtomicU64,
-    /// Configuration.
-    config: CircuitBreakerConfig,
+    /// Maximum consecutive failures before opening.
+    max_failures: AtomicU64,
+    /// Reset timeout in nanoseconds.
+    reset_timeout_ns: AtomicU64,
+    /// Maximum calls allowed in half-open state.
+    half_open_max_calls: AtomicU64,
 }
 
 impl CircuitBreaker {
@@ -65,7 +83,9 @@ impl CircuitBreaker {
             failure_count: AtomicU64::new(0),
             last_failure_time_ns: AtomicU64::new(0),
             half_open_calls: AtomicU64::new(0),
-            config,
+            max_failures: AtomicU64::new(config.max_failures),
+            reset_timeout_ns: AtomicU64::new(config.reset_timeout.as_nanos() as u64),
+            half_open_max_calls: AtomicU64::new(config.half_open_max_calls),
         }
     }
 
@@ -90,7 +110,7 @@ impl CircuitBreaker {
                 if last_ns > 0 {
                     let now_ns = Self::current_time_ns();
                     let elapsed_ns = now_ns.saturating_sub(last_ns);
-                    let timeout_ns = self.config.reset_timeout.as_nanos() as u64;
+                    let timeout_ns = self.reset_timeout_ns.load(Ordering::Relaxed);
 
                     if elapsed_ns >= timeout_ns {
                         // Transition to half-open
@@ -107,8 +127,9 @@ impl CircuitBreaker {
             }
             2 => {
                 // Half-open - allow limited calls
+                let max_calls = self.half_open_max_calls.load(Ordering::Relaxed);
                 let calls = self.half_open_calls.fetch_add(1, Ordering::Relaxed);
-                calls < self.config.half_open_max_calls
+                calls < max_calls
             }
             _ => false,
         }
@@ -140,6 +161,7 @@ impl CircuitBreaker {
     pub fn record_failure(&self) {
         let failures = self.failure_count.fetch_add(1, Ordering::Relaxed) + 1;
         let state = self.state.load(Ordering::Relaxed);
+        let max_failures = self.max_failures.load(Ordering::Relaxed);
 
         if state == 2 {
             // Half-open -> Open (failed during recovery)
@@ -150,7 +172,7 @@ impl CircuitBreaker {
                 target: "blockcell.session_metrics.circuit_breaker",
                 "Circuit breaker returned to OPEN state after half-open failure"
             );
-        } else if failures >= self.config.max_failures {
+        } else if failures >= max_failures {
             // Closed -> Open
             self.state.store(1, Ordering::Relaxed);
             self.last_failure_time_ns
@@ -158,7 +180,7 @@ impl CircuitBreaker {
             tracing::error!(
                 target: "blockcell.session_metrics.circuit_breaker",
                 failures = failures,
-                max_failures = self.config.max_failures,
+                max_failures = max_failures,
                 "Circuit breaker tripped to OPEN state"
             );
         }
@@ -177,6 +199,17 @@ impl CircuitBreaker {
     /// Get the current failure count.
     pub fn failure_count(&self) -> u64 {
         self.failure_count.load(Ordering::Relaxed)
+    }
+
+    /// 从配置更新熔断器阈值。注意：此方法仅在熔断器初始化时调用，
+    /// 不会覆盖运行时状态（如当前失败计数）。
+    pub fn apply_config(&self, config: &CircuitBreakerConfig) {
+        self.max_failures
+            .store(config.max_failures, Ordering::Relaxed);
+        self.reset_timeout_ns
+            .store(config.reset_timeout.as_nanos() as u64, Ordering::Relaxed);
+        self.half_open_max_calls
+            .store(config.half_open_max_calls, Ordering::Relaxed);
     }
 
     /// Reset the circuit breaker to closed state.
@@ -259,6 +292,20 @@ pub fn reset_all_circuit_breakers() {
     get_compact_circuit_breaker().reset();
     get_memory_extraction_circuit_breaker().reset();
     get_dream_circuit_breaker().reset();
+}
+
+/// 从全局配置更新所有熔断器阈值。仅在熔断器初始化时调用，
+/// 不会覆盖运行时状态（如当前失败计数）。
+///
+/// 调用方必须先确认用户显式配置了 circuitBreaker。这样既能让省略配置时
+/// 保留各层独立默认值，也能让用户显式写入 60 秒默认值时真正生效：
+/// - L4 Compact:      3 次失败, 60 秒恢复
+/// - L5 Extraction:   3 次失败, 300 秒恢复
+/// - L6 Dream:        2 次失败, 900 秒恢复
+pub fn set_circuit_breaker_configs(config: &CircuitBreakerConfig) {
+    get_compact_circuit_breaker().apply_config(config);
+    get_memory_extraction_circuit_breaker().apply_config(config);
+    get_dream_circuit_breaker().apply_config(config);
 }
 
 #[cfg(test)]

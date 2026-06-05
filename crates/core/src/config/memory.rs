@@ -3,7 +3,7 @@
 //! 包含 MemoryVector, Layer1-7, MemorySystem,
 //!  SelfImprove, Evolution 等配置定义。
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,8 +41,12 @@ pub struct Layer1Config {
     pub max_result_size_chars: usize,
     #[serde(default = "default_l1_max_per_message")]
     pub max_tool_results_per_message_chars: usize,
-    #[serde(default = "default_l1_preview_size")]
-    pub preview_size_bytes: usize,
+    #[serde(
+        default = "default_l1_preview_size",
+        alias = "preview_size_bytes",
+        alias = "previewSizeBytes"
+    )]
+    pub preview_size_chars: usize,
     #[serde(default = "default_l1_max_replacement")]
     pub max_replacement_entries: usize,
     #[serde(default = "default_l1_cache_max")]
@@ -76,7 +80,7 @@ impl Default for Layer1Config {
         Self {
             max_result_size_chars: 50_000,
             max_tool_results_per_message_chars: 150_000,
-            preview_size_bytes: 2_000,
+            preview_size_chars: 2_000,
             max_replacement_entries: 1_000,
             cache_max_per_session: 10,
             cacheable_min_chars: 800,
@@ -367,6 +371,110 @@ impl Default for Layer7Config {
     }
 }
 
+// === 熔断器配置（用户配置结构，会被转换为运行时的 CircuitBreakerConfig） ===
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CircuitBreakerSettings {
+    pub max_failures: u64,
+    pub reset_timeout_secs: u64,
+    #[serde(skip)]
+    configured: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CircuitBreakerSettingsWire {
+    #[serde(default = "default_cb_max_failures")]
+    max_failures: u64,
+    #[serde(default = "default_cb_reset_timeout_secs")]
+    reset_timeout_secs: u64,
+}
+
+fn default_cb_max_failures() -> u64 {
+    3
+}
+fn default_cb_reset_timeout_secs() -> u64 {
+    60
+}
+
+impl Default for CircuitBreakerSettings {
+    fn default() -> Self {
+        Self {
+            max_failures: 3,
+            reset_timeout_secs: 60,
+            configured: false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CircuitBreakerSettings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CircuitBreakerSettingsWire::deserialize(deserializer)?;
+        Ok(Self {
+            max_failures: wire.max_failures,
+            reset_timeout_secs: wire.reset_timeout_secs,
+            configured: true,
+        })
+    }
+}
+
+impl CircuitBreakerSettings {
+    /// 返回用户配置文件中是否显式出现了 circuitBreaker。
+    pub fn is_configured(&self) -> bool {
+        self.configured
+    }
+
+    fn has_default_values(&self) -> bool {
+        self.max_failures == default_cb_max_failures()
+            && self.reset_timeout_secs == default_cb_reset_timeout_secs()
+    }
+
+    fn is_implicit_default(&self) -> bool {
+        !self.configured && self.has_default_values()
+    }
+}
+
+// === 监控配置 ===
+// TODO: 接入运行时行为 — 当前仅定义配置结构体，尚未在业务路径中使用
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitoringConfig {
+    #[serde(default = "default_monitoring_enabled")]
+    pub enabled: bool,
+}
+
+fn default_monitoring_enabled() -> bool {
+    true
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+// === 压缩通知配置 ===
+// TODO: 接入运行时行为 — 当前仅定义配置结构体，尚未在业务路径中使用
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactNotificationConfig {
+    #[serde(default = "default_compact_notify_enabled")]
+    pub enabled: bool,
+}
+
+fn default_compact_notify_enabled() -> bool {
+    true
+}
+
+impl Default for CompactNotificationConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 // === 7 层记忆系统配置 ===
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -391,6 +499,17 @@ pub struct MemorySystemConfig {
     pub layer6: Layer6Config,
     #[serde(default)]
     pub layer7: Layer7Config,
+    #[serde(
+        default,
+        skip_serializing_if = "CircuitBreakerSettings::is_implicit_default"
+    )]
+    pub circuit_breaker: CircuitBreakerSettings,
+    #[doc(hidden)]
+    #[serde(default)]
+    pub monitoring: MonitoringConfig,
+    #[doc(hidden)]
+    #[serde(default)]
+    pub compact_notification: CompactNotificationConfig,
 }
 
 fn default_token_budget() -> usize {
@@ -410,6 +529,9 @@ impl Default for MemorySystemConfig {
             layer5: Layer5Config::default(),
             layer6: Layer6Config::default(),
             layer7: Layer7Config::default(),
+            circuit_breaker: CircuitBreakerSettings::default(),
+            monitoring: MonitoringConfig::default(),
+            compact_notification: CompactNotificationConfig::default(),
         }
     }
 }
@@ -444,6 +566,16 @@ impl MemorySystemConfig {
                 "layer1.maxResultSizeChars ({}) > layer1.maxToolResultsPerMessageChars ({}). \
                  Single result exceeds per-message budget.",
                 self.layer1.max_result_size_chars, self.layer1.max_tool_results_per_message_chars
+            ));
+        }
+
+        // L1: preview_size_chars 不超过 max_result_size_chars，防止 fallback 截断路径下溢
+        // 注意：validate 为 &self，无法就地 clamp；超值时仅发 warning，运行时应做 saturating_sub 防御
+        if self.layer1.preview_size_chars > self.layer1.max_result_size_chars {
+            warnings.push(format!(
+                "layer1.previewSizeChars ({}) > layer1.maxResultSizeChars ({}). \
+                 Preview exceeds inline truncation budget; runtime uses saturating_sub to guard.",
+                self.layer1.preview_size_chars, self.layer1.max_result_size_chars
             ));
         }
 
@@ -673,5 +805,41 @@ impl Default for SelfImproveReviewConfig {
             enabled: true,
             max_rounds: 8,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试 previewSizeBytes（旧 camelCase 配置）能正确反序列化到 preview_size_chars
+    #[test]
+    fn test_preview_size_bytes_camel_case_alias() {
+        let json = r#"{"previewSizeBytes": 4096}"#;
+        let config: Layer1Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.preview_size_chars, 4096);
+    }
+
+    /// 测试 preview_size_bytes（旧 snake_case 配置）能正确反序列化
+    #[test]
+    fn test_preview_size_bytes_snake_case_alias() {
+        let json = r#"{"preview_size_bytes": 3000}"#;
+        let config: Layer1Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.preview_size_chars, 3000);
+    }
+
+    /// 测试新字段名 previewSizeChars（camelCase，与 rename_all 一致）正常工作
+    #[test]
+    fn test_preview_size_chars_current_name() {
+        let json = r#"{"previewSizeChars": 5000}"#;
+        let config: Layer1Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.preview_size_chars, 5000);
+    }
+
+    /// 测试默认值
+    #[test]
+    fn test_preview_size_default() {
+        let config: Layer1Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.preview_size_chars, 2000);
     }
 }

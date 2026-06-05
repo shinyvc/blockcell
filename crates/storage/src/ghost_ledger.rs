@@ -538,7 +538,7 @@ impl GhostLedger {
                 params![now, now],
             )
             .map_err(map_sqlite_error)?;
-        Ok(affected as usize)
+        Ok(affected)
     }
 
     pub fn insert_review_run(&self, run: NewGhostReviewRun) -> Result<String> {

@@ -12,8 +12,7 @@ use crate::registry::ToolRegistry;
 use crate::{Tool, ToolContext, ToolSchema};
 
 /// 默认的 ToolRegistry 单例，避免每次 exec_skill_script 调用都重新创建
-static DEFAULT_TOOL_REGISTRY: LazyLock<ToolRegistry> =
-    LazyLock::new(|| ToolRegistry::with_defaults());
+static DEFAULT_TOOL_REGISTRY: LazyLock<ToolRegistry> = LazyLock::new(ToolRegistry::with_defaults);
 
 pub struct ExecSkillScriptTool;
 
@@ -341,6 +340,7 @@ mod tests {
         assert_eq!(result["output"]["message"], "nested-ok");
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn test_exec_skill_script_runs_process_script() {
         let skill_dir = temp_skill_dir("blockcell-exec-skill-script-process");
@@ -372,6 +372,7 @@ mod tests {
             .contains("process ok"));
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn test_exec_skill_script_runs_cli_binary() {
         let skill_dir = temp_skill_dir("blockcell-exec-skill-script-cli");

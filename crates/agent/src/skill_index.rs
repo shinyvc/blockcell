@@ -541,7 +541,7 @@ impl SkillIndex {
             .collect();
 
         // 按交集大小降序排列 (交集越大越相关)
-        matched.sort_by(|a, b| b.0.cmp(&a.0));
+        matched.sort_by_key(|b| std::cmp::Reverse(b.0));
 
         matched.into_iter().map(|(_, entry)| entry).collect()
     }
@@ -607,7 +607,7 @@ impl SkillIndex {
             .collect();
 
         // 按分数降序排列
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|b| std::cmp::Reverse(b.0));
 
         scored.into_iter().map(|(_, entry)| entry).collect()
     }
