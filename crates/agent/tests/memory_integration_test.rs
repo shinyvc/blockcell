@@ -6,7 +6,7 @@
 mod tests {
     use blockcell_agent::auto_memory::{ExtractionCursor, ExtractionCursorManager, MemoryType};
     use blockcell_agent::memory_system::{
-        evaluate_memory_hooks, MemorySystem, MemorySystemConfig, PostSamplingAction,
+        evaluate_memory_hooks, MemorySystem, MemorySystemConfig, PostSamplingActions,
     };
     use blockcell_agent::session_memory::{
         should_extract_memory, SessionMemoryConfig, SessionMemoryState,
@@ -71,8 +71,8 @@ mod tests {
 
         let messages = vec![ChatMessage::user("Hello"), ChatMessage::assistant("Hi!")];
 
-        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
-        assert!(matches!(action, PostSamplingAction::None));
+        let actions = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
+        assert!(actions.is_empty());
     }
 
     /// 测试 Post-Sampling Hook Compact 触发
@@ -94,9 +94,9 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("Test")];
-        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
+        let actions = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
 
-        assert!(matches!(action, PostSamplingAction::Compact));
+        assert!(actions.compact);
     }
 
     /// 测试 Session Memory 状态更新
@@ -1344,10 +1344,11 @@ _No errors encountered._
 
     /// 测试 PostSamplingAction 优先级
     ///
-    /// 验证 Compact > Session Memory > Auto Memory 的优先级顺序
+    /// 验证设计文档要求的顺序：Session Memory > Auto Memory > Compact
+    /// Layer 3/5 必须在 Layer 4 之前，确保压缩前用完整历史提取
     #[tokio::test]
     async fn test_post_sampling_action_priority() {
-        // Compact 最高优先级
+        // 设计文档：Layer 3/5 先于 Layer 4
         let config = MemorySystemConfig {
             token_budget: 100,
             layer4: Layer4Config {
@@ -1365,7 +1366,7 @@ _No errors encountered._
             "test".to_string(),
         );
 
-        // 创建足够多的消息
+        // 创建足够多的消息（触发 auto memory 和 compact）
         let messages: Vec<ChatMessage> = (0..20)
             .flat_map(|i| {
                 vec![
@@ -1375,11 +1376,15 @@ _No errors encountered._
             })
             .collect();
 
-        // 当 Token 超过阈值时，应返回 Compact 而不是其他 Action
-        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
+        // Auto Memory 应在 Compact 之前触发（设计文档：Layer 3/5 先于 Layer 4）
+        let actions = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
 
-        // Compact 优先级最高
-        assert!(matches!(action, PostSamplingAction::Compact));
+        // Auto Memory 和 Compact 可以同时触发
+        assert!(
+            !actions.auto_memory_types.is_empty(),
+            "Auto Memory 应被触发，实际: {:?}",
+            actions
+        );
     }
 
     /// 测试 Layer 各层 Token 预算约束

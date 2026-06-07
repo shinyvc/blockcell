@@ -259,6 +259,10 @@ pub struct Layer5Config {
     /// 内容变化阈值（字符数），内容变化需超过此值才触发提取
     #[serde(default = "default_l5_content_change_threshold")]
     pub content_change_threshold: usize,
+    /// 后台提取 pending marker 过期阈值（毫秒）
+    /// 独立于 Layer 3 的 extraction_stale_threshold_ms，避免长任务被短阈值误判
+    #[serde(default = "default_l5_extraction_stale_threshold_ms")]
+    pub extraction_stale_threshold_ms: u64,
 }
 
 fn default_l5_min_messages() -> usize {
@@ -279,6 +283,9 @@ fn default_l5_time_cooldown_secs() -> u64 {
 fn default_l5_content_change_threshold() -> usize {
     500
 }
+fn default_l5_extraction_stale_threshold_ms() -> u64 {
+    300_000 // 5 分钟，比 Layer 3 的 1 分钟更长，适合长任务
+}
 
 impl Default for Layer5Config {
     fn default() -> Self {
@@ -289,6 +296,7 @@ impl Default for Layer5Config {
             injection_max_tokens: 4_000,
             extraction_time_cooldown_secs: 300,
             content_change_threshold: 500,
+            extraction_stale_threshold_ms: 300_000,
         }
     }
 }

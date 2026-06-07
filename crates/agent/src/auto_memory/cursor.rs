@@ -627,6 +627,27 @@ impl ExtractionCursorManager {
     }
 
     /// 重置所有游标
+    /// Compact 后重置消息计数基线
+    ///
+    /// Compact 会把历史替换为短摘要，消息数大幅减少。
+    /// 如果不重置 `last_message_count`，后续 `should_extract_full` 中
+    /// `current_message_count.saturating_sub(self.last_message_count)` 会一直为 0，
+    /// 导致 Auto Memory 长期不再触发。
+    pub fn reset_message_count_baseline(&mut self, post_compact_message_count: usize) {
+        for cursor in self.cursors.values_mut() {
+            // 只在当前基线大于压缩后消息数时才需要重置（说明 compact 发生了）
+            if cursor.last_message_count > post_compact_message_count {
+                tracing::debug!(
+                    memory_type = cursor.memory_type.name(),
+                    old_count = cursor.last_message_count,
+                    new_count = post_compact_message_count,
+                    "[cursor] Compact 后重置消息计数基线"
+                );
+                cursor.last_message_count = post_compact_message_count;
+            }
+        }
+    }
+
     pub fn reset_all(&mut self) {
         self.cursors.clear();
         for mt in MemoryType::all() {

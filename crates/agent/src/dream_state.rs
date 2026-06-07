@@ -103,7 +103,10 @@ async fn write_dream_state(base_dir: &Path, state: &DreamStateData) -> std::io::
 /// 确保 Dream 整合的三重门控机制能正确判断会话数量。
 ///
 /// 使用跨进程锁保护 read-modify-write 序列，防止并发会话初始化导致计数丢失。
-pub async fn increment_dream_session_count(base_dir: &Path) {
+///
+/// 返回 `Result`：调用者（runtime）仅在递增成功后才提交 sidecar marker，
+/// 避免递增失败但 marker 已创建导致该 session 永久漏计。
+pub async fn increment_dream_session_count(base_dir: &Path) -> std::io::Result<()> {
     let lock_path = dream_state_lock_path(base_dir);
     let _lock_guard = match CrossProcessLock::acquire(&lock_path) {
         Ok(guard) => guard,
@@ -112,25 +115,21 @@ pub async fn increment_dream_session_count(base_dir: &Path) {
             // Fallback: proceed without lock (best-effort)
             let mut state = read_dream_state(base_dir).await;
             state.current_session_count = state.current_session_count.saturating_add(1);
-            if let Err(e) = write_dream_state(base_dir, &state).await {
-                warn!(error = %e, "[layer6] 保存 .dream_state.json 失败");
-            }
-            return;
+            write_dream_state(base_dir, &state).await?;
+            return Ok(());
         }
     };
 
     let mut state = read_dream_state(base_dir).await;
     state.current_session_count = state.current_session_count.saturating_add(1);
 
-    if let Err(e) = write_dream_state(base_dir, &state).await {
-        warn!(error = %e, "[layer6] 保存 .dream_state.json 失败");
-    } else {
-        info!(
-            current_session_count = state.current_session_count,
-            last_session_count = state.last_session_count,
-            "[layer6] 会话计数已递增并持久化（跨进程锁保护）"
-        );
-    }
+    write_dream_state(base_dir, &state).await?;
+    info!(
+        current_session_count = state.current_session_count,
+        last_session_count = state.last_session_count,
+        "[layer6] 会话计数已递增并持久化（跨进程锁保护）"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
