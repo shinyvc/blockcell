@@ -2589,15 +2589,19 @@ impl AgentRuntime {
         // Use paths.base as both workspace and config directory
         let base_dir = self.paths.base.clone();
 
-        // 增加梦境会话门控计数（Layer 6）
-        // 每次新会话初始化时递增，使 Dream 整合的三重门控机制能正确判断
-        // 注意：由于 agent 和 scheduler 存在循环依赖，此处直接操作 .dream_state.json
-        crate::dream_state::increment_dream_session_count(&base_dir).await;
+        // 注意：Dream session count 不再在此处无条件递增。
+        // 改为在 process_message 中根据会话是否为全新创建来决定是否递增，
+        // 避免 Gateway/异步消息模式下每条消息都错误推进 Dream 门控。
+        // 参见 process_message 中 is_new_session 的判断逻辑。
 
         let mut memory_system = MemorySystem::new(config, base_dir.clone(), base_dir, session_id);
 
         // Perform async initialization: load cursor state + mark session active
         memory_system.initialize().await?;
+
+        // 扫描并清理过期 journal（上次进程退出时遗留的未完成任务）
+        // 仅清理超过 stale 阈值的 journal 及其 pending marker，保留仍在运行的任务
+        memory_system.cleanup_orphaned_journals();
 
         // 仅当用户显式写了 circuitBreaker 时才覆盖分层默认值。
         {
@@ -2991,6 +2995,34 @@ impl AgentRuntime {
         // ========== 0. Memory Flush — 压缩前保存重要信息 ==========
         self.flush_memory_store_before_compact(messages).await;
 
+        // ========== 0.5. Pre-Compact Hooks ==========
+        // 允许注册的 hooks 在压缩前执行自定义逻辑（取消、延迟等）
+        if let Some(ms) = self.memory_system.as_ref() {
+            if ms.compact_hooks().has_pre_hooks() {
+                let token_budget = ms.config().token_budget;
+                let pre_ctx = crate::compact::PreCompactContext {
+                    session_id: _session_key.to_string(),
+                    current_tokens: pre_compact_tokens,
+                    budget_tokens: token_budget,
+                    has_pending_background_tasks: ms.has_pending_extraction(),
+                };
+                match ms.compact_hooks().execute_pre_hooks(pre_ctx).await {
+                    crate::compact::PreCompactResult::Cancel => {
+                        info!("[layer4] Compact cancelled by pre-hook");
+                        return CompactResult::failed("Cancelled by pre-hook");
+                    }
+                    crate::compact::PreCompactResult::Delay(duration) => {
+                        info!(
+                            delay_ms = duration.as_millis() as u64,
+                            "[layer4] Compact delayed by pre-hook"
+                        );
+                        tokio::time::sleep(duration).await;
+                    }
+                    crate::compact::PreCompactResult::Continue => {}
+                }
+            }
+        }
+
         // ========== 1. 熔断器检查 ==========
         let circuit_breaker = get_compact_circuit_breaker();
         if !circuit_breaker.allow() {
@@ -3088,8 +3120,55 @@ impl AgentRuntime {
         // ========== 7. 收集恢复信息 ==========
         // 先等待后台 Session Memory 提取完成，避免读取过时内容
         if let Some(memory_system) = self.memory_system.as_ref() {
+            // 检查跨 runtime 可见的提取 pending 标记
+            // 在 gateway/异步消息模式下，前一个 runtime 的提取可能仍在运行
+            // 但其 extraction_started_at (Instant) 在当前 runtime 中为 None
+            let has_cross_runtime_pending = memory_system.has_pending_extraction_marker();
             let extraction_started_at = memory_system.session_memory_state().extraction_started_at;
-            if extraction_started_at.is_some() {
+
+            // 如果有跨 runtime pending 标记且不是过期的，使用 marker 中存储的时间戳
+            // 构造准确的 started_at，避免使用 Instant::now() 导致无意义超时
+            let effective_started_at = if extraction_started_at.is_some() {
+                extraction_started_at
+            } else if has_cross_runtime_pending {
+                let stale_threshold_ms =
+                    memory_system.config().layer3.extraction_stale_threshold_ms;
+                let marker_path = memory_system.session_dir().join(".extraction_pending");
+                // 读取 marker 中存储的 Unix epoch 毫秒时间戳
+                let marker_ts_ms = memory_system.read_extraction_marker_timestamp_ms();
+                let is_stale = marker_ts_ms
+                    .map(|ts_ms| {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        now_ms.saturating_sub(ts_ms) >= stale_threshold_ms
+                    })
+                    .unwrap_or(true);
+                if is_stale {
+                    // 标记已过期，清理并跳过等待
+                    let _ = std::fs::remove_file(&marker_path);
+                    None
+                } else {
+                    info!("[layer4] 检测到跨 runtime 提取 pending 标记，等待提取完成");
+                    // 从 marker 时间戳恢复准确的 Instant，避免从 Instant::now() 开始导致的无意义超时
+                    marker_ts_ms.and_then(|ts_ms| {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()?
+                            .as_millis() as u64;
+                        let elapsed_ms = now_ms.saturating_sub(ts_ms);
+                        Some(
+                            std::time::Instant::now()
+                                - std::time::Duration::from_millis(elapsed_ms),
+                        )
+                    })
+                }
+            } else {
+                None
+            };
+
+            if effective_started_at.is_some() {
                 let wait_timeout_ms = memory_system.config().layer3.extraction_wait_timeout_ms;
                 let stale_threshold_ms =
                     memory_system.config().layer3.extraction_stale_threshold_ms;
@@ -3099,7 +3178,7 @@ impl AgentRuntime {
                 );
                 match crate::session_memory::recovery::wait_for_session_memory_extraction_with_timeout(
                     &session_memory_path,
-                    extraction_started_at,
+                    effective_started_at,
                     wait_timeout_ms,
                     stale_threshold_ms,
                 )
@@ -3114,7 +3193,7 @@ impl AgentRuntime {
             }
         }
 
-        let recovery_message = if let Some(memory_system) = self.memory_system.as_ref() {
+        let mut recovery_message = if let Some(memory_system) = self.memory_system.as_ref() {
             let session_memory_path =
                 get_session_memory_path(memory_system.workspace_dir(), memory_system.session_id());
             let session_memory_content =
@@ -3129,13 +3208,57 @@ impl AgentRuntime {
             String::new()
         };
 
-        // ========== 8. 构建 CompactResult ==========
-        let post_compact_tokens = estimate_messages_tokens(&[
+        // ========== 8. 构建 CompactResult（初始 token 估算） ==========
+        let mut post_compact_tokens = estimate_messages_tokens(&[
             ChatMessage::system(&summary_message),
             ChatMessage::user(&recovery_message),
         ]);
 
-        // ========== 9. 记录成功事件 ==========
+        // ========== 9. Post-Compact Hooks ==========
+        // 允许注册的 hooks 在压缩完成后执行恢复/清理逻辑
+        // 注意：post-hooks 可能追加 recovery 内容并更新 post_compact_tokens，
+        // 因此指标记录必须在 post-hooks 之后，确保 token 指标准确
+        if let Some(ms) = self.memory_system.as_ref() {
+            if ms.compact_hooks().has_post_hooks() {
+                let session_memory_path = crate::session_memory::get_session_memory_path(
+                    ms.workspace_dir(),
+                    ms.session_id(),
+                );
+                let post_ctx = crate::compact::PostCompactContext {
+                    session_id: _session_key.to_string(),
+                    recovery_message: recovery_message.clone(),
+                    session_memory_path: if session_memory_path.exists() {
+                        Some(session_memory_path)
+                    } else {
+                        None
+                    },
+                };
+                match ms.compact_hooks().execute_post_hooks(post_ctx).await {
+                    crate::compact::PostCompactResult::NeedRecovery(hook_recovery) => {
+                        warn!(
+                            recovery_msg = %hook_recovery,
+                            "[layer4] Post-compact hook requested recovery, 追加恢复消息"
+                        );
+                        // NeedRecovery 语义为"额外恢复"，应追加而非替换
+                        // 保留 generate_compact_recovery() 收集的文件/技能/session recovery
+                        if !hook_recovery.is_empty() {
+                            if !recovery_message.is_empty() {
+                                recovery_message.push_str("\n\n");
+                            }
+                            recovery_message.push_str(&hook_recovery);
+                            // hook 注入后重新计算 token 数
+                            post_compact_tokens = estimate_messages_tokens(&[
+                                ChatMessage::system(&summary_message),
+                                ChatMessage::user(&recovery_message),
+                            ]);
+                        }
+                    }
+                    crate::compact::PostCompactResult::Success => {}
+                }
+            }
+        }
+
+        // ========== 10. 记录成功事件（post-hooks 之后，token 指标准确） ==========
         // 使用来自 LLM API 响应的真实 cache usage 数据
         crate::memory_event!(
             layer4,
@@ -3960,9 +4083,11 @@ impl AgentRuntime {
         info!(target: "chat::user", content = %msg.content, "User input");
         self.update_main_session_target(&msg).await;
         if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
+            // cron 投递场景下使用 persist_session_key（目标会话），
+            // 确保学习/召回归属到目标会话而非源会话
             let turn_number = self
                 .session_store
-                .load(&session_key)
+                .load(&persist_session_key)
                 .map(|history| {
                     history
                         .iter()
@@ -3971,7 +4096,7 @@ impl AgentRuntime {
                         + 1
                 })
                 .unwrap_or(1);
-            manager.on_turn_start(turn_number, &msg.content, &session_key);
+            manager.on_turn_start(turn_number, &msg.content, &persist_session_key);
         }
 
         // Learning Coordinator: record user turn (replaces skill_nudge_engine.record_user_turn)
@@ -4095,7 +4220,7 @@ impl AgentRuntime {
         // ── Handle manual compact request from /compact command ──
         if msg.content == "__COMPACT_REQUEST__" {
             info!(
-                session_key = %session_key,
+                session_key = %persist_session_key,
                 channel = %msg.channel,
                 "[compact] Manual compact request received"
             );
@@ -4106,18 +4231,19 @@ impl AgentRuntime {
                 account_id: msg.account_id.as_deref(),
             };
 
-            // Load session history for compact
-            let history = self.session_store.load(&session_key)?;
+            // 使用 persist_session_key 加载和保存历史：cron 转发场景下
+            // persist_session_key 是目标会话，session_key 是来源会话
+            let history = self.session_store.load(&persist_session_key)?;
             if let Err(e) = self
-                .capture_pre_compress_learning_boundary(&session_key, &history)
+                .capture_pre_compress_learning_boundary(&persist_session_key, &history)
                 .await
             {
-                warn!(error = %e, session_key = %session_key, "Ghost learning pre-compress capture failed");
+                warn!(error = %e, session_key = %persist_session_key, "Ghost learning pre-compress capture failed");
             }
 
             // Execute compact directly (is_auto=false for manual trigger)
             let result = self
-                .execute_layer4_compact(&history, &session_key, Some(compact_ctx), false)
+                .execute_layer4_compact(&history, &persist_session_key, Some(compact_ctx), false)
                 .await;
 
             if result.success {
@@ -4127,12 +4253,15 @@ impl AgentRuntime {
                     ChatMessage::user("请继续当前任务。"),
                 ];
                 compacted_messages.extend(result.recent_messages);
-                self.session_store.save(&session_key, &compacted_messages)?;
+                self.session_store
+                    .save(&persist_session_key, &compacted_messages)?;
 
                 // Clear trackers
                 if let Some(ms) = self.memory_system.as_mut() {
                     ms.file_tracker_mut().clear();
                     ms.skill_tracker_mut().clear();
+                    // 重置 Session/Auto 增量基线，避免压缩后永远不触发记忆提取
+                    ms.reset_baselines_after_compact(&compacted_messages);
                 }
 
                 // Record compression metrics
@@ -4210,9 +4339,28 @@ impl AgentRuntime {
             return Ok(String::new());
         }
 
-        // Load session history
-        let mut history = self.session_store.load(&session_key)?;
+        // 使用 persist_session_key 加载历史：cron 转发场景下 persist_session_key 是目标会话，
+        // session_key 是来源会话。历史应从目标会话加载，避免源会话历史覆盖目标会话。
+        let mut history = self.session_store.load(&persist_session_key)?;
         let mut session_metadata = self.session_store.load_metadata(&persist_session_key)?;
+
+        // Dream session count：使用独立 marker 文件 + create_new 实现原子计数
+        // 解决 metadata save 的 TOCTOU 竞态：两个 runtime 可能同时读到 dream_counted=false，
+        // 都执行 save_with_metadata（File::create 覆盖写），导致重复递增。
+        // mark_dream_counted 使用 create_new(true) 创建独立 marker 文件，只有一个调用者能成功。
+        if self.session_store.mark_dream_counted(&persist_session_key) {
+            if let Err(e) =
+                crate::dream_state::increment_dream_session_count(&self.paths.base).await
+            {
+                warn!(
+                    error = %e,
+                    session_key = %persist_session_key,
+                    "[dream] 会话计数递增失败，清除 marker 以便重试"
+                );
+                self.session_store
+                    .clear_dream_counted_marker(&persist_session_key);
+            }
+        }
         if let Err(err) = self.apply_learned_skill_negative_feedback(&mut session_metadata, &msg) {
             warn!(
                 error = %err,
@@ -4223,9 +4371,13 @@ impl AgentRuntime {
 
         // Layer 2: 时间触发的轻量压缩
         // 检查会话最后更新时间，如果超过阈值则清理旧工具结果
+        // 注意：updated_at 存储在 session 文件外层 metadata 行中，不在 metadata 子对象内，
+        // 必须使用 load_timestamps() 而非从 session_metadata 读取
         let time_config = TimeBasedMCConfig::from(self.config.memory.memory_system.layer2.clone());
-        if let Some(updated_at_str) = session_metadata.get("updated_at").and_then(|v| v.as_str()) {
-            if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(updated_at_str) {
+        if let Ok((_, Some(updated_at_str))) =
+            self.session_store.load_timestamps(&persist_session_key)
+        {
+            if let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&updated_at_str) {
                 let last_assistant_timestamp = Some(updated_at.with_timezone(&chrono::Utc));
                 let projector = HistoryProjector::new(&history);
 
@@ -4250,7 +4402,7 @@ impl AgentRuntime {
         if history.is_empty() {
             if let Some(new_name) = self
                 .session_store
-                .set_session_name_if_new(&session_key, &msg.content)
+                .set_session_name_if_new(&persist_session_key, &msg.content)
             {
                 if msg.channel == "ws" {
                     if let Some(ref event_tx) = self.event_tx {
@@ -4409,10 +4561,12 @@ impl AgentRuntime {
             .get("media_pending_intent")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // 使用 persist_session_key 构建上下文：cron delivery 下 file memory snapshot
+        // 应基于目标会话而非来源会话
         let mut messages = self
             .context_builder
             .build_messages_for_session_mode_with_channel(
-                &session_key,
+                &persist_session_key,
                 &history,
                 &msg.content,
                 &msg.media,
@@ -4442,13 +4596,16 @@ impl AgentRuntime {
         history.push(ChatMessage::user(&msg.content));
 
         // Layer 4: Initialize memory system if needed
+        // 使用 persist_session_key（非 session_key）：cron delivery/转发场景下
+        // Session Memory 文件、pending marker、.session_memory_state.json
+        // 应写入目标会话目录，而非来源会话
         let needs_memory_system_init = self
             .memory_system
             .as_ref()
-            .map(|memory_system| memory_system.session_id() != session_key)
+            .map(|memory_system| memory_system.session_id() != persist_session_key)
             .unwrap_or(true);
         if needs_memory_system_init {
-            if let Err(e) = self.init_memory_system(session_key.clone()).await {
+            if let Err(e) = self.init_memory_system(persist_session_key.clone()).await {
                 warn!(error = %e, "[layer4] Failed to initialize memory system");
             }
         }
@@ -4567,13 +4724,15 @@ impl AgentRuntime {
                     // 使用 self.paths.workspace() 而非 self.paths.base，
                     // 保证写入的 .tool_results 目录与 session_recall 读取、
                     // cleanup_tool_results 清理共用同一个根目录（base/workspace/.tool_results）
+                    // 使用 persist_session_key：cron delivery 下 history 来自目标会话，
+                    // 大工具结果也应写入目标会话目录，否则后续 session_recall 找不到
                     current_messages = crate::response_cache::apply_budget_async(
                         &current_messages,
                         &candidates,
                         &mut state_mut,
                         budget,
                         &self.paths.workspace(),
-                        &session_key,
+                        &persist_session_key,
                         preview_size_chars,
                     )
                     .await;
@@ -4613,26 +4772,30 @@ impl AgentRuntime {
                         account_id: msg.account_id.as_deref(),
                     };
                     if let Err(e) = self
-                        .capture_pre_compress_learning_boundary(&session_key, &current_messages)
+                        .capture_pre_compress_learning_boundary(
+                            &persist_session_key,
+                            &current_messages,
+                        )
                         .await
                     {
-                        warn!(error = %e, session_key = %session_key, "Ghost learning pre-compress capture failed");
+                        warn!(error = %e, session_key = %persist_session_key, "Ghost learning pre-compress capture failed");
                     }
                     let compact_result = self
                         .execute_layer4_compact(
                             &current_messages,
-                            &session_key,
+                            &persist_session_key,
                             Some(compact_ctx),
                             true, // is_auto for automatic compact
                         )
                         .await;
                     if compact_result.success {
+                        // 替换当前消息为压缩后的内容（用于 LLM API 调用）
                         current_messages.clear();
                         current_messages
                             .push(ChatMessage::system(&compact_result.to_compact_message()));
                         current_messages.push(ChatMessage::user("请继续当前任务。"));
 
-                        current_messages.extend(compact_result.recent_messages);
+                        current_messages.extend(compact_result.recent_messages.clone());
 
                         info!(
                             post_compact_tokens = estimate_messages_tokens(&current_messages),
@@ -4640,10 +4803,22 @@ impl AgentRuntime {
                         );
                         metrics.record_compression();
 
+                        // 同步更新 history 并持久化到 session store
+                        // 确保 compact 结果在请求中断或失败时也不会丢失
+                        history.clear();
+                        history.push(ChatMessage::system(&compact_result.to_compact_message()));
+                        history.push(ChatMessage::user("请继续当前任务。"));
+                        history.extend(compact_result.recent_messages);
+                        if let Err(e) = self.session_store.save(&persist_session_key, &history) {
+                            warn!(error = %e, "[layer4] 无法保存 pre-loop compacted history");
+                        }
+
                         // Compact 成功后清空追踪器，防止下次 Compact 重复恢复
                         if let Some(ms) = self.memory_system.as_mut() {
                             ms.file_tracker_mut().clear();
                             ms.skill_tracker_mut().clear();
+                            // 重置 Session/Auto 增量基线，避免压缩后永远不触发记忆提取
+                            ms.reset_baselines_after_compact(&history);
                         }
                     } else {
                         warn!(
@@ -5219,28 +5394,31 @@ impl AgentRuntime {
                             account_id: msg.account_id.as_deref(),
                         };
                         if let Err(e) = self
-                            .capture_pre_compress_learning_boundary(&session_key, &current_messages)
+                            .capture_pre_compress_learning_boundary(
+                                &persist_session_key,
+                                &current_messages,
+                            )
                             .await
                         {
-                            warn!(error = %e, session_key = %session_key, "Ghost learning pre-compress capture failed");
+                            warn!(error = %e, session_key = %persist_session_key, "Ghost learning pre-compress capture failed");
                         }
                         let compact_result = self
                             .execute_layer4_compact(
                                 &current_messages,
-                                &session_key,
+                                &persist_session_key,
                                 Some(compact_ctx),
                                 true, // is_auto for automatic compact
                             )
                             .await;
                         if compact_result.success {
-                            // 替换消息历史为压缩后的内容
+                            // 替换消息历史为压缩后的内容（用于 LLM API 调用）
                             current_messages.clear();
                             current_messages
                                 .push(ChatMessage::system(&compact_result.to_compact_message()));
                             // 添加当前用户消息作为继续点
                             current_messages.push(ChatMessage::user("请继续当前任务。"));
 
-                            current_messages.extend(compact_result.recent_messages);
+                            current_messages.extend(compact_result.recent_messages.clone());
 
                             info!(
                                 post_compact_tokens = estimate_messages_tokens(&current_messages),
@@ -5248,10 +5426,23 @@ impl AgentRuntime {
                             );
                             metrics.record_compression();
 
+                            // 同步更新 history 并持久化到 session store
+                            // 确保 compact 结果不会因请求中断而丢失
+                            history.clear();
+                            history.push(ChatMessage::system(&compact_result.to_compact_message()));
+                            history.push(ChatMessage::user("请继续当前任务。"));
+                            history.extend(compact_result.recent_messages);
+                            if let Err(e) = self.session_store.save(&persist_session_key, &history)
+                            {
+                                warn!(error = %e, "[layer4] 无法保存 mid-loop compacted history");
+                            }
+
                             // Compact 成功后清空追踪器，防止下次 Compact 重复恢复
                             if let Some(ms) = self.memory_system.as_mut() {
                                 ms.file_tracker_mut().clear();
                                 ms.skill_tracker_mut().clear();
+                                // 重置 Session/Auto 增量基线，避免压缩后永远不触发记忆提取
+                                ms.reset_baselines_after_compact(&history);
                             }
 
                             // 跳过后续处理
@@ -5611,47 +5802,57 @@ impl AgentRuntime {
 
         if let Some(memory_system) = self.memory_system.as_mut() {
             let current_tokens = estimate_messages_tokens(&history);
-            let action = crate::memory_system::evaluate_memory_hooks(
+            let mut actions = crate::memory_system::evaluate_memory_hooks(
                 memory_system,
                 &history,
                 current_tokens,
             )
             .await;
 
-            match action {
-                crate::memory_system::PostSamplingAction::ExtractSessionMemory => {
-                    info!("[post-sampling] Spawning Session Memory extraction task");
+            // Post-Sampling 动作处理：Session Memory → Auto Memory → Compact
+            // 使用 PostSamplingActions struct 支持同一轮返回多个动作，
+            // 避免 Session/Auto/Compact 同时到期时互相跳过。
+            // 执行顺序：先 spawn 提取任务（clone 历史），再同步执行 Compact。
 
-                    // 先确保 session memory 文件存在于磁盘上，
-                    // 必须在 mark_extraction_started() 之前完成，
-                    // 否则模板写入的 mtime 会晚于 extraction_start_system，
-                    // 导致 compact 等待时误判提取已完成
-                    let memory_path = crate::session_memory::get_session_memory_path(
-                        memory_system.workspace_dir(),
-                        memory_system.session_id(),
-                    );
-                    let template = crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE;
-                    match crate::session_memory::setup_session_memory_file(&memory_path, template)
-                        .await
-                    {
-                        Ok(_) => {
-                            info!(
-                                path = %memory_path.display(),
-                                "[layer3] Session memory file ensured on disk"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                path = %memory_path.display(),
-                                error = %e,
-                                "[layer3] Failed to initialize session memory file"
-                            );
-                        }
+            // 1. Session Memory 提取
+            if actions.session_memory {
+                info!("[post-sampling] Spawning Session Memory extraction task");
+
+                // 先确保 session memory 文件存在于磁盘上，
+                // 必须在 mark_extraction_started() 之前完成，
+                // 否则模板写入的 mtime 会晚于 extraction_start_system，
+                // 导致 compact 等待时误判提取已完成
+                let memory_path = crate::session_memory::get_session_memory_path(
+                    memory_system.workspace_dir(),
+                    memory_system.session_id(),
+                );
+                let template = crate::session_memory::DEFAULT_SESSION_MEMORY_TEMPLATE;
+                match crate::session_memory::setup_session_memory_file(&memory_path, template).await
+                {
+                    Ok(_) => {
+                        info!(
+                            path = %memory_path.display(),
+                            "[layer3] Session memory file ensured on disk"
+                        );
                     }
+                    Err(e) => {
+                        warn!(
+                            path = %memory_path.display(),
+                            error = %e,
+                            "[layer3] Failed to initialize session memory file"
+                        );
+                    }
+                }
 
-                    // 标记提取开始（设置 extraction_started_at + has_pending_extraction）
-                    // 在模板写入之后，这样 mtime 基准不会被模板写入干扰
-                    memory_system.mark_extraction_started();
+                // 标记提取开始（设置 extraction_started_at + has_pending_extraction）
+                // 在模板写入之后，这样 mtime 基准不会被模板写入干扰
+                // 原子创建 pending marker：如果另一个 runtime 已在提取，跳过 spawn
+                if !memory_system.mark_extraction_started() {
+                    info!("[layer3] 另一个 runtime 已在提取 Session Memory，跳过");
+                } else {
+                    // 落盘 journal：记录任务元数据，用于 stale marker 检测
+                    // 后台任务完成时清除 journal；不是可靠恢复队列
+                    memory_system.write_session_memory_journal(history.len());
 
                     // 克隆必要的数据用于异步任务
                     let provider_pool = Arc::clone(&self.provider_pool);
@@ -5669,8 +5870,29 @@ impl AgentRuntime {
                     let current_token_count =
                         crate::token::estimate_messages_tokens(&history_clone);
 
-                    // 非阻塞执行
-                    let handle = tokio::spawn(async move {
+                    // 获取状态文件和标记文件路径（用于后台任务直接落盘）
+                    // 在短生命周期 runtime 下（如 gateway 模式），runtime 可能
+                    // 在后台提取完成前被 drop，导致 watch channel 结果无法应用。
+                    // 后台任务直接写状态文件可确保下次 runtime 能恢复提取进度。
+                    let session_state_path = memory_path
+                        .parent()
+                        .map(|p| p.join(".session_memory_state.json"))
+                        .unwrap_or_else(|| memory_path.with_extension("session_memory_state.json"));
+                    let session_marker_path = memory_path
+                        .parent()
+                        .map(|p| p.join(".extraction_pending"))
+                        .unwrap_or_else(|| memory_path.with_extension("extraction_pending"));
+                    // journal 路径：后台任务完成时清除
+                    let session_journal_path = memory_path
+                        .parent()
+                        .map(|p| p.join(".extraction_journal"))
+                        .unwrap_or_else(|| memory_path.with_extension("extraction_journal"));
+
+                    // 非阻塞执行（不追踪 handle，避免 runtime drop 时被 abort）
+                    // 可靠性说明：journal 仅用于 stale marker 检测，不是可靠恢复队列。
+                    // 进程退出时正在运行的任务会丢失，只能通过 stale 机制清理。
+                    // 原子 pending marker 防止并发重复提取。
+                    let _handle = tokio::spawn(async move {
                         let system_prompt = Arc::new(
                             "你是一个会话记忆提取助手。请从对话中提取关键信息并更新 Session Memory 文件。"
                                 .to_string(),
@@ -5697,7 +5919,7 @@ impl AgentRuntime {
                             Ok(_) => {
                                 info!("[layer3] Session Memory extraction completed");
                                 crate::memory_system::SessionMemoryExtractionResult {
-                                    last_message_id: last_msg_id,
+                                    last_message_id: last_msg_id.clone(),
                                     last_message_index: last_msg_index,
                                     token_count: current_token_count,
                                     success: true,
@@ -5711,95 +5933,202 @@ impl AgentRuntime {
                                 }
                             }
                         };
-                        let _ = result_sender.send(extraction_result);
+                        let _ = result_sender.send(extraction_result.clone());
+
+                        // 直接持久化状态到文件，确保短生命周期 runtime 下状态不丢失
+                        // 即使当前 runtime 已被 drop，下次 runtime 也能从文件恢复提取进度
+                        if extraction_result.success {
+                            let json = serde_json::json!({
+                                "tokens_at_last_extraction": current_token_count,
+                                "initialized": true,
+                                "last_memory_message_id": last_msg_id,
+                                "last_memory_message_index": last_msg_index,
+                            });
+                            if let Ok(content) = serde_json::to_string_pretty(&json) {
+                                if let Some(parent) = session_state_path.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                // 使用原子写入，防止崩溃或并发读取时得到半截 JSON
+                                if let Err(e) = crate::fs_util::atomic_write(
+                                    &session_state_path,
+                                    content.as_bytes(),
+                                ) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        path = %session_state_path.display(),
+                                        "[layer3] 直接持久化状态文件失败"
+                                    );
+                                }
+                            }
+                        }
+                        // 始终清理 extraction pending 标记和 journal（无论成功或失败）
+                        let _ = std::fs::remove_file(&session_marker_path);
+                        let _ = std::fs::remove_file(&session_journal_path);
                     });
 
-                    // 保存任务句柄
-                    if let Some(ms) = self.memory_system.as_mut() {
-                        ms.add_background_task(handle);
+                    // 注意：不将提取句柄加入 background_tasks，避免 runtime drop 时 abort
+                    // 导致状态永远无法落盘。后台任务自行写状态文件 + 清标记，对 runtime
+                    // 生命周期无依赖。tokio::spawn 的任务会持续运行直到完成。
+                } // else: mark_extraction_started 成功
+            }
+
+            // 2. Auto Memory 提取
+            if !actions.auto_memory_types.is_empty() {
+                info!(
+                    memory_types = ?actions.auto_memory_types,
+                    "[post-sampling] Spawning Auto Memory extraction tasks"
+                );
+
+                // 克隆必要的数据
+                let provider_pool = Arc::clone(&self.provider_pool);
+                let history_clone = history.clone();
+                let config_dir = memory_system.config_dir().to_path_buf();
+                let model = self.config.agents.defaults.model.clone();
+                let layer5_config = memory_system.config().layer5.clone();
+                // 使用预先获取的 cursor_reload_flag
+                let cursor_reload_flag = cursor_reload_flag
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+                // 为每种记忆类型创建独立的异步任务
+                for memory_type in actions.auto_memory_types.drain(..) {
+                    let provider_pool_for_type = Arc::clone(&provider_pool);
+                    let history_for_type = history_clone.clone();
+                    let config_dir_for_type = config_dir.clone();
+                    let model_for_type = model.clone();
+                    let layer5_config_for_type = layer5_config.clone();
+                    let reload_flag_for_type = Arc::clone(&reload_flag);
+                    let cursor_reload_flag_for_type = Arc::clone(&cursor_reload_flag);
+
+                    // 获取最后一条用户消息的 UUID（用于游标更新）
+                    let last_user_uuid = history_for_type
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "user")
+                        .and_then(|m| m.id.clone())
+                        .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+                        .unwrap_or_else(uuid::Uuid::new_v4);
+
+                    let message_count = history_for_type.len();
+
+                    // per-memory-type pending marker 路径
+                    let auto_marker_path = config_dir_for_type
+                        .join(format!(".extraction_pending.{}", memory_type.name()));
+                    // per-memory-type journal 路径
+                    let auto_journal_path = config_dir_for_type
+                        .join(format!(".extraction_journal.{}", memory_type.name()));
+
+                    // 在 spawn 前同步、原子创建 pending marker，防止快连续消息重复 spawn
+                    // create_new(true) 保证只有一个调用者能成功创建文件
+                    // 已存在的 marker 说明该 memory type 的提取正在运行，应跳过
+                    if let Some(parent) = auto_marker_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
                     }
-                }
-                crate::memory_system::PostSamplingAction::ExtractAutoMemory(types) => {
-                    info!(
-                        memory_types = ?types,
-                        "[post-sampling] Spawning Auto Memory extraction tasks"
-                    );
+                    let marker_created = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&auto_marker_path)
+                        .is_ok();
+                    if !marker_created {
+                        tracing::debug!(
+                            memory_type = memory_type.name(),
+                            "[layer5] 跳过已标记 pending 的 memory type 提取"
+                        );
+                        continue;
+                    }
 
-                    // 克隆必要的数据
-                    let provider_pool = Arc::clone(&self.provider_pool);
-                    let history_clone = history.clone();
-                    let config_dir = memory_system.config_dir().to_path_buf();
-                    let model = self.config.agents.defaults.model.clone();
-                    let layer5_config = memory_system.config().layer5.clone();
-                    // 使用预先获取的 cursor_reload_flag
-                    let cursor_reload_flag = cursor_reload_flag
-                        .clone()
-                        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+                    // 落盘 journal：记录任务元数据，用于 stale marker 检测
+                    // 包含 owner_pid 用于检测任务所属进程是否存活，避免误删长耗时任务
+                    {
+                        let journal = serde_json::json!({
+                            "task_type": "auto_memory",
+                            "memory_type": memory_type.name(),
+                            "message_count": message_count,
+                            "started_at": chrono::Utc::now().to_rfc3339(),
+                            "owner_pid": std::process::id(),
+                        });
+                        if let Ok(content) = serde_json::to_string_pretty(&journal) {
+                            if let Err(e) =
+                                crate::fs_util::atomic_write(&auto_journal_path, content.as_bytes())
+                            {
+                                tracing::debug!(
+                                    error = %e,
+                                    memory_type = memory_type.name(),
+                                    "[layer5] 写入 Auto Memory journal 失败"
+                                );
+                            }
+                        }
+                    }
 
-                    // 为每种记忆类型创建独立的异步任务
-                    for memory_type in types {
-                        let provider_pool_for_type = Arc::clone(&provider_pool);
-                        let history_for_type = history_clone.clone();
-                        let config_dir_for_type = config_dir.clone();
-                        let model_for_type = model.clone();
-                        let layer5_config_for_type = layer5_config.clone();
-                        let reload_flag_for_type = Arc::clone(&reload_flag);
-                        let cursor_reload_flag_for_type = Arc::clone(&cursor_reload_flag);
+                    let _handle = tokio::spawn(async move {
+                        // marker 已在 spawn 前原子创建，无需在任务内创建
 
-                        // 获取最后一条用户消息的 UUID（用于游标更新）
-                        let last_user_uuid = history_for_type
-                            .iter()
-                            .rev()
-                            .find(|m| m.role == "user")
-                            .and_then(|m| m.id.clone())
-                            .and_then(|s| uuid::Uuid::parse_str(&s).ok())
-                            .unwrap_or_else(uuid::Uuid::new_v4);
+                        // 创建提取器（会加载持久化的游标状态）
+                        let extractor_config =
+                            crate::auto_memory::AutoMemoryConfig::from(layer5_config_for_type);
+                        let mut extractor =
+                            match crate::auto_memory::AutoMemoryExtractor::with_config(
+                                &config_dir_for_type,
+                                extractor_config,
+                            )
+                            .await
+                            {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    warn!(error = %e, "[layer5] Failed to create AutoMemoryExtractor");
+                                    // 清理 pending 标记和 journal
+                                    let _ = std::fs::remove_file(&auto_marker_path);
+                                    let _ = std::fs::remove_file(&auto_journal_path);
+                                    return;
+                                }
+                            };
 
-                        let message_count = history_for_type.len();
-
-                        let handle = tokio::spawn(async move {
-                            // 创建提取器（会加载持久化的游标状态）
-                            let extractor_config =
-                                crate::auto_memory::AutoMemoryConfig::from(layer5_config_for_type);
-                            let mut extractor =
-                                match crate::auto_memory::AutoMemoryExtractor::with_config(
-                                    &config_dir_for_type,
-                                    extractor_config,
-                                )
-                                .await
-                                {
-                                    Ok(e) => e,
-                                    Err(e) => {
-                                        warn!(error = %e, "[layer5] Failed to create AutoMemoryExtractor");
-                                        return;
-                                    }
-                                };
-
-                            let system_prompt = Arc::new(
+                        let system_prompt = Arc::new(
                                 "你是一个记忆提取助手。请从对话中提取用户偏好、项目信息、反馈和外部资源引用。"
                                     .to_string(),
                             );
 
-                            // 使用 ExtractionParams 和 extract() 方法
-                            // 这样游标状态会被正确更新和保存
-                            let params = crate::auto_memory::ExtractionParams {
-                                provider_pool: provider_pool_for_type,
-                                memory_type,
-                                system_prompt,
-                                model: model_for_type,
-                                messages: history_for_type,
-                                last_message_uuid: last_user_uuid,
-                                message_count,
-                            };
+                        // 使用 ExtractionParams 和 extract() 方法
+                        // 这样游标状态会被正确更新和保存
+                        let params = crate::auto_memory::ExtractionParams {
+                            provider_pool: provider_pool_for_type,
+                            memory_type,
+                            system_prompt,
+                            model: model_for_type,
+                            messages: history_for_type,
+                            last_message_uuid: last_user_uuid,
+                            message_count,
+                        };
 
-                            let result = extractor.extract(params).await;
+                        let result = extractor.extract(params).await;
 
-                            if result.success {
+                        // 清理 pending 标记
+                        // 如果 cursor_save_failed，保留 marker 以便下次重试，
+                        // 避免游标未推进时重复触发提取但 marker 被清除导致无法防重
+                        if !result.success || !result.cursor_save_failed {
+                            let _ = std::fs::remove_file(&auto_marker_path);
+                            let _ = std::fs::remove_file(&auto_journal_path);
+                        } else {
+                            warn!(
+                                memory_type = result.memory_type.name(),
+                                "[layer5] 游标保存失败，保留 pending marker 以便重试"
+                            );
+                        }
+
+                        if result.success {
+                            if result.cursor_save_failed {
+                                // 游标保存失败：记忆文件已更新但游标未推进
+                                // 不设置 reload flag，避免刷新不完整的游标状态
+                                // pending marker 已保留，下次交互会重试提取
+                                warn!(
+                                        memory_type = memory_type.name(),
+                                        "[layer5] Auto Memory 提取完成但游标保存失败，不刷新缓存，等待重试"
+                                    );
+                            } else {
                                 info!(
                                     memory_type = memory_type.name(),
                                     input_tokens = result.input_tokens,
                                     output_tokens = result.output_tokens,
-                                    cursor_save_failed = result.cursor_save_failed,
                                     "[layer5] Auto Memory extraction completed"
                                 );
                                 // 标记需要刷新缓存
@@ -5808,77 +6137,79 @@ impl AgentRuntime {
                                 // 标记需要重新加载游标状态（通知主线程）
                                 cursor_reload_flag_for_type
                                     .store(true, std::sync::atomic::Ordering::Release);
-                            } else {
-                                warn!(
-                                    memory_type = memory_type.name(),
-                                    error = ?result.error,
-                                    "[layer5] Auto Memory extraction failed"
-                                );
                             }
-                        });
-
-                        // 保存任务句柄
-                        if let Some(ms) = self.memory_system.as_mut() {
-                            ms.add_background_task(handle);
+                        } else {
+                            warn!(
+                                memory_type = memory_type.name(),
+                                error = ?result.error,
+                                "[layer5] Auto Memory extraction failed"
+                            );
                         }
-                    }
+                    });
+
+                    // 注意：不将 Auto Memory 提取句柄加入 background_tasks，
+                    // 避免短生命周期 runtime drop 时 abort 导致游标状态无法保存。
+                    // AutoMemoryExtractor::extract() 内部已自行持久化游标状态。
                 }
-                crate::memory_system::PostSamplingAction::Compact => {
-                    // Post-Sampling 中的 Compact - 同步执行压缩
-                    // Compact 应在当前交互结束前同步执行
-                    // 这样下次交互时历史已经是压缩后的状态，用户无感知
+            }
+
+            // 3. Compact（在 spawn 之后执行，确保提取任务已拿到完整历史快照）
+            if actions.compact {
+                // Post-Sampling 中的 Compact - 同步执行压缩
+                // Compact 应在当前交互结束前同步执行
+                // 这样下次交互时历史已经是压缩后的状态，用户无感知
+                info!(
+                    current_tokens,
+                    token_budget = memory_system.config().token_budget,
+                    "[post-sampling] Executing synchronous compact before response delivery"
+                );
+
+                let compact_ctx = CompactContext {
+                    channel: &msg.channel,
+                    chat_id: &msg.chat_id,
+                    account_id: msg.account_id.as_deref(),
+                };
+                if let Err(e) = self
+                    .capture_pre_compress_learning_boundary(&persist_session_key, &history)
+                    .await
+                {
+                    warn!(error = %e, session_key = %persist_session_key, "Ghost learning pre-compress capture failed");
+                }
+                let compact_result = self
+                    .execute_layer4_compact(
+                        &history,
+                        &persist_session_key,
+                        Some(compact_ctx),
+                        true, // is_auto for automatic compact
+                    )
+                    .await;
+                if compact_result.success {
+                    // 压缩成功，替换历史
+                    history.clear();
+                    history.push(ChatMessage::system(&compact_result.to_compact_message()));
+                    history.push(ChatMessage::user("请继续当前任务。"));
+
+                    history.extend(compact_result.recent_messages);
+
                     info!(
-                        current_tokens,
-                        token_budget = memory_system.config().token_budget,
-                        "[post-sampling] Executing synchronous compact before response delivery"
+                        post_compact_tokens = estimate_messages_tokens(&history),
+                        "[post-sampling] Compact completed, history replaced"
                     );
+                    metrics.record_compression();
 
-                    let compact_ctx = CompactContext {
-                        channel: &msg.channel,
-                        chat_id: &msg.chat_id,
-                        account_id: msg.account_id.as_deref(),
-                    };
-                    if let Err(e) = self
-                        .capture_pre_compress_learning_boundary(&session_key, &history)
-                        .await
-                    {
-                        warn!(error = %e, session_key = %session_key, "Ghost learning pre-compress capture failed");
+                    // 清空追踪器
+                    if let Some(ms) = self.memory_system.as_mut() {
+                        ms.file_tracker_mut().clear();
+                        ms.skill_tracker_mut().clear();
+                        // 重置 Session/Auto 增量基线，避免压缩后永远不触发记忆提取
+                        ms.reset_baselines_after_compact(&history);
                     }
-                    let compact_result = self
-                        .execute_layer4_compact(
-                            &history,
-                            &session_key,
-                            Some(compact_ctx),
-                            true, // is_auto for automatic compact
-                        )
-                        .await;
-                    if compact_result.success {
-                        // 压缩成功，替换历史
-                        history.clear();
-                        history.push(ChatMessage::system(&compact_result.to_compact_message()));
-                        history.push(ChatMessage::user("请继续当前任务。"));
-
-                        history.extend(compact_result.recent_messages);
-
-                        info!(
-                            post_compact_tokens = estimate_messages_tokens(&history),
-                            "[post-sampling] Compact completed, history replaced"
-                        );
-                        metrics.record_compression();
-
-                        // 清空追踪器
-                        if let Some(ms) = self.memory_system.as_mut() {
-                            ms.file_tracker_mut().clear();
-                            ms.skill_tracker_mut().clear();
-                        }
-                    } else {
-                        warn!(
-                            error = ?compact_result.error,
-                            "[post-sampling] Compact failed, continuing without compression"
-                        );
-                    }
+                } else {
+                    warn!(
+                        error = ?compact_result.error,
+                        "[post-sampling] Compact failed, continuing without compression"
+                    );
                 }
-                crate::memory_system::PostSamplingAction::None => {}
             }
 
             // 清理已完成的后台任务
@@ -5911,9 +6242,11 @@ impl AgentRuntime {
             }
         }
 
+        // cron 投递场景下 Ghost sync/prefetch 使用 persist_session_key（目标会话），
+        // 确保学习/召回归属到目标会话而非源会话
         if let Some(manager) = self.ghost_memory_lifecycle.as_ref() {
-            manager.sync_all(&msg.content, &delivered_response, &session_key);
-            manager.queue_prefetch_all(&msg.content, &session_key);
+            manager.sync_all(&msg.content, &delivered_response, &persist_session_key);
+            manager.queue_prefetch_all(&msg.content, &persist_session_key);
         }
 
         self.spawn_pending_ghost_background_reviews();

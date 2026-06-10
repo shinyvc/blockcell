@@ -368,7 +368,6 @@ impl AutoMemoryExtractor {
                             memory_type = memory_type.name(),
                             "[auto_memory] 提取未产生内容变更（正常 no-op）"
                         );
-                        cb.record_success();
                         // 正常推进游标，防止下次继续触发
                         let cursor = {
                             let mut c = self.cursor_manager.get_cursor(memory_type);
@@ -390,6 +389,13 @@ impl AutoMemoryExtractor {
                             }
                             Ok(()) => false,
                         };
+                        // cursor 保存失败时记入熔断器失败，避免存储层故障被掩盖
+                        if cursor_save_failed {
+                            cb.record_failure();
+                            get_memory_metrics().layer5.record_extraction_failure();
+                        } else {
+                            cb.record_success();
+                        }
                         return ExtractionResult {
                             memory_type,
                             success: true, // 无变化视为成功
@@ -449,8 +455,13 @@ impl AutoMemoryExtractor {
                     );
                 }
 
-                // 熔断器记录成功
-                cb.record_success();
+                // 熔断器记录：cursor 保存失败时记入失败，避免存储层故障被掩盖
+                if cursor_save_failed {
+                    cb.record_failure();
+                    get_memory_metrics().layer5.record_extraction_failure();
+                } else {
+                    cb.record_success();
+                }
 
                 ExtractionResult {
                     memory_type,

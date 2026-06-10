@@ -62,6 +62,36 @@ impl SessionStore {
         Ok(messages)
     }
 
+    /// 读取 session 文件外层的时间戳（created_at, updated_at）
+    ///
+    /// 与 load_metadata() 不同，此方法返回的是 metadata 行外层的 created_at 和 updated_at，
+    /// 而非 metadata 子对象内部的内容。Layer 2 时间触发轻量压缩需要 updated_at 来判断
+    /// 会话是否长时间未更新。
+    pub fn load_timestamps(&self, session_key: &str) -> Result<(Option<String>, Option<String>)> {
+        let path = self.paths.session_file(session_key);
+
+        if !path.exists() {
+            return Ok((None, None));
+        }
+
+        Ok(self
+            .read_metadata_line(&path)
+            .map(|(created_at, _)| (Some(created_at), self.read_updated_at(&path)))
+            .unwrap_or((None, None)))
+    }
+
+    /// 从 session 文件第一行读取 updated_at 字段
+    fn read_updated_at(&self, path: &std::path::Path) -> Option<String> {
+        let file = File::open(path).ok()?;
+        let mut reader = BufReader::new(file);
+        let mut first_line = String::new();
+        reader.read_line(&mut first_line).ok()?;
+        let line: serde_json::Value = serde_json::from_str(first_line.trim()).ok()?;
+        line.get("updated_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
     pub fn load_metadata(&self, session_key: &str) -> Result<Value> {
         let path = self.paths.session_file(session_key);
 
@@ -204,8 +234,15 @@ impl SessionStore {
 
     /// Clear session history by deleting the session file.
     /// Returns true if the file existed and was deleted, false if it didn't exist.
+    /// 同时删除关联的 sidecar marker 文件（如 .dream_counted），保持生命周期一致。
     pub fn clear(&self, session_key: &str) -> Result<bool> {
         let path = self.paths.session_file(session_key);
+
+        // 同步删除 sidecar marker 文件，避免会话清理后同 key 复用时 marker 残留
+        let marker_path = path.with_extension("dream_counted");
+        if marker_path.exists() {
+            let _ = std::fs::remove_file(&marker_path);
+        }
 
         if path.exists() {
             std::fs::remove_file(&path)?;
@@ -213,6 +250,68 @@ impl SessionStore {
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+
+    /// 原子标记会话已被 Dream 计数，使用独立 marker 文件 + create_new 实现并发安全。
+    ///
+    /// 返回 true 表示本次成功标记（应递增计数），false 表示已被其他 runtime 标记过。
+    /// 解决 metadata save 的 TOCTOU 竞态：两个 runtime 可能同时读到 dream_counted=false，
+    /// 都执行 save_with_metadata（File::create 覆盖写），导致重复递增。
+    /// create_new(true) 保证只有一个调用者能成功创建文件。
+    ///
+    /// 迁移兼容：旧版本在 metadata 中存储 dream_counted=true（无 sidecar marker）。
+    /// 首次遇到旧会话时，检测 metadata 中的标记，自动创建 sidecar 并返回 false（不重复计数）。
+    pub fn mark_dream_counted(&self, session_key: &str) -> bool {
+        let path = self.paths.session_file(session_key);
+        let marker_path = path.with_extension("dream_counted");
+
+        if let Some(parent) = marker_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // create_new(true): 文件已存在返回 Err，只有一个调用者能成功
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker_path)
+            .is_ok();
+
+        if !created {
+            // sidecar marker 已存在，说明已被计数过
+            return false;
+        }
+
+        // sidecar 创建成功，但需要检查旧 metadata 是否已有 dream_counted=true
+        // （从旧版本迁移的会话：metadata 有标记但无 sidecar）
+        if let Ok(metadata) = self.load_metadata(session_key) {
+            if metadata
+                .get("dream_counted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                // 旧版本已计过数，不重复计数
+                debug!(
+                    session_key = %session_key,
+                    "[dream] 检测到旧版本 dream_counted metadata，sidecar 已创建但不重复计数"
+                );
+                return false;
+            }
+        }
+
+        // 全新标记，应递增计数
+        true
+    }
+
+    /// 清除 dream 计数 sidecar marker
+    ///
+    /// 当 `increment_dream_session_count` 失败时调用，
+    /// 删除 marker 以便下次交互时重试递增，避免永久漏计。
+    pub fn clear_dream_counted_marker(&self, session_key: &str) {
+        let path = self.paths.session_file(session_key);
+        let marker_path = path.with_extension("dream_counted");
+        if marker_path.exists() {
+            let _ = std::fs::remove_file(&marker_path);
         }
     }
 

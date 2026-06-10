@@ -32,6 +32,22 @@ pub struct SessionMemoryExtractionResult {
     pub success: bool,
 }
 
+/// Session Memory 状态的持久化版本
+///
+/// 用于在 runtime 重建时恢复提取进度，避免 Gateway/异步消息模式下
+/// `tokens_at_last_extraction` 和 `initialized` 丢失导致重复触发提取。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedSessionMemoryState {
+    /// 上次提取时的 Token 数
+    tokens_at_last_extraction: usize,
+    /// 是否已初始化
+    initialized: bool,
+    /// 上次提取时的消息 ID
+    last_memory_message_id: Option<String>,
+    /// 上次提取时的消息索引（向后兼容，用于消息无 ID 时的 fallback）
+    last_memory_message_index: Option<usize>,
+}
+
 /// 记忆系统状态
 #[derive(Debug, Default)]
 pub struct MemorySystemState {
@@ -120,11 +136,352 @@ impl MemorySystem {
         }
     }
 
-    /// 异步初始化（加载游标状态 + 标记会话活跃）
+    /// 异步初始化（加载游标状态 + 标记会话活跃 + 恢复持久化的 Session Memory 状态）
     pub async fn initialize(&mut self) -> std::io::Result<()> {
         self.cursor_manager.load().await?;
+        // 恢复持久化的 Session Memory 状态（避免 runtime 重建后丢失提取进度）
+        self.load_session_memory_state().await?;
         // 标记会话为活跃状态
         self.mark_session_active().await
+    }
+
+    /// 从会话目录加载持久化的 Session Memory 状态
+    ///
+    /// 在 Gateway/异步消息模式下，runtime 会被重建，此方法确保
+    /// `tokens_at_last_extraction`、`initialized` 和 `last_memory_message_id`
+    /// 在 runtime 重建后仍能正确恢复，避免重复触发提取。
+    async fn load_session_memory_state(&mut self) -> std::io::Result<()> {
+        let state_path = self.session_memory_state_path();
+        if !state_path.exists() {
+            return Ok(());
+        }
+
+        match std::fs::read_to_string(&state_path) {
+            Ok(content) => match serde_json::from_str::<PersistedSessionMemoryState>(&content) {
+                Ok(persisted) => {
+                    self.state.session_memory.tokens_at_last_extraction =
+                        persisted.tokens_at_last_extraction;
+                    self.state.session_memory.initialized = persisted.initialized;
+                    self.state.session_memory.last_memory_message_id =
+                        persisted.last_memory_message_id;
+                    self.state.session_memory.last_memory_message_index =
+                        persisted.last_memory_message_index;
+                    tracing::info!(
+                        tokens_at_last_extraction = persisted.tokens_at_last_extraction,
+                        initialized = persisted.initialized,
+                        "[memory_system] 已恢复持久化的 Session Memory 状态"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "[memory_system] 解析 Session Memory 状态文件失败，使用默认状态"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "[memory_system] 读取 Session Memory 状态文件失败，使用默认状态"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// 持久化当前 Session Memory 状态到会话目录（同步，适用于同步上下文调用）
+    ///
+    /// 在提取完成或状态变更后调用，确保 runtime 重建后能恢复提取进度。
+    pub fn save_session_memory_state_sync(&self) {
+        let state_path = self.session_memory_state_path();
+        if let Some(parent) = state_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let persisted = PersistedSessionMemoryState {
+            tokens_at_last_extraction: self.state.session_memory.tokens_at_last_extraction,
+            initialized: self.state.session_memory.initialized,
+            last_memory_message_id: self.state.session_memory.last_memory_message_id.clone(),
+            last_memory_message_index: self.state.session_memory.last_memory_message_index,
+        };
+
+        match serde_json::to_string_pretty(&persisted) {
+            Ok(content) => {
+                // 使用原子写入，防止崩溃或并发读取时得到半截 JSON
+                if let Err(e) = crate::fs_util::atomic_write(&state_path, content.as_bytes()) {
+                    tracing::warn!(
+                        error = %e,
+                        "[memory_system] 保存 Session Memory 状态失败"
+                    );
+                } else {
+                    tracing::trace!("[memory_system] Session Memory 状态已持久化");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "[memory_system] 序列化 Session Memory 状态失败"
+                );
+            }
+        }
+    }
+
+    /// 获取 Session Memory 状态文件路径
+    fn session_memory_state_path(&self) -> PathBuf {
+        let session_dir = self.session_dir();
+        session_dir.join(".session_memory_state.json")
+    }
+
+    /// 创建 Session Memory 提取 pending 文件标记（同步，跨 runtime 可见）
+    /// 使用原子创建（create_new），返回是否成功创建。
+    /// 两个 runtime 同时调用时，只有一个能成功创建，避免并发重复提取。
+    fn touch_extraction_marker_sync(&self) -> bool {
+        let marker_path = self.extraction_pending_marker_path();
+        if let Some(parent) = marker_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        // 使用 create_new(true) 实现原子创建：
+        // 文件已存在时返回 Err，只有一个调用者能成功
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                let _ = file.write_all(timestamp_ms.to_string().as_bytes());
+                true
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "[memory_system] 创建提取标记失败（可能已有其他 runtime 在提取）"
+                );
+                false
+            }
+        }
+    }
+
+    /// 清除 Session Memory 提取 pending 文件标记
+    fn clear_extraction_marker_sync(&self) {
+        let marker_path = self.extraction_pending_marker_path();
+        if marker_path.exists() {
+            let _ = std::fs::remove_file(&marker_path);
+        }
+    }
+
+    // ── 提取任务 Journal（stale marker 清理辅助） ──────────
+    //
+    // Journal 记录提取任务的元数据（started_at、message_count 等），用于：
+    // 1. 启动时检测孤儿 journal：通过 started_at 判断任务是否已过期
+    // 2. 过期 journal 清除对应的 stale pending marker，允许下次交互重新触发提取
+    // 注意：Journal 不存储可重放的提取参数，不是可靠恢复队列。
+    // 进程退出时正在运行的任务会丢失，只能通过 stale 机制在下次启动时清理。
+
+    /// 获取 Session Memory 提取 journal 文件路径
+    fn session_memory_journal_path(&self) -> PathBuf {
+        self.session_dir().join(".extraction_journal")
+    }
+
+    /// 获取 Auto Memory 提取 journal 文件路径
+    pub fn auto_memory_journal_path(&self, memory_type: &MemoryType) -> PathBuf {
+        self.config_dir
+            .join(format!(".extraction_journal.{}", memory_type.name()))
+    }
+
+    /// 写入 Session Memory 提取 journal
+    /// 在 spawn 前调用，记录任务元数据（用于 stale marker 检测，不是可靠恢复队列）
+    /// 包含 owner_pid 用于检测任务所属进程是否存活，避免误删长耗时任务
+    pub fn write_session_memory_journal(&self, message_count: usize) {
+        let journal_path = self.session_memory_journal_path();
+        if let Some(parent) = journal_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let journal = serde_json::json!({
+            "task_type": "session_memory",
+            "session_id": self.session_id,
+            "message_count": message_count,
+            "started_at": chrono::Utc::now().to_rfc3339(),
+            "owner_pid": std::process::id(),
+        });
+        if let Ok(content) = serde_json::to_string_pretty(&journal) {
+            if let Err(e) = crate::fs_util::atomic_write(&journal_path, content.as_bytes()) {
+                tracing::debug!(error = %e, "[memory_system] 写入 Session Memory journal 失败");
+            }
+        }
+    }
+
+    /// 清除 Session Memory 提取 journal
+    pub fn clear_session_memory_journal(&self) {
+        let journal_path = self.session_memory_journal_path();
+        if journal_path.exists() {
+            let _ = std::fs::remove_file(&journal_path);
+        }
+    }
+
+    /// 写入 Auto Memory 提取 journal（用于 stale marker 检测，不是可靠恢复队列）
+    /// 包含 owner_pid 用于检测任务所属进程是否存活，避免误删长耗时任务
+    pub fn write_auto_memory_journal(&self, memory_type: &MemoryType, message_count: usize) {
+        let journal_path = self.auto_memory_journal_path(memory_type);
+        if let Some(parent) = journal_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let journal = serde_json::json!({
+            "task_type": "auto_memory",
+            "memory_type": memory_type.name(),
+            "session_id": self.session_id,
+            "message_count": message_count,
+            "started_at": chrono::Utc::now().to_rfc3339(),
+            "owner_pid": std::process::id(),
+        });
+        if let Ok(content) = serde_json::to_string_pretty(&journal) {
+            if let Err(e) = crate::fs_util::atomic_write(&journal_path, content.as_bytes()) {
+                tracing::debug!(
+                    error = %e,
+                    memory_type = memory_type.name(),
+                    "[memory_system] 写入 Auto Memory journal 失败"
+                );
+            }
+        }
+    }
+
+    /// 清除 Auto Memory 提取 journal
+    pub fn clear_auto_memory_journal(&self, memory_type: &MemoryType) {
+        let journal_path = self.auto_memory_journal_path(memory_type);
+        if journal_path.exists() {
+            let _ = std::fs::remove_file(&journal_path);
+        }
+    }
+
+    /// 扫描并清理孤儿 journal（启动时调用）
+    ///
+    /// 检测残留的 journal 文件，仅当任务已过期（started_at 超过 stale 阈值）时
+    /// 才清除 pending marker 和 journal，允许下次交互重新触发提取。
+    /// 仍在运行的任务（journal 未过期）不会被干扰，避免误删活跃任务的 marker。
+    pub fn cleanup_orphaned_journals(&self) {
+        // Session Memory journal：使用 Layer 3 的 stale 阈值
+        let sm_journal = self.session_memory_journal_path();
+        if sm_journal.exists() {
+            let stale_threshold_ms = self.config.layer3.extraction_stale_threshold_ms;
+            if self.is_journal_stale(&sm_journal, stale_threshold_ms) {
+                tracing::warn!(
+                    path = %sm_journal.display(),
+                    stale_threshold_ms,
+                    "[memory_system] 发现过期 Session Memory journal，清除 pending marker 允许重新提取"
+                );
+                self.clear_extraction_marker_sync();
+                let _ = std::fs::remove_file(&sm_journal);
+            } else {
+                tracing::debug!(
+                    path = %sm_journal.display(),
+                    "[memory_system] Session Memory journal 仍在有效期内，保留（任务可能仍在运行）"
+                );
+            }
+        }
+
+        // Auto Memory journal 扫描：使用 Layer 5 的 stale 阈值
+        let auto_stale_threshold_ms = self.config.layer5.extraction_stale_threshold_ms;
+        if let Ok(entries) = std::fs::read_dir(&self.config_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with(".extraction_journal.") {
+                    let journal_path = entry.path();
+                    if self.is_journal_stale(&journal_path, auto_stale_threshold_ms) {
+                        tracing::warn!(
+                            path = %journal_path.display(),
+                            stale_threshold_ms = auto_stale_threshold_ms,
+                            "[memory_system] 发现过期 Auto Memory journal，清除对应 pending marker"
+                        );
+                        // 从 journal 文件名推导 pending marker 文件名
+                        let pending_name =
+                            name_str.replace(".extraction_journal.", ".extraction_pending.");
+                        let pending_path = self.config_dir.join(&*pending_name);
+                        if pending_path.exists() {
+                            let _ = std::fs::remove_file(&pending_path);
+                        }
+                        let _ = std::fs::remove_file(&journal_path);
+                    } else {
+                        tracing::debug!(
+                            path = %journal_path.display(),
+                            "[memory_system] Auto Memory journal 仍在有效期内，保留（任务可能仍在运行）"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 检查 journal 是否已过期
+    ///
+    /// 按优先级判断：
+    /// 1. owner_pid == 当前进程：同一进程刚启动，journal 不是孤儿 → 不清理
+    /// 2. owner_pid 对应进程仍存活（Unix: /proc/{pid}）：任务可能在运行 → 不清理
+    /// 3. 进程已死或无法判断：使用 3x stale_threshold_ms 作为清理阈值
+    ///    （3x 裕量覆盖真实 LLM/Forked 提取的耗时，避免误删长耗时任务）
+    fn is_journal_stale(&self, journal_path: &Path, stale_threshold_ms: u64) -> bool {
+        let content = match std::fs::read_to_string(journal_path) {
+            Ok(c) => c,
+            Err(_) => return true, // 无法读取视为过期
+        };
+        let journal_value: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return true, // 无法解析视为过期
+        };
+
+        // 检查 owner_pid：如果进程仍存活，journal 不是孤儿
+        if let Some(owner_pid) = journal_value.get("owner_pid").and_then(|v| v.as_u64()) {
+            let pid = owner_pid as u32;
+            if pid == std::process::id() {
+                // 同一进程：刚启动的 runtime，journal 不是孤儿
+                return false;
+            }
+            if is_pid_alive(pid) {
+                // 进程仍在运行：任务可能仍在执行
+                tracing::debug!(pid, "[memory_system] journal owner 进程仍存活，不清理");
+                return false;
+            }
+            // 进程已死：使用 3x 阈值，比正常 stale 多一些裕量
+        }
+
+        // 无 owner_pid（旧格式 journal）或进程已死：基于时间判断
+        let started_at_str = journal_value
+            .get("started_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let started_at = match chrono::DateTime::parse_from_rfc3339(started_at_str) {
+            Ok(dt) => dt,
+            Err(_) => return true, // 时间格式无效视为过期
+        };
+        // 使用 3x 阈值：真实 LLM/Forked 提取可能超过单次 stale 阈值
+        let effective_threshold_ms = stale_threshold_ms * 3;
+        let elapsed = chrono::Utc::now()
+            .signed_duration_since(started_at.with_timezone(&chrono::Utc))
+            .num_milliseconds();
+        elapsed >= effective_threshold_ms as i64
+    }
+
+    /// 检查是否有未完成的 Session Memory 提取标记（跨 runtime 可见）
+    pub fn has_pending_extraction_marker(&self) -> bool {
+        self.extraction_pending_marker_path().exists()
+    }
+
+    /// 读取提取 pending 标记中存储的开始时间戳（Unix epoch 毫秒）
+    /// 返回 None 表示标记不存在或内容无法解析
+    pub fn read_extraction_marker_timestamp_ms(&self) -> Option<u64> {
+        let marker_path = self.extraction_pending_marker_path();
+        let content = std::fs::read_to_string(&marker_path).ok()?;
+        content.trim().parse().ok()
+    }
+
+    /// 获取提取 pending 标记文件路径
+    fn extraction_pending_marker_path(&self) -> PathBuf {
+        let session_dir = self.session_dir();
+        session_dir.join(".extraction_pending")
     }
 
     /// 重新加载游标状态
@@ -199,6 +556,51 @@ impl MemorySystem {
 
     /// 检查是否应该提取 Session Memory
     pub fn should_extract_session_memory(&self, messages: &[ChatMessage]) -> bool {
+        // 检查跨 runtime 可见的提取 pending 文件标记
+        // 在 Gateway/异步消息模式下，前一个 runtime 可能已被 drop，
+        // 但其后台提取任务可能仍在运行。此检查防止在新 runtime 中重复触发提取。
+        if self.has_pending_extraction_marker() {
+            let marker_path = self.extraction_pending_marker_path();
+            if let Ok(metadata) = std::fs::metadata(&marker_path) {
+                if let Ok(modified) = metadata.modified() {
+                    let stale_threshold = std::time::Duration::from_millis(
+                        self.state
+                            .session_memory
+                            .config
+                            .extraction_stale_threshold_ms,
+                    );
+                    if let Ok(elapsed) = modified.elapsed() {
+                        if elapsed < stale_threshold {
+                            // 标记未过期，前一个 runtime 的提取可能仍在进行
+                            tracing::debug!(
+                                elapsed_ms = elapsed.as_millis(),
+                                "[memory_system] 提取 pending 标记未过期，跳过重复触发"
+                            );
+                            return false;
+                        }
+                    }
+                }
+            }
+            // 标记已过期，但在清理前先检查 journal 的 owner_pid
+            // 如果 journal 显示任务所属进程仍存活，说明长耗时任务正在运行，不应删除 marker
+            let journal_path = self.session_memory_journal_path();
+            let stale_threshold_ms = self
+                .state
+                .session_memory
+                .config
+                .extraction_stale_threshold_ms;
+            if journal_path.exists() && !self.is_journal_stale(&journal_path, stale_threshold_ms) {
+                tracing::debug!(
+                    "[memory_system] Session Memory marker 虽然过期，但 journal 显示任务仍在运行，不删除"
+                );
+                return false;
+            }
+            // journal 也确认过期或不存在，安全清理 marker
+            tracing::warn!(
+                "[memory_system] 提取 pending 标记已过期且 journal 确认可清理，允许重新触发"
+            );
+            self.clear_extraction_marker_sync();
+        }
         should_extract_memory(messages, &self.state.session_memory)
     }
 
@@ -237,18 +639,59 @@ impl MemorySystem {
         self.state.session_memory.last_extracted_at = Some(std::time::Instant::now());
         self.state.session_memory.extraction_started_at = None;
         self.state.has_pending_extraction = false;
+        // 清除跨 runtime 可见的提取 pending 文件标记
+        self.clear_extraction_marker_sync();
     }
 
-    /// 标记提取开始（设置 extraction_started_at）
-    pub fn mark_extraction_started(&mut self) {
-        self.state.session_memory.extraction_started_at = Some(std::time::Instant::now());
-        self.state.has_pending_extraction = true;
+    /// Compact 后重置 Session/Auto 增量基线
+    ///
+    /// Compact 会把历史替换为短摘要，token 数和消息数大幅减少。
+    /// 如果不重置基线：
+    /// - Session Memory: `current_tokens.saturating_sub(tokens_at_last_extraction)` 会为 0
+    /// - Auto Memory: `current_count.saturating_sub(last_message_count)` 会为 0
+    ///
+    /// 导致记忆提取长期不再触发，直到压缩后历史重新长到压缩前大小。
+    pub fn reset_baselines_after_compact(&mut self, post_compact_messages: &[ChatMessage]) {
+        // Session Memory: 重置 token 基线
+        let post_compact_tokens = crate::token::estimate_messages_tokens(post_compact_messages);
+        let old_tokens = self.state.session_memory.tokens_at_last_extraction;
+        if old_tokens > post_compact_tokens {
+            tracing::info!(
+                old_tokens,
+                new_tokens = post_compact_tokens,
+                "[memory_system] Compact 后重置 Session Memory token 基线"
+            );
+            self.state.session_memory.tokens_at_last_extraction = post_compact_tokens;
+        }
+
+        // Auto Memory: 重置游标消息计数基线
+        self.cursor_manager
+            .reset_message_count_baseline(post_compact_messages.len());
+
+        // 持久化 Session Memory 状态
+        self.save_session_memory_state_sync();
     }
 
-    /// 标记提取失败（清除 extraction_started_at，保留其他状态）
+    /// 标记提取开始（先创建文件标记，成功后再设内存状态）
+    /// 返回 true 表示标记创建成功，false 表示已有其他 runtime 在提取（应跳过 spawn）
+    /// 先创建 marker 再设内存状态，失败时内存状态保持干净，避免污染
+    pub fn mark_extraction_started(&mut self) -> bool {
+        // 先原子创建跨 runtime 可见的文件标记
+        let marker_created = self.touch_extraction_marker_sync();
+        if marker_created {
+            // 标记创建成功，再设置内存状态
+            self.state.session_memory.extraction_started_at = Some(std::time::Instant::now());
+            self.state.has_pending_extraction = true;
+        }
+        marker_created
+    }
+
+    /// 标记提取失败（清除 extraction_started_at + 文件标记，保留其他状态）
     pub fn mark_extraction_failed(&mut self) {
         self.state.session_memory.extraction_started_at = None;
         self.state.has_pending_extraction = false;
+        // 清除跨 runtime 可见的文件标记
+        self.clear_extraction_marker_sync();
     }
 
     /// 获取内容替换状态
@@ -350,8 +793,12 @@ impl MemorySystem {
                 last_message_index,
                 token_count,
             );
+            // 持久化状态，确保 runtime 重建后能恢复提取进度
+            self.save_session_memory_state_sync();
         } else {
             self.mark_extraction_failed();
+            // 持久化失败状态，清除提取标记
+            self.save_session_memory_state_sync();
             tracing::warn!("[memory_system] 后台 Session Memory 提取失败，已清除提取标记");
         }
         true
@@ -434,15 +881,76 @@ impl MemorySystem {
     }
 
     /// 检查是否应该触发自动记忆提取
+    ///
+    /// 过滤掉已有 pending marker 的 memory type，避免 detached 提取仍在运行时重复 spawn。
     pub fn should_extract_auto_memory(&self, messages: &[ChatMessage]) -> Vec<MemoryType> {
         let config = crate::auto_memory::AutoMemoryConfig::from(self.config.layer5.clone());
         let current_content = crate::auto_memory::build_message_content_signature(messages);
-        crate::auto_memory::should_extract_auto_memory_with_config(
+        let mut types = crate::auto_memory::should_extract_auto_memory_with_config(
             &self.cursor_manager,
             messages.len(),
             &current_content,
             &config,
-        )
+        );
+
+        // 过滤掉已有 pending marker 的 memory type
+        // 前一个 runtime 的 detached 提取可能尚未完成并保存 cursor
+        // 使用 Layer 5 独立的 stale 阈值，避免 Layer 3 短阈值误判 Layer 5 长任务
+        let stale_threshold_ms = self.config.layer5.extraction_stale_threshold_ms;
+        types.retain(|mt| !self.has_active_auto_memory_pending(mt, stale_threshold_ms));
+
+        types
+    }
+
+    /// 检查指定 memory type 是否有活跃的 pending marker
+    /// 过期时先检查对应 journal 的 owner_pid，避免误删长耗时任务的 marker
+    fn has_active_auto_memory_pending(
+        &self,
+        memory_type: &MemoryType,
+        stale_threshold_ms: u64,
+    ) -> bool {
+        let marker_path = self.auto_memory_pending_marker_path(memory_type);
+        match std::fs::metadata(&marker_path) {
+            Ok(meta) => {
+                // 检查标记是否过期
+                let is_stale = meta
+                    .modified()
+                    .ok()
+                    .and_then(|mtime| mtime.elapsed().ok())
+                    .map(|elapsed| elapsed.as_millis() as u64 >= stale_threshold_ms)
+                    .unwrap_or(true);
+                if is_stale {
+                    // 标记已过期，但在清理前先检查 journal 的 owner_pid
+                    // 如果 journal 显示任务所属进程仍存活，说明长耗时任务正在运行，不应删除 marker
+                    let journal_path = self.auto_memory_journal_path(memory_type);
+                    if journal_path.exists()
+                        && !self.is_journal_stale(&journal_path, stale_threshold_ms)
+                    {
+                        tracing::debug!(
+                            memory_type = memory_type.name(),
+                            "[memory_system] Auto Memory marker 虽然过期，但 journal 显示任务仍在运行，不删除"
+                        );
+                        return true;
+                    }
+                    // journal 也确认过期或不存在，安全清理 marker
+                    let _ = std::fs::remove_file(&marker_path);
+                    false
+                } else {
+                    tracing::debug!(
+                        memory_type = memory_type.name(),
+                        "[memory_system] 检测到活跃的 Auto Memory pending marker，跳过提取"
+                    );
+                    true
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// 获取 Auto Memory 提取 pending 标记文件路径
+    pub fn auto_memory_pending_marker_path(&self, memory_type: &MemoryType) -> PathBuf {
+        self.config_dir
+            .join(format!(".extraction_pending.{}", memory_type.name()))
     }
 
     /// 添加后台任务句柄
@@ -607,17 +1115,47 @@ impl Drop for MemorySystem {
     }
 }
 
-/// Post-Sampling Hook 结果
+/// Post-Sampling 动作集合
+///
+/// 支持同一轮返回多个动作，避免 Session/Auto/Compact 同时到期时互相跳过。
+/// 执行顺序：Session Memory → Auto Memory → Compact
 #[derive(Debug)]
-pub enum PostSamplingAction {
-    /// 无操作
-    None,
-    /// 触发 Session Memory 提取
-    ExtractSessionMemory,
-    /// 触发自动记忆提取
-    ExtractAutoMemory(Vec<MemoryType>),
-    /// 触发 Compact
-    Compact,
+pub struct PostSamplingActions {
+    /// 是否触发 Session Memory 提取
+    pub session_memory: bool,
+    /// 需要提取的 Auto Memory 类型（空 = 不触发）
+    pub auto_memory_types: Vec<MemoryType>,
+    /// 是否触发 Compact
+    pub compact: bool,
+}
+
+impl PostSamplingActions {
+    /// 所有动作均为空
+    pub fn is_empty(&self) -> bool {
+        !self.session_memory && self.auto_memory_types.is_empty() && !self.compact
+    }
+}
+
+/// 检查指定 PID 的进程是否仍存活
+///
+/// 用于 journal cleanup 判断：owner 进程仍存活说明任务可能在运行，不应清理。
+/// - 同一进程：直接返回 true
+/// - Unix: 检查 /proc/{pid} 是否存在
+/// - Windows: 无法简单检查（需要额外依赖），返回 false，依靠 3x 阈值裕量
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        std::path::Path::new(&format!("/proc/{}", pid)).exists()
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows 下无法无依赖检查 PID 存活，依靠 is_journal_stale 的 3x 阈值裕量
+        let _ = pid;
+        false
+    }
 }
 
 /// 检查是否应该触发记忆操作
@@ -635,7 +1173,7 @@ pub async fn evaluate_memory_hooks(
     memory_system: &mut MemorySystem,
     messages: &[ChatMessage],
     current_tokens: usize,
-) -> PostSamplingAction {
+) -> PostSamplingActions {
     // 检查是否需要重新加载游标状态（后台提取完成后）
     if memory_system.check_and_clear_cursor_reload() {
         if let Err(e) = memory_system.reload_cursors().await {
@@ -646,27 +1184,40 @@ pub async fn evaluate_memory_hooks(
     // 检查并应用后台 Session Memory 提取结果
     memory_system.apply_session_memory_result();
 
-    // 1. 检查 Compact (最高优先级)
-    if memory_system.should_compact(current_tokens) {
-        return PostSamplingAction::Compact;
-    }
+    // 收集所有需要触发的动作（不提前 return，确保 Session/Auto/Compact 同时到期时都不被跳过）
+    let mut actions = PostSamplingActions {
+        session_memory: false,
+        auto_memory_types: Vec::new(),
+        compact: false,
+    };
 
-    // 2. 检查 Session Memory 提取
+    // 1. 检查 Session Memory 提取（在 Compact 之前，确保压缩前完成会话记忆快照）
+    // 设计文档 Post-Sampling 顺序：Layer 3/5 先于 Layer 4
+    // 如果长会话首次达到 compact 阈值但还没提取 Session Memory，
+    // 必须先提取再压缩，否则压缩后原始长历史丢失，Layer 3 再也无法提取
     if memory_system.should_extract_session_memory(messages) {
-        return PostSamplingAction::ExtractSessionMemory;
+        actions.session_memory = true;
     }
 
-    // 3. 检查自动记忆提取
+    // 2. 检查自动记忆提取（在 Compact 之前，确保压缩前用完整历史提取）
+    // 设计文档 Post-Sampling 顺序：Layer 3/5 先于 Layer 4
+    // Auto Memory 需要完整历史作为提取材料，必须在压缩前执行，
+    // 否则压缩后 history 被替换为摘要，提取质量下降或完全丢失
     if memory_system.config().auto_memory_enabled {
         // 使用已加载的 cursor_manager，确保冷却机制正确工作
         let types_to_extract = memory_system.should_extract_auto_memory(messages);
 
         if !types_to_extract.is_empty() {
-            return PostSamplingAction::ExtractAutoMemory(types_to_extract);
+            actions.auto_memory_types = types_to_extract;
         }
     }
 
-    PostSamplingAction::None
+    // 3. 检查 Compact（Layer 3/5 都不需要时也检查，支持同轮组合触发）
+    if memory_system.should_compact(current_tokens) {
+        actions.compact = true;
+    }
+
+    actions
 }
 
 /// 默认记忆目录路径
@@ -760,8 +1311,8 @@ mod tests {
 
         let messages = vec![ChatMessage::user("Hello"), ChatMessage::assistant("Hi!")];
 
-        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
-        assert!(matches!(action, PostSamplingAction::None));
+        let actions = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
+        assert!(actions.is_empty());
     }
 
     #[tokio::test]
@@ -782,9 +1333,9 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("Test")];
-        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
+        let actions = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
 
-        assert!(matches!(action, PostSamplingAction::Compact));
+        assert!(actions.compact);
     }
 
     #[test]
@@ -899,7 +1450,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_post_sampling_action_order() {
-        // 测试 Compact 优先级高于其他操作
+        // 测试 Post-Sampling 优先级：Session Memory > Auto Memory > Compact
+        // 设计文档要求 Layer 3/5 先于 Layer 4，确保压缩前完成提取
         let config = MemorySystemConfig {
             token_budget: 100,
             layer4: Layer4Config {
@@ -916,7 +1468,7 @@ mod tests {
             "test".to_string(),
         );
 
-        // 即使有足够的消息触发 auto memory，也应该优先返回 Compact
+        // 有足够消息触发 auto memory，且 auto memory 优先级高于 Compact
         let messages: Vec<ChatMessage> = (0..20)
             .flat_map(|i| {
                 vec![
@@ -926,9 +1478,13 @@ mod tests {
             })
             .collect();
 
-        let action = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
+        let actions = evaluate_memory_hooks(&mut memory_system, &messages, 100).await;
 
-        // Compact 优先级最高
-        assert!(matches!(action, PostSamplingAction::Compact));
+        // Auto Memory 和 Compact 可以同时触发（设计文档：Layer 3/5 先于 Layer 4）
+        assert!(
+            !actions.auto_memory_types.is_empty(),
+            "Auto Memory 应被触发，实际: {:?}",
+            actions
+        );
     }
 }

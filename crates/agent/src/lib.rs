@@ -106,7 +106,7 @@ pub use memory_file_store::{
 };
 pub use memory_system::{
     evaluate_memory_hooks, BackgroundTaskHandle, MemorySystem, MemorySystemConfig,
-    MemorySystemState, PostSamplingAction,
+    MemorySystemState, PostSamplingActions,
 };
 pub use response_cache::{ResponseCache, ResponseCacheConfig};
 pub use runtime::{create_evolution_deploy_callback, AgentRuntime, ConfirmRequest};
