@@ -106,8 +106,10 @@ export const MarkdownContent = memo(function MarkdownContent({ content }: { cont
             );
           },
           img({ src, alt }) {
-            // Route local file paths through the serve endpoint
-            const resolvedSrc = src && src.startsWith('/') ? mediaFileUrl(src, selectedAgentId) : src;
+            // Route any local file path (relative or absolute) through the serve
+            // endpoint; only http(s)/data/blob URLs are passed through unchanged.
+            const isRemoteUrl = src && /^(https?:|data:|blob:)/i.test(src);
+            const resolvedSrc = !isRemoteUrl ? mediaFileUrl(src ?? '', selectedAgentId) : src;
             return (
               <img
                 src={resolvedSrc}

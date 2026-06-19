@@ -308,46 +308,47 @@ pub(super) async fn handle_files_download(
 }
 
 /// GET /v1/files/serve — serve a file inline with proper Content-Type (for <img>/<audio> tags)
-/// Supports both workspace-relative paths and absolute paths within ~/.blockcell/
+///
+/// Security: only files under the requesting agent's `media_dir()` may be served.
+/// The request `path` may be either absolute or relative to `media_dir()`; either
+/// way it is canonicalized and required to remain inside `media_dir()`. This
+/// prevents reading `config.json5`, other agents' workspaces, sessions, or any
+/// file outside this agent's media directory.
 pub(super) async fn handle_files_serve(
     State(state): State<GatewayState>,
     Query(params): Query<FileContentQuery>,
 ) -> Response {
-    let base_dir = state.paths.base.clone();
     let agent_id = match resolve_requested_agent_id(&state.config, params.agent.as_deref()) {
         Ok(agent_id) => agent_id,
         Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
     };
-    let workspace = state.paths.for_agent(&agent_id).workspace();
 
-    // Determine target: absolute path or workspace-relative
-    let target = if params.path.starts_with('/') {
+    // The allowed root is the agent's media directory, not ~/.blockcell/ base.
+    let media_dir = state.paths.for_agent(&agent_id).media_dir();
+    let media_canonical = media_dir
+        .canonicalize()
+        .unwrap_or_else(|_| media_dir.clone());
+
+    // Accept absolute paths (as produced by the agent runtime) and paths
+    // relative to media_dir. Canonicalize the candidate and enforce that it
+    // stays inside media_dir — this is the sole security boundary.
+    let candidate = if std::path::Path::new(&params.path).is_absolute() {
         std::path::PathBuf::from(&params.path)
     } else {
-        workspace.join(&params.path)
+        media_dir.join(&params.path)
     };
-
-    // Canonicalize for security check
-    let canonical = match target.canonicalize() {
+    let canonical = match candidate.canonicalize() {
         Ok(p) => p,
         Err(_) => return (StatusCode::NOT_FOUND, "File not found").into_response(),
     };
-
-    // Security: file must be within ~/.blockcell/ base directory
-    let base_canonical = base_dir
-        .canonicalize()
-        .unwrap_or_else(|_| base_dir.to_path_buf());
-    if !canonical.starts_with(&base_canonical) {
-        return (
-            StatusCode::FORBIDDEN,
-            "Access denied: file outside allowed directory",
-        )
-            .into_response();
+    if !canonical.starts_with(&media_canonical) {
+        return (StatusCode::FORBIDDEN, "Access denied").into_response();
     }
 
-    if !target.is_file() {
+    if !canonical.is_file() {
         return (StatusCode::NOT_FOUND, "Not a file").into_response();
     }
+    let target = canonical.clone();
 
     let ext = target
         .extension()
