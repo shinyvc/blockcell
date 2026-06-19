@@ -134,27 +134,19 @@ use webui::*;
 enum WsEvent {
     #[serde(rename = "session_bound")]
     SessionBound {
+        channel: String,
         client_chat_id: String,
         chat_id: String,
         agent_id: String,
     },
-    #[serde(rename = "message_done")]
-    MessageDone {
-        chat_id: String,
-        task_id: String,
-        content: String,
-        /// LLM 推理/思考内容（如 DeepSeek thinking mode）。
-        /// 作为独立字段发送，前端可在折叠的"思考"区域渲染，
-        /// 而非混入 content 正文。
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reasoning_content: Option<String>,
-        tool_calls: usize,
-        duration_ms: u64,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        media: Vec<String>,
-    },
     #[serde(rename = "agent_progress")]
     AgentProgress {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        chat_id: Option<String>,
         task_id: String,
         progress_type: String,
         tokens_added: u64,
@@ -165,12 +157,22 @@ enum WsEvent {
     /// 任务阶段进度（阶段描述 + 百分比）
     #[serde(rename = "agent_stage")]
     AgentStage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        chat_id: Option<String>,
         task_id: String,
         stage: String,
         percent: u8,
     },
     #[serde(rename = "error")]
-    Error { chat_id: String, message: String },
+    Error {
+        channel: String,
+        chat_id: String,
+        message: String,
+    },
 }
 
 impl WsEvent {
@@ -190,6 +192,7 @@ impl WsEvent {
     /// Create an error event with the given chat_id and message
     fn error(chat_id: impl Into<String>, message: impl Into<String>) -> Self {
         WsEvent::Error {
+            channel: "ws".to_string(),
             chat_id: chat_id.into(),
             message: message.into(),
         }
@@ -1192,19 +1195,37 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
                     tools_added,
                     total_tokens,
                     total_tools,
-                } => WsEvent::AgentProgress {
-                    task_id: task_id.clone(),
-                    progress_type: "delta".to_string(),
-                    tokens_added: *tokens_added,
-                    tools_added: *tools_added,
-                    total_tokens: *total_tokens,
-                    total_tools: *total_tools,
-                },
+                } => {
+                    let task = if task_id.is_empty() {
+                        None
+                    } else {
+                        task_manager_for_progress.get_task(task_id).await
+                    };
+                    WsEvent::AgentProgress {
+                        channel: task.as_ref().map(|task| task.origin_channel.clone()),
+                        agent_id: task
+                            .as_ref()
+                            .and_then(|task| task.agent_id.clone())
+                            .or_else(|| Some("default".to_string())),
+                        chat_id: task.as_ref().map(|task| task.origin_chat_id.clone()),
+                        task_id: task_id.clone(),
+                        progress_type: "delta".to_string(),
+                        tokens_added: *tokens_added,
+                        tools_added: *tools_added,
+                        total_tokens: *total_tokens,
+                        total_tools: *total_tools,
+                    }
+                }
                 blockcell_agent::AgentProgress::Stage {
                     task_id,
                     stage,
                     percent,
                 } => {
+                    let task = if task_id.is_empty() {
+                        None
+                    } else {
+                        task_manager_for_progress.get_task(task_id).await
+                    };
                     // ── Channel 进度转发 ──
                     // 将 Stage 事件转发到任务的 origin_channel（QQ/微信/Telegram 等）
                     let should_forward = match last_forwarded_percent.get(task_id) {
@@ -1223,7 +1244,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
                             // 仅在未完成时更新节流记录，完成时已清理
                             last_forwarded_percent.insert(task_id.clone(), *percent);
                         }
-                        if let Some(task) = task_manager_for_progress.get_task(task_id).await {
+                        if let Some(task) = task.as_ref() {
                             // 仅转发到非 ws/cli 渠道（空渠道也跳过）
                             if !task.origin_channel.is_empty()
                                 && task.origin_channel != "ws"
@@ -1251,6 +1272,12 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
                     }
 
                     WsEvent::AgentStage {
+                        channel: task.as_ref().map(|task| task.origin_channel.clone()),
+                        agent_id: task
+                            .as_ref()
+                            .and_then(|task| task.agent_id.clone())
+                            .or_else(|| Some("default".to_string())),
+                        chat_id: task.as_ref().map(|task| task.origin_chat_id.clone()),
                         task_id: task_id.clone(),
                         stage: stage.clone(),
                         percent: *percent,
@@ -1370,6 +1397,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
                     "request_id": request_id,
                     "tool_name": req.tool_name,
                     "paths": req.paths,
+                    "agent_id": req.agent_id.as_deref().unwrap_or("default"),
                     "channel": req.channel,
                     "chat_id": req.chat_id,
                 });

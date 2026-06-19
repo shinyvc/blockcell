@@ -5,6 +5,54 @@ use crate::commands::slash_commands::{CommandContext, CommandResult, SLASH_COMMA
 // P0: WebSocket with structured protocol
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct WsSessionScope {
+    agent_id: String,
+    chat_id: String,
+}
+
+fn ws_event_visible_to_connection(
+    subscriptions: &std::collections::HashSet<WsSessionScope>,
+    msg: &str,
+) -> bool {
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(msg) else {
+        return false;
+    };
+
+    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if matches!(
+        event_type,
+        "skills_updated"
+            | "evolution_triggered"
+            | "evolution_resumed"
+            | "evolution_stopped"
+            | "evolution_deleted"
+    ) {
+        return true;
+    }
+
+    if event.get("channel").and_then(|v| v.as_str()) != Some("ws") {
+        return false;
+    }
+
+    let Some(chat_id) = event.get("chat_id").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if chat_id.is_empty() {
+        return false;
+    }
+
+    let agent_id = event
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+
+    subscriptions.contains(&WsSessionScope {
+        agent_id: agent_id.to_string(),
+        chat_id: chat_id.to_string(),
+    })
+}
+
 pub(super) async fn handle_ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<GatewayState>,
@@ -50,15 +98,42 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let mut broadcast_rx = state.ws_broadcast.subscribe();
+    let subscriptions = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let (direct_tx, mut direct_rx) = mpsc::channel::<String>(16);
 
     use futures::SinkExt;
     use futures::StreamExt;
 
     // Task: forward broadcast events to this WS client
+    let send_subscriptions = Arc::clone(&subscriptions);
     let send_task = tokio::spawn(async move {
-        while let Ok(msg) = broadcast_rx.recv().await {
-            if ws_sender.send(WsMessage::Text(msg)).await.is_err() {
-                break;
+        let mut direct_open = true;
+        loop {
+            tokio::select! {
+                direct = direct_rx.recv(), if direct_open => {
+                    let Some(msg) = direct else {
+                        direct_open = false;
+                        continue;
+                    };
+                    if ws_sender.send(WsMessage::Text(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                received = broadcast_rx.recv() => {
+                    let Ok(msg) = received else {
+                        break;
+                    };
+                    let visible = {
+                        let subscriptions = send_subscriptions.lock().await;
+                        ws_event_visible_to_connection(&subscriptions, &msg)
+                    };
+                    if !visible {
+                        continue;
+                    }
+                    if ws_sender.send(WsMessage::Text(msg)).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -115,10 +190,18 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                     {
                                         Ok(agent_id) => agent_id,
                                         Err(err) => {
-                                            let _ = ws_broadcast.send(
-                                                WsEvent::error(client_chat_id.clone(), err)
-                                                    .to_json(),
-                                            );
+                                            let _ = direct_tx
+                                                .send(
+                                                    serde_json::json!({
+                                                        "type": "error",
+                                                        "channel": "ws",
+                                                        "client_chat_id": client_chat_id,
+                                                        "chat_id": client_chat_id,
+                                                        "message": err,
+                                                    })
+                                                    .to_string(),
+                                                )
+                                                .await;
                                             continue;
                                         }
                                     }
@@ -127,9 +210,17 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                             };
 
                             let chat_id = assign_session_id(&client_chat_id, &resolved_agent_id);
+                            {
+                                let mut subscriptions = subscriptions.lock().await;
+                                subscriptions.insert(WsSessionScope {
+                                    agent_id: resolved_agent_id.clone(),
+                                    chat_id: chat_id.clone(),
+                                });
+                            }
 
                             let _ = ws_broadcast.send(
                                 WsEvent::SessionBound {
+                                    channel: "ws".to_string(),
                                     client_chat_id: client_chat_id.clone(),
                                     chat_id: chat_id.clone(),
                                     agent_id: resolved_agent_id.clone(),
@@ -160,6 +251,8 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                         // 复用 message_done 事件（前端已支持）
                                         let event = serde_json::json!({
                                             "type": "message_done",
+                                            "channel": "ws",
+                                            "agent_id": resolved_agent_id,
                                             "chat_id": chat_id,
                                             "content": response.content,
                                             "is_markdown": response.is_markdown,
@@ -175,6 +268,8 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                         let _ = ws_broadcast.send(
                                             serde_json::json!({
                                                 "type": "error",
+                                                "channel": "ws",
+                                                "agent_id": resolved_agent_id,
                                                 "chat_id": chat_id,
                                                 "message": format!("权限不足: {}", msg),
                                             })
@@ -186,6 +281,8 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                         let _ = ws_broadcast.send(
                                             serde_json::json!({
                                                 "type": "error",
+                                                "channel": "ws",
+                                                "agent_id": resolved_agent_id,
                                                 "chat_id": chat_id,
                                                 "message": format!("命令执行错误: {}", e),
                                             })
@@ -199,6 +296,8 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                         let _ = ws_broadcast.send(
                                             serde_json::json!({
                                                 "type": "error",
+                                                "channel": "ws",
+                                                "agent_id": resolved_agent_id,
                                                 "chat_id": chat_id,
                                                 "message": "此命令仅在 CLI 模式可用",
                                             })
@@ -292,9 +391,17 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                     {
                                         Ok(agent_id) => with_route_agent_id(inbound, &agent_id),
                                         Err(err) => {
-                                            let _ = ws_broadcast.send(
-                                                WsEvent::error(chat_id.clone(), err).to_json(),
-                                            );
+                                            let _ = direct_tx
+                                                .send(
+                                                    serde_json::json!({
+                                                        "type": "error",
+                                                        "channel": "ws",
+                                                        "chat_id": chat_id,
+                                                        "message": err,
+                                                    })
+                                                    .to_string(),
+                                                )
+                                                .await;
                                             continue;
                                         }
                                     }
@@ -344,4 +451,109 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
 
     send_task.abort();
     info!("WebSocket client disconnected");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn scope(agent_id: &str, chat_id: &str) -> WsSessionScope {
+        WsSessionScope {
+            agent_id: agent_id.to_string(),
+            chat_id: chat_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn ws_event_filter_allows_only_subscribed_session_events() {
+        let subscriptions = HashSet::from([scope("default", "chat-a")]);
+
+        let own = serde_json::json!({
+            "type": "message_done",
+            "channel": "ws",
+            "agent_id": "default",
+            "chat_id": "chat-a",
+            "content": "visible",
+        })
+        .to_string();
+        assert!(ws_event_visible_to_connection(&subscriptions, &own));
+
+        let other_chat = serde_json::json!({
+            "type": "message_done",
+            "channel": "ws",
+            "agent_id": "default",
+            "chat_id": "chat-b",
+            "content": "hidden",
+        })
+        .to_string();
+        assert!(!ws_event_visible_to_connection(&subscriptions, &other_chat));
+
+        let other_agent = serde_json::json!({
+            "type": "message_done",
+            "channel": "ws",
+            "agent_id": "ops",
+            "chat_id": "chat-a",
+            "content": "hidden",
+        })
+        .to_string();
+        assert!(!ws_event_visible_to_connection(
+            &subscriptions,
+            &other_agent
+        ));
+    }
+
+    #[test]
+    fn ws_event_filter_rejects_non_ws_or_unscoped_session_events_even_when_chat_id_matches() {
+        let subscriptions = HashSet::from([scope("default", "chat-a")]);
+
+        let external = serde_json::json!({
+            "type": "token",
+            "channel": "telegram",
+            "agent_id": "default",
+            "chat_id": "chat-a",
+            "delta": "hidden",
+        })
+        .to_string();
+        assert!(!ws_event_visible_to_connection(&subscriptions, &external));
+
+        let missing_channel = serde_json::json!({
+            "type": "token",
+            "agent_id": "default",
+            "chat_id": "chat-a",
+            "delta": "hidden",
+        })
+        .to_string();
+        assert!(!ws_event_visible_to_connection(
+            &subscriptions,
+            &missing_channel
+        ));
+    }
+
+    #[test]
+    fn ws_event_filter_rejects_prebind_error_without_session_subscription() {
+        let subscriptions = HashSet::new();
+        let event = serde_json::json!({
+            "type": "error",
+            "channel": "ws",
+            "client_chat_id": "draft-session",
+            "chat_id": "draft-session",
+            "message": "Unknown agent 'missing'",
+        })
+        .to_string();
+
+        assert!(!ws_event_visible_to_connection(&subscriptions, &event));
+    }
+
+    #[test]
+    fn ws_event_filter_keeps_global_dashboard_refresh_events() {
+        let subscriptions = HashSet::new();
+        let event = serde_json::json!({
+            "type": "skills_updated",
+            "new_skills": ["demo"],
+        })
+        .to_string();
+
+        assert!(ws_event_visible_to_connection(&subscriptions, &event));
+    }
 }

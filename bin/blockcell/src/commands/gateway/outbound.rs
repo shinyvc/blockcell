@@ -3,10 +3,14 @@ use super::*;
 // Outbound → WebSocket broadcast bridge
 // ---------------------------------------------------------------------------
 
-/// Forwards outbound messages from the runtime to all connected WebSocket clients
+/// Dispatches runtime outbound messages to their target non-WebSocket channels.
+///
+/// WebSocket clients receive runtime events through `event_tx`, where each
+/// connection applies its own session filter. Mirroring non-WS outbound traffic
+/// into `ws_broadcast` would leak external-channel conversations to WebUI users.
 pub(super) async fn outbound_to_ws_bridge(
     mut outbound_rx: mpsc::Receiver<blockcell_core::OutboundMessage>,
-    ws_broadcast: broadcast::Sender<String>,
+    _ws_broadcast: broadcast::Sender<String>,
     channel_manager: Arc<ChannelManager>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
@@ -14,25 +18,6 @@ pub(super) async fn outbound_to_ws_bridge(
         tokio::select! {
             msg = outbound_rx.recv() => {
                 let Some(msg) = msg else { break };
-                // Forward to WebSocket clients as a message_done event.
-                // Skip "ws" channel — the runtime already emits events directly via event_tx.
-                // Also skip messages marked skip_ws_echo (e.g. from persist_and_deliver_final_response)
-                // to prevent duplicate message_done events.
-                // Still forward cron, subagent, and other internal channel results to WS clients.
-                if msg.channel != "ws" && !msg.skip_ws_echo {
-                    let event = WsEvent::MessageDone {
-                        chat_id: msg.chat_id.clone(),
-                        task_id: String::new(),
-                        content: msg.content.clone(),
-                    reasoning_content: msg.reasoning_content.clone(),
-                        tool_calls: 0,
-                        duration_ms: 0,
-                        media: msg.media.clone(),
-                    };
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        let _ = ws_broadcast.send(json);
-                    }
-                }
 
                 // Also dispatch to external channels (telegram, slack, etc.)
                 if msg.channel != "ws" && msg.channel != "cli" && msg.channel != "http" {
@@ -46,5 +31,46 @@ pub(super) async fn outbound_to_ws_bridge(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::{broadcast, mpsc};
+
+    #[tokio::test]
+    async fn outbound_bridge_does_not_broadcast_non_ws_messages_to_websocket_clients() {
+        let (outbound_tx, outbound_rx) = mpsc::channel(4);
+        let (ws_broadcast, mut ws_rx) = broadcast::channel(4);
+        let channel_manager = Arc::new(ChannelManager::new(
+            Config::default(),
+            Paths::with_base(std::env::temp_dir().join("blockcell-outbound-bridge-test")),
+            mpsc::channel(1).0,
+        ));
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        let handle = tokio::spawn(outbound_to_ws_bridge(
+            outbound_rx,
+            ws_broadcast,
+            channel_manager,
+            shutdown_rx,
+        ));
+
+        outbound_tx
+            .send(OutboundMessage::new("telegram", "chat-a", "private reply"))
+            .await
+            .expect("outbound bridge should accept test message");
+
+        let leaked = tokio::time::timeout(std::time::Duration::from_millis(50), ws_rx.recv()).await;
+        assert!(
+            leaked.is_err(),
+            "non-ws outbound messages must not be visible to websocket clients"
+        );
+
+        let _ = shutdown_tx.send(());
+        handle
+            .await
+            .expect("outbound bridge task should exit cleanly");
     }
 }

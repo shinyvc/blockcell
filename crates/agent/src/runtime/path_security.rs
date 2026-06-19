@@ -205,6 +205,7 @@ impl super::AgentRuntime {
                 tool_name: tool_name.to_string(),
                 paths: confirm_paths.clone(),
                 response_tx,
+                agent_id: self.agent_id.clone(),
                 channel: msg.channel.clone(),
                 chat_id: msg.chat_id.clone(),
             };
@@ -253,6 +254,7 @@ impl super::AgentRuntime {
                 tool_name: tool_name.to_string(),
                 paths: items,
                 response_tx,
+                agent_id: self.agent_id.clone(),
                 channel: msg.channel.clone(),
                 chat_id: msg.chat_id.clone(),
             };

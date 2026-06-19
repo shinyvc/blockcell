@@ -275,6 +275,8 @@ pub struct ConfirmRequest {
     pub tool_name: String,
     pub paths: Vec<String>,
     pub response_tx: tokio::sync::oneshot::Sender<bool>,
+    /// Agent that owns the originating message.
+    pub agent_id: Option<String>,
     /// The channel the originating message came from (e.g. "ws", "lark", "telegram").
     pub channel: String,
     /// The chat_id of the originating message, used to route the confirmation
@@ -3733,6 +3735,7 @@ impl AgentRuntime {
                     if let Some(ref event_tx) = self.event_tx {
                         let mut event = serde_json::json!({
                             "type": "message_done",
+                            "channel": "ws",
                             "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                             "chat_id": to,
                             "task_id": "",
@@ -3772,6 +3775,7 @@ impl AgentRuntime {
             if let Some(ref event_tx) = self.event_tx {
                 let mut event = serde_json::json!({
                     "type": "message_done",
+                    "channel": msg.channel,
                     "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                     "chat_id": msg.chat_id,
                     "task_id": "",
@@ -3897,6 +3901,7 @@ impl AgentRuntime {
                                     if let Some(ref event_tx) = self.event_tx {
                                         let event = serde_json::json!({
                                             "type": "token",
+                                            "channel": msg.channel,
                                             "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                                             "chat_id": msg.chat_id.clone(),
                                             "delta": delta,
@@ -3909,6 +3914,7 @@ impl AgentRuntime {
                                     if let Some(ref event_tx) = self.event_tx {
                                         let event = serde_json::json!({
                                             "type": "thinking",
+                                            "channel": msg.channel,
                                             "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                                             "chat_id": msg.chat_id.clone(),
                                             "content": delta,
@@ -4016,6 +4022,7 @@ impl AgentRuntime {
                         if let Some(ref event_tx) = self.event_tx {
                             let event = serde_json::json!({
                                 "type": "stream_reset",
+                                "channel": msg.channel,
                                 "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                                 "chat_id": msg.chat_id.clone(),
                             });
@@ -4193,6 +4200,7 @@ impl AgentRuntime {
                         if let Some(ref event_tx) = self.event_tx {
                             let event = serde_json::json!({
                                 "type": "message_done",
+                                "channel": "ws",
                                 "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                                 "chat_id": to,
                                 "task_id": "",
@@ -4286,6 +4294,7 @@ impl AgentRuntime {
                         };
                         let event = serde_json::json!({
                             "type": "message_done",
+                            "channel": msg.channel,
                             "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                             "chat_id": msg.chat_id,
                             "task_id": "",
@@ -4313,6 +4322,7 @@ impl AgentRuntime {
                         let notification_content = format!("⚠️ 压缩失败: {}", error_msg);
                         let event = serde_json::json!({
                             "type": "message_done",
+                            "channel": msg.channel,
                             "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                             "chat_id": msg.chat_id,
                             "task_id": "",
@@ -4408,6 +4418,7 @@ impl AgentRuntime {
                     if let Some(ref event_tx) = self.event_tx {
                         let event = serde_json::json!({
                             "type": "session_renamed",
+                            "channel": msg.channel,
                             "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                             "chat_id": msg.chat_id,
                             "name": new_name,
@@ -5717,6 +5728,7 @@ impl AgentRuntime {
                             if let Some(ref event_tx) = self.event_tx {
                                 let event = serde_json::json!({
                                     "type": "message_done",
+                                    "channel": msg.channel,
                                     "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                                     "chat_id": msg.chat_id,
                                     "task_id": "",
@@ -6552,6 +6564,7 @@ impl AgentRuntime {
         if let Some(ref event_tx) = self.event_tx {
             let event = serde_json::json!({
                 "type": "tool_call_start",
+                "channel": msg.channel,
                 "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                 "chat_id": msg.chat_id,
                 "task_id": "",
@@ -6709,6 +6722,7 @@ impl AgentRuntime {
         if let Some(ref event_tx) = self.event_tx {
             let event = serde_json::json!({
                 "type": "tool_call_result",
+                "channel": msg.channel,
                 "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                 "chat_id": msg.chat_id,
                 "task_id": "",
@@ -6942,6 +6956,7 @@ impl AgentRuntime {
                 if let Some(ref event_tx) = self.event_tx {
                     let mut event = serde_json::json!({
                         "type": "message_done",
+                        "channel": "ws",
                         "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                         "chat_id": to,
                         "task_id": "",
@@ -6972,6 +6987,7 @@ impl AgentRuntime {
             if let Some(ref event_tx) = self.event_tx {
                 let event = serde_json::json!({
                     "type": "message_done",
+                    "channel": msg.channel,
                     "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                     "chat_id": msg.chat_id,
                     "task_id": "",
@@ -7291,6 +7307,7 @@ impl AgentRuntime {
                                         let _ = event_tx.send(
                                             serde_json::json!({
                                                 "type": "message_done",
+                                                "channel": "ws",
                                                 "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                                                 "chat_id": chat_id,
                                                 "task_id": "",
@@ -7387,6 +7404,7 @@ impl AgentRuntime {
                                                 let _ = event_tx.send(
                                                     serde_json::json!({
                                                         "type": "message_done",
+                                                        "channel": msg.channel,
                                                         "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
                                                         "chat_id": msg.chat_id,
                                                         "task_id": task_id,
@@ -7978,6 +7996,7 @@ async fn run_message_task(
     runtime.init_runtime_handle();
     runtime.wire_evolution_deploy_callback();
 
+    let error_channel = msg.channel.clone();
     let error_chat_id = msg.chat_id.clone();
 
     match runtime.process_message(msg).await {
@@ -7995,6 +8014,7 @@ async fn run_message_task(
                 let _ = event_tx.send(
                     serde_json::json!({
                         "type": "error",
+                        "channel": error_channel,
                         "agent_id": agent_id.clone().unwrap_or_else(|| "default".to_string()),
                         "chat_id": error_chat_id,
                         "task_id": task_id.clone(),
@@ -9468,6 +9488,7 @@ async fn deliver_subagent_result_to_origin(
         if let Some(tx) = event_tx {
             let event = serde_json::json!({
                 "type": "message_done",
+                "channel": "ws",
                 "chat_id": origin_chat_id,
                 "content": content,
                 "is_markdown": true,
