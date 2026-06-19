@@ -282,6 +282,9 @@ pub struct ConfirmRequest {
     /// The chat_id of the originating message, used to route the confirmation
     /// prompt back to the correct conversation.
     pub chat_id: String,
+    /// Server-generated id for the originating WebSocket connection, when the
+    /// request came from an interactive WS client.
+    pub ws_connection_id: Option<String>,
 }
 
 /// Truncate a string at a safe char boundary.

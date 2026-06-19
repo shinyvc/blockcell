@@ -13,6 +13,7 @@ struct WsSessionScope {
 
 fn ws_event_visible_to_connection(
     subscriptions: &std::collections::HashSet<WsSessionScope>,
+    connection_id: &str,
     msg: &str,
 ) -> bool {
     let Ok(event) = serde_json::from_str::<serde_json::Value>(msg) else {
@@ -47,10 +48,37 @@ fn ws_event_visible_to_connection(
         .and_then(|v| v.as_str())
         .unwrap_or("default");
 
-    subscriptions.contains(&WsSessionScope {
+    if !subscriptions.contains(&WsSessionScope {
         agent_id: agent_id.to_string(),
         chat_id: chat_id.to_string(),
-    })
+    }) {
+        return false;
+    }
+
+    if let Some(expected_connection_id) = event.get("ws_connection_id").and_then(|v| v.as_str()) {
+        return expected_connection_id == connection_id;
+    }
+
+    true
+}
+
+fn ws_confirm_response_allowed(
+    subscriptions: &std::collections::HashSet<WsSessionScope>,
+    connection_id: &str,
+    pending: &PendingWsConfirmScope,
+) -> bool {
+    let subscribed = subscriptions.contains(&WsSessionScope {
+        agent_id: pending.agent_id.clone(),
+        chat_id: pending.chat_id.clone(),
+    });
+    if !subscribed {
+        return false;
+    }
+
+    match pending.ws_connection_id.as_deref() {
+        Some(expected) => expected == connection_id,
+        None => false,
+    }
 }
 
 pub(super) async fn handle_ws_upgrade(
@@ -100,12 +128,14 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
     let mut broadcast_rx = state.ws_broadcast.subscribe();
     let subscriptions = Arc::new(Mutex::new(std::collections::HashSet::new()));
     let (direct_tx, mut direct_rx) = mpsc::channel::<String>(16);
+    let connection_id = format!("ws_{}", uuid::Uuid::new_v4().simple());
 
     use futures::SinkExt;
     use futures::StreamExt;
 
     // Task: forward broadcast events to this WS client
     let send_subscriptions = Arc::clone(&subscriptions);
+    let send_connection_id = connection_id.clone();
     let send_task = tokio::spawn(async move {
         let mut direct_open = true;
         loop {
@@ -125,7 +155,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                     };
                     let visible = {
                         let subscriptions = send_subscriptions.lock().await;
-                        ws_event_visible_to_connection(&subscriptions, &msg)
+                        ws_event_visible_to_connection(&subscriptions, &send_connection_id, &msg)
                     };
                     if !visible {
                         continue;
@@ -229,7 +259,9 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                             );
 
                             // 斜杠命令拦截：在创建 InboundMessage 之前检查
-                            let mut ws_metadata = serde_json::Value::Null;
+                            let mut ws_metadata = serde_json::json!({
+                                "ws_connection_id": connection_id.clone(),
+                            });
                             if content.starts_with('/') {
                                 let session_key = format!("ws:{}", chat_id);
                                 let ctx = CommandContext::for_websocket(
@@ -318,6 +350,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                         content = transformed_content;
                                         // 标记来源为斜杠命令，runtime 据此验证授权
                                         ws_metadata = serde_json::json!({
+                                            "ws_connection_id": connection_id.clone(),
                                             "source": "slash_command",
                                             "original_command": original_command
                                         });
@@ -358,9 +391,23 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                 .unwrap_or(false);
                             if !request_id.is_empty() {
                                 let mut map = state.pending_confirms.lock().await;
-                                if let Some(tx) = map.remove(&request_id) {
-                                    let _ = tx.send(approved);
-                                    debug!(request_id = %request_id, approved, "Confirm response routed");
+                                let allowed = if let Some(pending) = map.get(&request_id) {
+                                    let subscriptions = subscriptions.lock().await;
+                                    ws_confirm_response_allowed(
+                                        &subscriptions,
+                                        &connection_id,
+                                        &pending.scope,
+                                    )
+                                } else {
+                                    false
+                                };
+                                if allowed {
+                                    if let Some(pending) = map.remove(&request_id) {
+                                        let _ = pending.response_tx.send(approved);
+                                        debug!(request_id = %request_id, approved, "Confirm response routed");
+                                    }
+                                } else {
+                                    warn!(request_id = %request_id, "Rejected unauthorized confirm response");
                                 }
                             }
                         }
@@ -416,6 +463,13 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                         }
                         _ => {
                             // Fallback: treat as plain chat
+                            {
+                                let mut subscriptions = subscriptions.lock().await;
+                                subscriptions.insert(WsSessionScope {
+                                    agent_id: "default".to_string(),
+                                    chat_id: "default".to_string(),
+                                });
+                            }
                             let inbound = InboundMessage {
                                 channel: "ws".to_string(),
                                 account_id: None,
@@ -423,7 +477,9 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                 chat_id: "default".to_string(),
                                 content: text.to_string(),
                                 media: vec![],
-                                metadata: serde_json::Value::Null,
+                                metadata: serde_json::json!({
+                                    "ws_connection_id": connection_id.clone(),
+                                }),
                                 timestamp_ms: chrono::Utc::now().timestamp_millis(),
                             };
                             let _ = inbound_tx.send(inbound).await;
@@ -431,6 +487,13 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                     }
                 } else {
                     // Plain text fallback
+                    {
+                        let mut subscriptions = subscriptions.lock().await;
+                        subscriptions.insert(WsSessionScope {
+                            agent_id: "default".to_string(),
+                            chat_id: "default".to_string(),
+                        });
+                    }
                     let inbound = InboundMessage {
                         channel: "ws".to_string(),
                         account_id: None,
@@ -438,7 +501,9 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                         chat_id: "default".to_string(),
                         content: text.to_string(),
                         media: vec![],
-                        metadata: serde_json::Value::Null,
+                        metadata: serde_json::json!({
+                            "ws_connection_id": connection_id.clone(),
+                        }),
                         timestamp_ms: chrono::Utc::now().timestamp_millis(),
                     };
                     let _ = inbound_tx.send(inbound).await;
@@ -477,7 +542,11 @@ mod tests {
             "content": "visible",
         })
         .to_string();
-        assert!(ws_event_visible_to_connection(&subscriptions, &own));
+        assert!(ws_event_visible_to_connection(
+            &subscriptions,
+            "connection-a",
+            &own
+        ));
 
         let other_chat = serde_json::json!({
             "type": "message_done",
@@ -487,7 +556,11 @@ mod tests {
             "content": "hidden",
         })
         .to_string();
-        assert!(!ws_event_visible_to_connection(&subscriptions, &other_chat));
+        assert!(!ws_event_visible_to_connection(
+            &subscriptions,
+            "connection-a",
+            &other_chat
+        ));
 
         let other_agent = serde_json::json!({
             "type": "message_done",
@@ -499,6 +572,7 @@ mod tests {
         .to_string();
         assert!(!ws_event_visible_to_connection(
             &subscriptions,
+            "connection-a",
             &other_agent
         ));
     }
@@ -515,7 +589,11 @@ mod tests {
             "delta": "hidden",
         })
         .to_string();
-        assert!(!ws_event_visible_to_connection(&subscriptions, &external));
+        assert!(!ws_event_visible_to_connection(
+            &subscriptions,
+            "connection-a",
+            &external
+        ));
 
         let missing_channel = serde_json::json!({
             "type": "token",
@@ -526,6 +604,7 @@ mod tests {
         .to_string();
         assert!(!ws_event_visible_to_connection(
             &subscriptions,
+            "connection-a",
             &missing_channel
         ));
     }
@@ -542,7 +621,11 @@ mod tests {
         })
         .to_string();
 
-        assert!(!ws_event_visible_to_connection(&subscriptions, &event));
+        assert!(!ws_event_visible_to_connection(
+            &subscriptions,
+            "connection-a",
+            &event
+        ));
     }
 
     #[test]
@@ -554,6 +637,76 @@ mod tests {
         })
         .to_string();
 
-        assert!(ws_event_visible_to_connection(&subscriptions, &event));
+        assert!(ws_event_visible_to_connection(
+            &subscriptions,
+            "connection-a",
+            &event
+        ));
+    }
+
+    #[test]
+    fn ws_event_filter_restricts_connection_scoped_confirm_requests() {
+        let subscriptions = HashSet::from([scope("default", "chat-a")]);
+        let event = serde_json::json!({
+            "type": "confirm_request",
+            "channel": "ws",
+            "agent_id": "default",
+            "chat_id": "chat-a",
+            "ws_connection_id": "origin-connection",
+            "request_id": "confirm_123",
+        })
+        .to_string();
+
+        assert!(!ws_event_visible_to_connection(
+            &subscriptions,
+            "other-connection",
+            &event
+        ));
+        assert!(ws_event_visible_to_connection(
+            &subscriptions,
+            "origin-connection",
+            &event
+        ));
+    }
+
+    #[test]
+    fn ws_confirm_response_requires_matching_connection_id() {
+        let subscriptions = HashSet::from([scope("default", "chat-a")]);
+        let pending = PendingWsConfirmScope {
+            agent_id: "default".to_string(),
+            chat_id: "chat-a".to_string(),
+            ws_connection_id: Some("origin-connection".to_string()),
+        };
+
+        assert!(!ws_confirm_response_allowed(
+            &subscriptions,
+            "other-connection",
+            &pending
+        ));
+        assert!(ws_confirm_response_allowed(
+            &subscriptions,
+            "origin-connection",
+            &pending
+        ));
+    }
+
+    #[test]
+    fn ws_confirm_response_rejects_ws_pending_without_connection_id() {
+        let pending = PendingWsConfirmScope {
+            agent_id: "default".to_string(),
+            chat_id: "chat-a".to_string(),
+            ws_connection_id: None,
+        };
+
+        assert!(!ws_confirm_response_allowed(
+            &HashSet::new(),
+            "any-connection",
+            &pending
+        ));
+        assert!(!ws_confirm_response_allowed(
+            &HashSet::from([scope("default", "chat-a")]),
+            "any-connection",
+            &pending
+        ));
     }
 }

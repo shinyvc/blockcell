@@ -208,6 +208,11 @@ impl super::AgentRuntime {
                 agent_id: self.agent_id.clone(),
                 channel: msg.channel.clone(),
                 chat_id: msg.chat_id.clone(),
+                ws_connection_id: msg
+                    .metadata
+                    .get("ws_connection_id")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string()),
             };
 
             if confirm_tx.send(request).await.is_err() {
@@ -257,6 +262,11 @@ impl super::AgentRuntime {
                 agent_id: self.agent_id.clone(),
                 channel: msg.channel.clone(),
                 chat_id: msg.chat_id.clone(),
+                ws_connection_id: msg
+                    .metadata
+                    .get("ws_connection_id")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string()),
             };
             if confirm_tx.send(request).await.is_err() {
                 warn!(

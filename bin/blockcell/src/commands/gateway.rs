@@ -214,7 +214,7 @@ struct GatewayState {
     /// Broadcast channel for streaming events to WebSocket clients
     ws_broadcast: broadcast::Sender<String>,
     /// Pending path-confirmation requests waiting for WebUI user response (keyed by request_id)
-    pending_confirms: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
+    pending_confirms: Arc<Mutex<HashMap<String, PendingWsConfirm>>>,
     /// Pending path-confirmation requests waiting for non-ws channel user reply (keyed by "channel:chat_id")
     #[allow(dead_code)]
     pending_channel_confirms: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
@@ -234,6 +234,22 @@ struct GatewayState {
     evolution_service: Arc<Mutex<EvolutionService>>,
     /// Shared ResponseCache for all agents (for /clear command)
     response_caches: Arc<RwLock<HashMap<String, blockcell_agent::ResponseCache>>>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PendingWsConfirmScope {
+    agent_id: String,
+    chat_id: String,
+    ws_connection_id: Option<String>,
+}
+
+struct PendingWsConfirm {
+    scope: PendingWsConfirmScope,
+    response_tx: tokio::sync::oneshot::Sender<bool>,
+}
+
+fn new_confirm_request_id() -> String {
+    format!("confirm_{}", uuid::Uuid::new_v4().simple())
 }
 
 #[derive(Deserialize, Default)]
@@ -1358,7 +1374,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
 
     // ── Set up path confirmation channel (channel-aware) ──
     // pending_ws_confirms: keyed by request_id, for WebUI (ws) confirmations
-    let pending_ws_confirms: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>> =
+    let pending_ws_confirms: Arc<Mutex<HashMap<String, PendingWsConfirm>>> =
         Arc::new(Mutex::new(HashMap::new()));
     // pending_channel_confirms: keyed by "channel:chat_id", for non-ws channel confirmations
     let pending_channel_confirms: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>> =
@@ -1387,20 +1403,44 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
             };
 
             if req.channel == "ws" {
-                let request_id = format!("confirm_{}", chrono::Utc::now().timestamp_millis());
+                let request_id = new_confirm_request_id();
+                let agent_id = req.agent_id.unwrap_or_else(|| "default".to_string());
+                let chat_id = req.chat_id;
+                let ws_connection_id = req.ws_connection_id;
+                let Some(ws_connection_id) = ws_connection_id else {
+                    warn!(
+                        agent_id = %agent_id,
+                        chat_id = %chat_id,
+                        tool = %req.tool_name,
+                        "Rejecting ws confirmation request without a WebSocket connection binding"
+                    );
+                    let _ = req.response_tx.send(false);
+                    continue;
+                };
                 {
                     let mut map = pending_ws_for_handler.lock().await;
-                    map.insert(request_id.clone(), req.response_tx);
+                    map.insert(
+                        request_id.clone(),
+                        PendingWsConfirm {
+                            scope: PendingWsConfirmScope {
+                                agent_id: agent_id.clone(),
+                                chat_id: chat_id.clone(),
+                                ws_connection_id: Some(ws_connection_id.clone()),
+                            },
+                            response_tx: req.response_tx,
+                        },
+                    );
                 }
-                let event = serde_json::json!({
+                let mut event = serde_json::json!({
                     "type": "confirm_request",
                     "request_id": request_id,
                     "tool_name": req.tool_name,
                     "paths": req.paths,
-                    "agent_id": req.agent_id.as_deref().unwrap_or("default"),
-                    "channel": req.channel,
-                    "chat_id": req.chat_id,
+                    "agent_id": agent_id,
+                    "channel": "ws",
+                    "chat_id": chat_id,
                 });
+                event["ws_connection_id"] = serde_json::json!(ws_connection_id);
                 let _ = ws_broadcast_for_confirm.send(event.to_string());
             } else {
                 let confirm_key = format!("{}:{}", req.channel, req.chat_id);
@@ -2338,6 +2378,19 @@ fn build_webui_cors_layer(config: &Config) -> CorsLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_confirm_request_id_is_random_uuid_not_timestamp() {
+        let first = new_confirm_request_id();
+        let second = new_confirm_request_id();
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("confirm_"));
+        assert_eq!("confirm_".len() + 32, first.len());
+        assert!(first["confirm_".len()..]
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn test_validate_channel_owner_bindings_requires_owner_for_enabled_channel() {
