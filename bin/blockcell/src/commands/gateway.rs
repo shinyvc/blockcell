@@ -43,7 +43,7 @@ use tracing::{debug, error, info, warn};
 use axum::{
     extract::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-        Path as AxumPath, Query, State,
+        DefaultBodyLimit, Path as AxumPath, Query, State,
     },
     http::{header, Request, StatusCode},
     middleware::{self, Next},
@@ -250,6 +250,48 @@ struct PendingWsConfirm {
 
 fn new_confirm_request_id() -> String {
     format!("confirm_{}", uuid::Uuid::new_v4().simple())
+}
+
+fn retain_active_progress_throttle_entries<F>(
+    forwarded: &mut HashMap<String, u8>,
+    mut status_for_task: F,
+) where
+    F: FnMut(&str) -> Option<blockcell_agent::task_manager::TaskStatus>,
+{
+    forwarded.retain(|task_id, _| {
+        status_for_task(task_id)
+            .as_ref()
+            .is_some_and(|status| !blockcell_agent::task_manager::is_terminal_status(status))
+    });
+}
+
+fn update_stage_progress_throttle(
+    forwarded: &mut HashMap<String, u8>,
+    task_id: &str,
+    percent: u8,
+    threshold: u8,
+    task_status: Option<&blockcell_agent::task_manager::TaskStatus>,
+) -> bool {
+    let terminal_or_missing = task_status
+        .map(blockcell_agent::task_manager::is_terminal_status)
+        .unwrap_or(true);
+    if terminal_or_missing {
+        forwarded.remove(task_id);
+        return percent >= 100 && task_status.is_some();
+    }
+
+    let should_forward = match forwarded.get(task_id) {
+        Some(&last) => percent.abs_diff(last) >= threshold,
+        None => true,
+    } || percent >= 100;
+
+    if percent >= 100 {
+        forwarded.remove(task_id);
+    } else if should_forward {
+        forwarded.insert(task_id.to_string(), percent);
+    }
+
+    should_forward
 }
 
 #[derive(Deserialize, Default)]
@@ -1200,9 +1242,27 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         // 节流：记录每个 task_id 上次转发到 channel 的百分比
         // 仅当百分比变化 >= CHANNEL_PROGRESS_THRESHOLD 时才转发
         const CHANNEL_PROGRESS_THRESHOLD: u8 = 20;
+        const THROTTLE_CLEANUP_INTERVAL: u64 = 64;
         let mut last_forwarded_percent: HashMap<String, u8> = HashMap::new();
+        let mut progress_events_seen: u64 = 0;
 
         while let Some(progress) = progress_rx.recv().await {
+            progress_events_seen = progress_events_seen.saturating_add(1);
+            if progress_events_seen % THROTTLE_CLEANUP_INTERVAL == 0
+                && !last_forwarded_percent.is_empty()
+            {
+                let task_ids = last_forwarded_percent.keys().cloned().collect::<Vec<_>>();
+                let mut statuses = HashMap::new();
+                for task_id in task_ids {
+                    if let Some(task) = task_manager_for_progress.get_task(&task_id).await {
+                        statuses.insert(task_id, task.status);
+                    }
+                }
+                retain_active_progress_throttle_entries(&mut last_forwarded_percent, |task_id| {
+                    statuses.get(task_id).cloned()
+                });
+            }
+
             // Convert AgentProgress to WsEvent and broadcast
             let event = match &progress {
                 blockcell_agent::AgentProgress::Delta {
@@ -1242,24 +1302,15 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
                     } else {
                         task_manager_for_progress.get_task(task_id).await
                     };
-                    // ── Channel 进度转发 ──
-                    // 将 Stage 事件转发到任务的 origin_channel（QQ/微信/Telegram 等）
-                    let should_forward = match last_forwarded_percent.get(task_id) {
-                        Some(&last) => percent.abs_diff(last) >= CHANNEL_PROGRESS_THRESHOLD,
-                        None => true, // 首次总是转发
-                    };
-                    // 100% 完成时总是转发，并清理节流记录防止内存泄漏
-                    let should_forward = should_forward || *percent >= 100;
-                    // 完成时清理该 task_id 的节流记录
-                    if *percent >= 100 {
-                        last_forwarded_percent.remove(task_id);
-                    }
+                    let should_forward = update_stage_progress_throttle(
+                        &mut last_forwarded_percent,
+                        task_id,
+                        *percent,
+                        CHANNEL_PROGRESS_THRESHOLD,
+                        task.as_ref().map(|task| &task.status),
+                    );
 
                     if should_forward {
-                        if *percent < 100 {
-                            // 仅在未完成时更新节流记录，完成时已清理
-                            last_forwarded_percent.insert(task_id.clone(), *percent);
-                        }
                         if let Some(task) = task.as_ref() {
                             // 仅转发到非 ws/cli 渠道（空渠道也跳过）
                             if !task.origin_channel.is_empty()
@@ -2197,7 +2248,10 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         .route("/v1/files/content", get(handle_files_content))
         .route("/v1/files/download", get(handle_files_download))
         .route("/v1/files/serve", get(handle_files_serve))
-        .route("/v1/files/upload", post(handle_files_upload))
+        .route(
+            "/v1/files/upload",
+            post(handle_files_upload).layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BODY_BYTES)),
+        )
         .layer(middleware::from_fn_with_state(
             gateway_state.clone(),
             auth_middleware,
@@ -2378,6 +2432,7 @@ fn build_webui_cors_layer(config: &Config) -> CorsLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blockcell_agent::task_manager::TaskStatus;
 
     #[test]
     fn test_confirm_request_id_is_random_uuid_not_timestamp() {
@@ -2390,6 +2445,56 @@ mod tests {
         assert!(first["confirm_".len()..]
             .chars()
             .all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_progress_throttle_cleanup_removes_terminal_or_missing_tasks() {
+        let mut forwarded = HashMap::from([
+            ("running-task".to_string(), 20),
+            ("failed-task".to_string(), 40),
+            ("missing-task".to_string(), 60),
+        ]);
+
+        retain_active_progress_throttle_entries(&mut forwarded, |task_id| match task_id {
+            "running-task" => Some(TaskStatus::Running),
+            "failed-task" => Some(TaskStatus::Failed),
+            _ => None,
+        });
+
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded.get("running-task"), Some(&20));
+    }
+
+    #[test]
+    fn test_stage_progress_throttle_removes_terminal_task_before_100_percent() {
+        let mut forwarded = HashMap::from([("failed-task".to_string(), 40)]);
+
+        let should_forward = update_stage_progress_throttle(
+            &mut forwarded,
+            "failed-task",
+            45,
+            20,
+            Some(&TaskStatus::Failed),
+        );
+
+        assert!(!should_forward);
+        assert!(!forwarded.contains_key("failed-task"));
+    }
+
+    #[test]
+    fn test_stage_progress_throttle_forwards_completed_100_percent_and_cleans() {
+        let mut forwarded = HashMap::from([("done-task".to_string(), 80)]);
+
+        let should_forward = update_stage_progress_throttle(
+            &mut forwarded,
+            "done-task",
+            100,
+            20,
+            Some(&TaskStatus::Completed),
+        );
+
+        assert!(should_forward);
+        assert!(!forwarded.contains_key("done-task"));
     }
 
     #[test]
