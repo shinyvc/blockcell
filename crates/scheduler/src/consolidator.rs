@@ -15,7 +15,7 @@
 
 use blockcell_agent::forked::{
     build_forked_tool_schemas, create_dream_can_use_tool, run_forked_agent, CacheSafeParams,
-    ForkedAgentParams,
+    ForkedAgentParams, ForkedAgentResult,
 };
 use blockcell_agent::memory_event;
 use blockcell_agent::session_metrics::get_dream_circuit_breaker;
@@ -247,6 +247,18 @@ fn apply_successful_dream_state(
     } else {
         tracing::info!("[dream] consolidation produced no changes");
     }
+}
+
+fn validate_dream_agent_result(agent_result: &ForkedAgentResult) -> Result<(), String> {
+    if agent_result.had_tool_error {
+        return Err("Forked Agent 工具调用失败 (had_tool_error=true)".to_string());
+    }
+
+    if agent_result.truncated {
+        return Err("Forked Agent reached max_turns before finishing (truncated=true)".to_string());
+    }
+
+    Ok(())
 }
 
 /// 收集到的信号
@@ -1203,20 +1215,20 @@ impl DreamConsolidator {
 
         match result {
             Ok(agent_result) => {
-                // 检查工具调用失败：与 Auto Memory / Session Memory 保持一致
-                // had_tool_error 为 true 时不应视为 consolidation 成功
-                if agent_result.had_tool_error {
+                // 检查工具调用失败和 max_turns 截断：二者都不应视为 consolidation 成功。
+                if let Err(reason) = validate_dream_agent_result(&agent_result) {
                     // 熔断器记录失败
                     cb.record_failure();
 
                     tracing::error!(
                         session_ids = ?agent_result.files_modified,
                         response = ?agent_result.final_content,
-                        "[dream] Forked Agent 工具调用失败，consolidation 标记为失败"
+                        truncated = agent_result.truncated,
+                        had_tool_error = agent_result.had_tool_error,
+                        reason = %reason,
+                        "[dream] Forked Agent did not complete consolidation"
                     );
-                    return Err(DreamError::ConsolidationFailed(
-                        "Forked Agent 工具调用失败 (had_tool_error=true)".to_string(),
-                    ));
+                    return Err(DreamError::ConsolidationFailed(reason));
                 }
 
                 // 熔断器记录成功
@@ -1858,6 +1870,36 @@ mod tests {
         assert_eq!(state.last_consolidation_time, Some(99));
         assert_eq!(state.last_session_count, 10);
         assert_eq!(state.consolidation_count, 4);
+    }
+
+    #[test]
+    fn test_truncated_forked_agent_result_is_consolidation_failure() {
+        let agent_result = blockcell_agent::forked::ForkedAgentResult {
+            messages: vec![],
+            total_usage: blockcell_core::UsageMetrics::default(),
+            files_modified: vec![],
+            final_content: Some("still working".to_string()),
+            truncated: true,
+            had_tool_error: false,
+        };
+
+        let err = validate_dream_agent_result(&agent_result).expect_err("truncated must fail");
+
+        assert!(err.contains("truncated"));
+    }
+
+    #[test]
+    fn test_completed_forked_agent_result_is_consolidation_success() {
+        let agent_result = blockcell_agent::forked::ForkedAgentResult {
+            messages: vec![],
+            total_usage: blockcell_core::UsageMetrics::default(),
+            files_modified: vec![],
+            final_content: Some("done".to_string()),
+            truncated: false,
+            had_tool_error: false,
+        };
+
+        assert!(validate_dream_agent_result(&agent_result).is_ok());
     }
 
     #[tokio::test]
