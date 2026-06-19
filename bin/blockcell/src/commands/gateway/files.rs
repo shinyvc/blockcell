@@ -3,6 +3,109 @@ use super::*;
 // P2: File management endpoints
 // ---------------------------------------------------------------------------
 
+pub(super) const MAX_FILE_CONTENT_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_FILE_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_FILE_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+pub(super) const MAX_FILE_UPLOAD_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+fn file_size_within_limit(size: u64, limit: u64) -> bool {
+    size <= limit
+}
+
+fn utf8_upload_within_limit(content: &str, limit: usize) -> bool {
+    content.len() <= limit
+}
+
+fn base64_upload_within_decoded_limit(content: &str, limit: usize) -> bool {
+    let normalized_len = content.chars().filter(|ch| !ch.is_whitespace()).count();
+    let padding = content
+        .chars()
+        .rev()
+        .take_while(|ch| *ch == '=')
+        .count()
+        .min(2);
+    let decoded_upper_bound = normalized_len.div_ceil(4).saturating_mul(3);
+    decoded_upper_bound.saturating_sub(padding) <= limit
+}
+
+async fn reject_if_file_too_large(path: &std::path::Path, limit: u64) -> Option<Response> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if !file_size_within_limit(meta.len(), limit) => Some(
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("File too large: maximum {} bytes", limit),
+            )
+                .into_response(),
+        ),
+        Ok(_) => None,
+        Err(e) => Some(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Metadata error: {}", e),
+            )
+                .into_response(),
+        ),
+    }
+}
+
+fn payload_too_large_response(limit: u64) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!("File too large: maximum {} bytes", limit),
+    )
+        .into_response()
+}
+
+fn bounded_file_response_bytes(bytes: Vec<u8>, limit: u64) -> Result<Vec<u8>, Response> {
+    if file_size_within_limit(bytes.len() as u64, limit) {
+        Ok(bytes)
+    } else {
+        Err(payload_too_large_response(limit))
+    }
+}
+
+fn bounded_file_response_string(content: String, limit: u64) -> Result<String, Response> {
+    if file_size_within_limit(content.len() as u64, limit) {
+        Ok(content)
+    } else {
+        Err(payload_too_large_response(limit))
+    }
+}
+
+async fn read_file_bytes_limited(path: &std::path::Path, limit: u64) -> Result<Vec<u8>, Response> {
+    use tokio::io::AsyncReadExt;
+
+    let file = tokio::fs::File::open(path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Read error: {}", e),
+        )
+            .into_response()
+    })?;
+    let mut reader = file.take(limit.saturating_add(1));
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Read error: {}", e),
+        )
+            .into_response()
+    })?;
+    bounded_file_response_bytes(bytes, limit)
+}
+
+async fn read_file_string_limited(path: &std::path::Path, limit: u64) -> Result<String, Response> {
+    let bytes = read_file_bytes_limited(path, limit).await?;
+    let content = String::from_utf8(bytes).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Read error: {}", e),
+        )
+            .into_response()
+    })?;
+    bounded_file_response_string(content, limit)
+}
+
 #[derive(Deserialize)]
 pub(super) struct FileListQuery {
     #[serde(default = "default_file_path")]
@@ -166,6 +269,9 @@ pub(super) async fn handle_files_content(
     if !target.is_file() {
         return (StatusCode::NOT_FOUND, "Not a file").into_response();
     }
+    if let Some(response) = reject_if_file_too_large(&target, MAX_FILE_CONTENT_BYTES).await {
+        return response;
+    }
 
     let ext = target
         .extension()
@@ -223,7 +329,7 @@ pub(super) async fn handle_files_content(
     };
 
     if is_binary {
-        match tokio::fs::read(&target).await {
+        match read_file_bytes_limited(&target, MAX_FILE_CONTENT_BYTES).await {
             Ok(bytes) => {
                 use base64::Engine;
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -236,14 +342,10 @@ pub(super) async fn handle_files_content(
                 }))
                 .into_response()
             }
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Read error: {}", e),
-            )
-                .into_response(),
+            Err(response) => response,
         }
     } else {
-        match tokio::fs::read_to_string(&target).await {
+        match read_file_string_limited(&target, MAX_FILE_CONTENT_BYTES).await {
             Ok(content) => Json(serde_json::json!({
                 "path": params.path,
                 "encoding": "utf-8",
@@ -252,11 +354,7 @@ pub(super) async fn handle_files_content(
                 "content": content,
             }))
             .into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Read error: {}", e),
-            )
-                .into_response(),
+            Err(response) => response,
         }
     }
 }
@@ -283,8 +381,11 @@ pub(super) async fn handle_files_download(
     if !canonical.starts_with(&ws_canonical) {
         return (StatusCode::FORBIDDEN, "Access denied").into_response();
     }
+    if let Some(response) = reject_if_file_too_large(&target, MAX_FILE_RESPONSE_BYTES).await {
+        return response;
+    }
 
-    match tokio::fs::read(&target).await {
+    match read_file_bytes_limited(&target, MAX_FILE_RESPONSE_BYTES).await {
         Ok(bytes) => {
             let filename = target
                 .file_name()
@@ -299,11 +400,7 @@ pub(super) async fn handle_files_download(
             ];
             (headers, bytes).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Read error: {}", e),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -349,6 +446,9 @@ pub(super) async fn handle_files_serve(
         return (StatusCode::NOT_FOUND, "Not a file").into_response();
     }
     let target = canonical.clone();
+    if let Some(response) = reject_if_file_too_large(&target, MAX_FILE_RESPONSE_BYTES).await {
+        return response;
+    }
 
     let ext = target
         .extension()
@@ -385,7 +485,7 @@ pub(super) async fn handle_files_serve(
         _ => "application/octet-stream",
     };
 
-    match tokio::fs::read(&target).await {
+    match read_file_bytes_limited(&target, MAX_FILE_RESPONSE_BYTES).await {
         Ok(bytes) => {
             let headers = [
                 (header::CONTENT_TYPE, content_type.to_string()),
@@ -393,11 +493,7 @@ pub(super) async fn handle_files_serve(
             ];
             (headers, bytes).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Read error: {}", e),
-        )
-            .into_response(),
+        Err(response) => response,
     }
 }
 
@@ -406,10 +502,16 @@ pub(super) async fn handle_files_upload(
     State(state): State<GatewayState>,
     Query(agent): Query<AgentScopedQuery>,
     Json(req): Json<serde_json::Value>,
-) -> impl IntoResponse {
+) -> Response {
     let agent_id = match resolve_requested_agent_id(&state.config, agent.agent.as_deref()) {
         Ok(agent_id) => agent_id,
-        Err(err) => return Json(serde_json::json!({ "error": err })),
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response()
+        }
     };
     let path = req.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let content = req.get("content").and_then(|v| v.as_str()).unwrap_or("");
@@ -420,8 +522,29 @@ pub(super) async fn handle_files_upload(
 
     let rel = match validate_workspace_relative_path(path) {
         Ok(p) => p,
-        Err(e) => return Json(serde_json::json!({ "error": e })),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response()
+        }
     };
+
+    let upload_within_limit = if encoding == "base64" {
+        base64_upload_within_decoded_limit(content, MAX_FILE_UPLOAD_BYTES)
+    } else {
+        utf8_upload_within_limit(content, MAX_FILE_UPLOAD_BYTES)
+    };
+    if !upload_within_limit {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!("Upload too large: maximum {} bytes", MAX_FILE_UPLOAD_BYTES)
+            })),
+        )
+            .into_response();
+    }
 
     let workspace = state.paths.for_agent(&agent_id).workspace();
     let target = workspace.join(&rel);
@@ -450,8 +573,72 @@ pub(super) async fn handle_files_upload(
     .await;
 
     match result {
-        Ok(Ok(_)) => Json(serde_json::json!({ "status": "uploaded", "path": path_echo })),
-        Ok(Err(e)) => Json(serde_json::json!({ "error": e })),
-        Err(e) => Json(serde_json::json!({ "error": format!("{}", e) })),
+        Ok(Ok(_)) => {
+            Json(serde_json::json!({ "status": "uploaded", "path": path_echo })).into_response()
+        }
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("{}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_size_limit_rejects_values_above_limit() {
+        assert!(file_size_within_limit(
+            MAX_FILE_CONTENT_BYTES,
+            MAX_FILE_CONTENT_BYTES
+        ));
+        assert!(!file_size_within_limit(
+            MAX_FILE_CONTENT_BYTES + 1,
+            MAX_FILE_CONTENT_BYTES
+        ));
+    }
+
+    #[test]
+    fn base64_upload_size_estimate_rejects_decoded_payload_above_limit() {
+        assert!(base64_upload_within_decoded_limit("YWJj", 3));
+        assert!(!base64_upload_within_decoded_limit("YWJj", 2));
+    }
+
+    #[test]
+    fn utf8_upload_size_rejects_payload_above_limit() {
+        assert!(utf8_upload_within_limit("abcd", 4));
+        assert!(!utf8_upload_within_limit("abcd", 3));
+    }
+
+    #[test]
+    fn bounded_file_response_rejects_bytes_read_after_metadata_check_limit() {
+        let result = bounded_file_response_bytes(vec![0; 5], 4);
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_file_bytes_limited_stops_after_limit_and_rejects() {
+        let dir = std::env::temp_dir().join(format!(
+            "blockcell-file-limit-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create temp dir");
+        let path = dir.join("large.txt");
+        tokio::fs::write(&path, b"12345").await.expect("write file");
+
+        let result = read_file_bytes_limited(&path, 4).await;
+
+        assert!(result.is_err());
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
