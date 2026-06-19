@@ -11,6 +11,69 @@ struct WsSessionScope {
     chat_id: String,
 }
 
+const MAX_WS_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_WS_MESSAGES_PER_WINDOW: usize = 60;
+const WS_RATE_LIMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn ws_inbound_message_size(msg: &WsMessage) -> usize {
+    match msg {
+        WsMessage::Text(text) => text.len(),
+        WsMessage::Binary(bytes) | WsMessage::Ping(bytes) | WsMessage::Pong(bytes) => bytes.len(),
+        WsMessage::Close(_) => 0,
+    }
+}
+
+fn ws_inbound_message_within_size_limit(msg: &WsMessage) -> bool {
+    ws_inbound_message_size(msg) <= MAX_WS_MESSAGE_BYTES
+}
+
+fn ws_inbound_message_allowed(
+    msg: &WsMessage,
+    limiter: &mut WsRateLimiter,
+    now: std::time::Instant,
+) -> bool {
+    if !ws_inbound_message_within_size_limit(msg) {
+        return false;
+    }
+    if matches!(msg, WsMessage::Close(_)) {
+        return true;
+    }
+    limiter.allow(now)
+}
+
+struct WsRateLimiter {
+    capacity: usize,
+    window: std::time::Duration,
+    seen_at: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl WsRateLimiter {
+    fn new(capacity: usize, window: std::time::Duration) -> Self {
+        Self {
+            capacity,
+            window,
+            seen_at: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn allow(&mut self, now: std::time::Instant) -> bool {
+        while self
+            .seen_at
+            .front()
+            .is_some_and(|seen| now.duration_since(*seen) >= self.window)
+        {
+            self.seen_at.pop_front();
+        }
+
+        if self.seen_at.len() >= self.capacity {
+            return false;
+        }
+
+        self.seen_at.push_back(now);
+        true
+    }
+}
+
 fn ws_event_visible_to_connection(
     subscriptions: &std::collections::HashSet<WsSessionScope>,
     connection_id: &str,
@@ -106,19 +169,21 @@ pub(super) async fn handle_ws_upgrade(
         _ => true, // no token configured → open access
     };
 
-    ws.on_upgrade(move |socket| async move {
-        if !token_valid {
-            let mut socket = socket;
-            let _ = socket
-                .send(WsMessage::Close(Some(axum::extract::ws::CloseFrame {
-                    code: 4401,
-                    reason: std::borrow::Cow::Borrowed("Unauthorized"),
-                })))
-                .await;
-            return;
-        }
-        handle_ws_connection(socket, state).await;
-    })
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            if !token_valid {
+                let mut socket = socket;
+                let _ = socket
+                    .send(WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                        code: 4401,
+                        reason: std::borrow::Cow::Borrowed("Unauthorized"),
+                    })))
+                    .await;
+                return;
+            }
+            handle_ws_connection(socket, state).await;
+        })
 }
 
 pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState) {
@@ -171,6 +236,7 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
     // Task: receive messages from this WS client
     let inbound_tx = state.inbound_tx.clone();
     let ws_broadcast = state.ws_broadcast.clone();
+    let mut rate_limiter = WsRateLimiter::new(MAX_WS_MESSAGES_PER_WINDOW, WS_RATE_LIMIT_WINDOW);
 
     while let Some(msg) = ws_receiver.next().await {
         let msg = match msg {
@@ -180,6 +246,19 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                 break;
             }
         };
+
+        if !ws_inbound_message_within_size_limit(&msg) {
+            warn!(
+                bytes = ws_inbound_message_size(&msg),
+                limit = MAX_WS_MESSAGE_BYTES,
+                "Closing WebSocket connection after oversized inbound message"
+            );
+            break;
+        }
+        if !matches!(msg, WsMessage::Close(_)) && !rate_limiter.allow(std::time::Instant::now()) {
+            warn!("Closing WebSocket connection after rate limit exceeded");
+            break;
+        }
 
         match msg {
             WsMessage::Text(text) => {
@@ -707,6 +786,51 @@ mod tests {
             &HashSet::from([scope("default", "chat-a")]),
             "any-connection",
             &pending
+        ));
+    }
+
+    #[test]
+    fn ws_message_size_limit_rejects_oversized_text() {
+        assert!(ws_inbound_message_within_size_limit(&WsMessage::Text(
+            "a".repeat(MAX_WS_MESSAGE_BYTES)
+        )));
+        assert!(!ws_inbound_message_within_size_limit(&WsMessage::Text(
+            "a".repeat(MAX_WS_MESSAGE_BYTES + 1)
+        )));
+    }
+
+    #[test]
+    fn ws_message_size_limit_rejects_oversized_binary() {
+        assert!(ws_inbound_message_within_size_limit(&WsMessage::Binary(
+            vec![0; MAX_WS_MESSAGE_BYTES]
+        )));
+        assert!(!ws_inbound_message_within_size_limit(&WsMessage::Binary(
+            vec![0; MAX_WS_MESSAGE_BYTES + 1]
+        )));
+    }
+
+    #[test]
+    fn ws_rate_limiter_rejects_burst_above_capacity() {
+        let mut limiter = WsRateLimiter::new(2, std::time::Duration::from_secs(60));
+
+        assert!(limiter.allow(std::time::Instant::now()));
+        assert!(limiter.allow(std::time::Instant::now()));
+        assert!(!limiter.allow(std::time::Instant::now()));
+    }
+
+    #[test]
+    fn ws_rate_limiter_applies_to_non_text_messages() {
+        let mut limiter = WsRateLimiter::new(1, std::time::Duration::from_secs(60));
+
+        assert!(ws_inbound_message_allowed(
+            &WsMessage::Ping(vec![]),
+            &mut limiter,
+            std::time::Instant::now()
+        ));
+        assert!(!ws_inbound_message_allowed(
+            &WsMessage::Ping(vec![]),
+            &mut limiter,
+            std::time::Instant::now()
         ));
     }
 }
