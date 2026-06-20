@@ -22,6 +22,8 @@ use blockcell_agent::session_metrics::get_dream_circuit_breaker;
 use blockcell_agent::CrossProcessLock;
 use blockcell_core::types::ChatMessage;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -32,6 +34,8 @@ pub const TIME_GATE_THRESHOLD_HOURS: u64 = 24;
 pub const SESSION_GATE_THRESHOLD: usize = 5;
 pub const LOCK_FILE_NAME: &str = ".dream_lock";
 pub const DREAM_STATE_FILE: &str = ".dream_state.json";
+const DREAM_COMMIT_BACKUP_DIR: &str = ".dream_commit_backup";
+const DREAM_COMMIT_MANIFEST_FILE: &str = "manifest.json";
 
 /// Session Memory 过期阈值（天）
 pub const SESSION_MEMORY_EXPIRY_DAYS: u64 = 7;
@@ -62,19 +66,6 @@ impl DreamStats {
     fn has_memory_changes(&self) -> bool {
         self.memories_created > 0 || self.memories_updated > 0 || self.memories_deleted > 0
     }
-}
-
-/// Memory 目录状态快照
-#[derive(Debug, Clone, Default)]
-struct MemoryDirState {
-    /// 文件数量 (保留用于未来日志/指标)
-    #[allow(dead_code)]
-    file_count: usize,
-    /// 总字节数 (保留用于未来日志/指标)
-    #[allow(dead_code)]
-    total_bytes: u64,
-    /// 文件名 -> 修改时间映射
-    file_mtimes: std::collections::HashMap<String, u64>,
 }
 
 /// 梦境状态
@@ -261,6 +252,618 @@ fn validate_dream_agent_result(agent_result: &ForkedAgentResult) -> Result<(), S
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct DreamStagingRun {
+    root: PathBuf,
+    memory_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MemoryTreeSnapshot {
+    files: HashMap<PathBuf, FileFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    hash: u64,
+}
+
+#[derive(Debug, Clone)]
+struct StagedMemoryChange {
+    rel_path: PathBuf,
+    staged_path: PathBuf,
+    real_path: PathBuf,
+    existed_before: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DreamCommitManifest {
+    changes: Vec<DreamCommitManifestChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DreamCommitManifestChange {
+    rel_path: PathBuf,
+    existed_before: bool,
+}
+
+#[derive(Debug)]
+struct StagedMemoryCommit {
+    stats: DreamStats,
+    changes: Vec<StagedMemoryChange>,
+    backup_root: Option<PathBuf>,
+}
+
+impl StagedMemoryCommit {
+    async fn finalize(mut self) {
+        if let Some(backup_root) = self.backup_root.take() {
+            cleanup_commit_backup(&backup_root).await;
+        }
+    }
+
+    async fn rollback(mut self) -> Result<(), DreamError> {
+        let Some(backup_root) = self.backup_root.take() else {
+            return Ok(());
+        };
+
+        let result = rollback_staged_memory_changes(&self.changes, &backup_root).await;
+        cleanup_commit_backup(&backup_root).await;
+        result
+    }
+}
+
+fn fingerprint_bytes(bytes: &[u8]) -> FileFingerprint {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    FileFingerprint {
+        len: bytes.len() as u64,
+        hash: hasher.finish(),
+    }
+}
+
+fn is_markdown_memory_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "md")
+}
+
+fn should_commit_staged_file(rel_path: &Path) -> bool {
+    if rel_path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return false;
+    }
+
+    if rel_path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|part| part.starts_with(".dream_") || part.ends_with(".tmp"))
+    }) {
+        return false;
+    }
+
+    is_markdown_memory_file(rel_path)
+}
+
+fn collect_memory_files_sync(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    if !current.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::other(format!(
+                "symlink is not allowed in dream memory staging: {}",
+                path.display()
+            )));
+        }
+        if metadata.is_dir() {
+            collect_memory_files_sync(root, &path, files)?;
+        } else if metadata.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            files.push(rel.to_path_buf());
+        }
+    }
+
+    Ok(())
+}
+
+async fn snapshot_memory_tree(root: &Path) -> Result<MemoryTreeSnapshot, DreamError> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<MemoryTreeSnapshot, std::io::Error> {
+        let mut rel_files = Vec::new();
+        collect_memory_files_sync(&root, &root, &mut rel_files)?;
+
+        let mut files = HashMap::new();
+        for rel_path in rel_files {
+            let path = root.join(&rel_path);
+            let bytes = std::fs::read(&path)?;
+            files.insert(rel_path, fingerprint_bytes(&bytes));
+        }
+
+        Ok(MemoryTreeSnapshot { files })
+    })
+    .await
+    .map_err(|e| DreamError::Io(std::io::Error::other(e.to_string())))?
+    .map_err(DreamError::Io)
+}
+
+fn copy_memory_tree_sync(source: &Path, dest: &Path) -> std::io::Result<()> {
+    if !source.exists() {
+        std::fs::create_dir_all(dest)?;
+        return Ok(());
+    }
+
+    let mut rel_files = Vec::new();
+    collect_memory_files_sync(source, source, &mut rel_files)?;
+    for rel_path in rel_files {
+        let source_path = source.join(&rel_path);
+        let dest_path = dest.join(&rel_path);
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(source_path, dest_path)?;
+    }
+    Ok(())
+}
+
+async fn prepare_dream_staging(
+    config_dir: &Path,
+    real_memory_dir: &Path,
+) -> Result<DreamStagingRun, DreamError> {
+    let root = config_dir
+        .join(".dream_staging")
+        .join(format!("run_{}", uuid::Uuid::new_v4().simple()));
+    let memory_dir = root.join("memory");
+    let real_memory_dir = real_memory_dir.to_path_buf();
+    let memory_dir_for_copy = memory_dir.clone();
+
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        if root.exists() {
+            std::fs::remove_dir_all(&root)?;
+        }
+        std::fs::create_dir_all(&memory_dir_for_copy)?;
+        copy_memory_tree_sync(&real_memory_dir, &memory_dir_for_copy)
+    })
+    .await
+    .map_err(|e| DreamError::Io(std::io::Error::other(e.to_string())))?
+    .map_err(DreamError::Io)?;
+
+    Ok(DreamStagingRun {
+        root: memory_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| config_dir.join(".dream_staging")),
+        memory_dir,
+    })
+}
+
+async fn validate_staged_memory(staging_memory_dir: &Path) -> Result<(), DreamError> {
+    let staging_memory_dir = staging_memory_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        let mut rel_files = Vec::new();
+        collect_memory_files_sync(&staging_memory_dir, &staging_memory_dir, &mut rel_files)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| DreamError::Io(std::io::Error::other(e.to_string())))?
+    .map_err(DreamError::Io)
+}
+
+fn changed_staged_paths<'a>(
+    pre: &'a MemoryTreeSnapshot,
+    post: &'a MemoryTreeSnapshot,
+) -> impl Iterator<Item = &'a PathBuf> {
+    post.files
+        .iter()
+        .filter_map(|(rel_path, post_fingerprint)| {
+            (pre.files.get(rel_path) != Some(post_fingerprint)).then_some(rel_path)
+        })
+}
+
+fn deleted_staged_paths<'a>(
+    pre: &'a MemoryTreeSnapshot,
+    post: &'a MemoryTreeSnapshot,
+) -> impl Iterator<Item = &'a PathBuf> {
+    pre.files
+        .keys()
+        .filter(|rel_path| !post.files.contains_key(*rel_path))
+}
+
+#[cfg(test)]
+async fn commit_staged_memory(
+    real_memory_dir: &Path,
+    pre: &MemoryTreeSnapshot,
+    staging_memory_dir: &Path,
+) -> Result<DreamStats, DreamError> {
+    let commit = commit_staged_memory_transaction(real_memory_dir, pre, staging_memory_dir).await?;
+    let stats = commit.stats.clone();
+    commit.finalize().await;
+    Ok(stats)
+}
+
+async fn commit_staged_memory_transaction(
+    real_memory_dir: &Path,
+    pre: &MemoryTreeSnapshot,
+    staging_memory_dir: &Path,
+) -> Result<StagedMemoryCommit, DreamError> {
+    commit_staged_memory_inner(real_memory_dir, pre, staging_memory_dir, None).await
+}
+
+#[cfg(test)]
+async fn commit_staged_memory_with_injected_write_failure_for_test(
+    real_memory_dir: &Path,
+    pre: &MemoryTreeSnapshot,
+    staging_memory_dir: &Path,
+    fail_rel_path: &Path,
+) -> Result<DreamStats, DreamError> {
+    let commit = commit_staged_memory_inner(
+        real_memory_dir,
+        pre,
+        staging_memory_dir,
+        Some(fail_rel_path),
+    )
+    .await?;
+    let stats = commit.stats.clone();
+    commit.finalize().await;
+    Ok(stats)
+}
+
+async fn commit_staged_memory_inner(
+    real_memory_dir: &Path,
+    pre: &MemoryTreeSnapshot,
+    staging_memory_dir: &Path,
+    fail_rel_path: Option<&Path>,
+) -> Result<StagedMemoryCommit, DreamError> {
+    validate_staged_memory(staging_memory_dir).await?;
+    let post = snapshot_memory_tree(staging_memory_dir).await?;
+    let current = snapshot_memory_tree(real_memory_dir).await?;
+
+    let mut changes = Vec::new();
+    let mut candidate_paths: HashSet<PathBuf> = HashSet::new();
+    for rel_path in changed_staged_paths(pre, &post) {
+        if !should_commit_staged_file(rel_path) {
+            return Err(DreamError::ConsolidationFailed(format!(
+                "unsupported file changed in dream staging: {}",
+                rel_path.display()
+            )));
+        }
+    }
+    for rel_path in deleted_staged_paths(pre, &post) {
+        if !should_commit_staged_file(rel_path) {
+            return Err(DreamError::ConsolidationFailed(format!(
+                "unsupported file deleted in dream staging: {}",
+                rel_path.display()
+            )));
+        }
+    }
+
+    for rel_path in changed_staged_paths(pre, &post) {
+        if should_commit_staged_file(rel_path) {
+            candidate_paths.insert(rel_path.clone());
+        }
+    }
+
+    for rel_path in pre.files.keys() {
+        if should_commit_staged_file(rel_path) && !post.files.contains_key(rel_path) {
+            return Err(DreamError::ConsolidationFailed(format!(
+                "Dream staging attempted to delete memory file {}; deletion is not enabled",
+                rel_path.display()
+            )));
+        }
+    }
+
+    for rel_path in candidate_paths {
+        let post_fingerprint = post.files.get(&rel_path);
+        let pre_fingerprint = pre.files.get(&rel_path);
+        if post_fingerprint == pre_fingerprint {
+            continue;
+        }
+
+        if current.files.get(&rel_path) != pre_fingerprint {
+            return Err(DreamError::ConsolidationFailed(format!(
+                "memory file {} changed during dream staging",
+                rel_path.display()
+            )));
+        }
+
+        changes.push(StagedMemoryChange {
+            staged_path: staging_memory_dir.join(&rel_path),
+            real_path: real_memory_dir.join(&rel_path),
+            existed_before: pre_fingerprint.is_some(),
+            rel_path,
+        });
+    }
+    changes.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+
+    if changes.is_empty() {
+        return Ok(StagedMemoryCommit {
+            stats: DreamStats::default(),
+            changes,
+            backup_root: None,
+        });
+    }
+
+    let backup_root = backup_real_memory_for_changes(real_memory_dir, &changes).await?;
+    let mut rollback_changes = Vec::new();
+
+    for change in &changes {
+        rollback_changes.push(change.clone());
+        let write_result = async {
+            if fail_rel_path.is_some_and(|fail_path| fail_path == change.rel_path.as_path()) {
+                return Err(DreamError::Io(std::io::Error::other(
+                    "injected write failure",
+                )));
+            }
+
+            let bytes = tokio::fs::read(&change.staged_path)
+                .await
+                .map_err(DreamError::Io)?;
+            if let Some(parent) = change.real_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(DreamError::Io)?;
+            }
+
+            atomic_write_memory_file(&change.real_path, bytes).await
+        }
+        .await;
+
+        if let Err(write_err) = write_result {
+            let rollback_result =
+                rollback_staged_memory_changes(&rollback_changes, &backup_root).await;
+            cleanup_commit_backup(&backup_root).await;
+
+            let mut message = format!(
+                "dream staging commit failed while writing {}: {}",
+                change.rel_path.display(),
+                write_err
+            );
+            if let Err(rollback_err) = rollback_result {
+                message.push_str(&format!("; rollback failed: {}", rollback_err));
+            }
+            return Err(DreamError::ConsolidationFailed(message));
+        }
+    }
+
+    let created = changes
+        .iter()
+        .filter(|change| !change.existed_before)
+        .count();
+    let updated = changes
+        .iter()
+        .filter(|change| change.existed_before)
+        .count();
+
+    Ok(StagedMemoryCommit {
+        stats: DreamStats {
+            memories_created: created,
+            memories_updated: updated,
+            memories_deleted: 0,
+            ..Default::default()
+        },
+        changes,
+        backup_root: Some(backup_root),
+    })
+}
+
+async fn atomic_write_memory_file(path: &Path, bytes: Vec<u8>) -> Result<(), DreamError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || blockcell_agent::fs_util::atomic_write(&path, &bytes))
+        .await
+        .map_err(|e| DreamError::Io(std::io::Error::other(e.to_string())))?
+        .map_err(DreamError::Io)
+}
+
+async fn backup_real_memory_for_changes(
+    real_memory_dir: &Path,
+    changes: &[StagedMemoryChange],
+) -> Result<PathBuf, DreamError> {
+    let backup_root = real_memory_dir
+        .parent()
+        .unwrap_or(real_memory_dir)
+        .join(DREAM_COMMIT_BACKUP_DIR)
+        .join(format!("run_{}", uuid::Uuid::new_v4().simple()));
+
+    tokio::fs::create_dir_all(&backup_root)
+        .await
+        .map_err(DreamError::Io)?;
+
+    for change in changes {
+        if !change.existed_before {
+            continue;
+        }
+
+        let backup_path = backup_root.join(&change.rel_path);
+        if let Some(parent) = backup_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(DreamError::Io)?;
+        }
+        tokio::fs::copy(&change.real_path, &backup_path)
+            .await
+            .map_err(DreamError::Io)?;
+    }
+
+    write_commit_manifest(&backup_root, changes).await?;
+
+    Ok(backup_root)
+}
+
+async fn write_commit_manifest(
+    backup_root: &Path,
+    changes: &[StagedMemoryChange],
+) -> Result<(), DreamError> {
+    let manifest = DreamCommitManifest {
+        changes: changes
+            .iter()
+            .map(|change| DreamCommitManifestChange {
+                rel_path: change.rel_path.clone(),
+                existed_before: change.existed_before,
+            })
+            .collect(),
+    };
+    let bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| DreamError::Io(std::io::Error::other(e.to_string())))?;
+    atomic_write_memory_file(&backup_root.join(DREAM_COMMIT_MANIFEST_FILE), bytes).await
+}
+
+async fn read_commit_manifest(backup_root: &Path) -> Result<DreamCommitManifest, DreamError> {
+    let bytes = tokio::fs::read(backup_root.join(DREAM_COMMIT_MANIFEST_FILE))
+        .await
+        .map_err(DreamError::Io)?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        DreamError::ConsolidationFailed(format!("invalid dream commit manifest: {}", e))
+    })
+}
+
+fn changes_from_manifest(
+    real_memory_dir: &Path,
+    manifest: DreamCommitManifest,
+) -> Vec<StagedMemoryChange> {
+    manifest
+        .changes
+        .into_iter()
+        .map(|change| StagedMemoryChange {
+            staged_path: PathBuf::new(),
+            real_path: real_memory_dir.join(&change.rel_path),
+            rel_path: change.rel_path,
+            existed_before: change.existed_before,
+        })
+        .collect()
+}
+
+async fn rollback_staged_memory_changes(
+    changes: &[StagedMemoryChange],
+    backup_root: &Path,
+) -> Result<(), DreamError> {
+    let mut errors = Vec::new();
+
+    for change in changes.iter().rev() {
+        let result = if change.existed_before {
+            let backup_path = backup_root.join(&change.rel_path);
+            match tokio::fs::read(&backup_path).await {
+                Ok(bytes) => {
+                    if let Some(parent) = change.real_path.parent() {
+                        if let Err(err) = tokio::fs::create_dir_all(parent).await {
+                            Err(DreamError::Io(err))
+                        } else {
+                            atomic_write_memory_file(&change.real_path, bytes).await
+                        }
+                    } else {
+                        atomic_write_memory_file(&change.real_path, bytes).await
+                    }
+                }
+                Err(err) => Err(DreamError::Io(err)),
+            }
+        } else {
+            match tokio::fs::remove_file(&change.real_path).await {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(DreamError::Io(err)),
+            }
+        };
+
+        if let Err(err) = result {
+            errors.push(format!("{}: {}", change.rel_path.display(), err));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(DreamError::ConsolidationFailed(errors.join("; ")))
+    }
+}
+
+async fn cleanup_commit_backup(backup_root: &Path) {
+    let _ = tokio::fs::remove_dir_all(backup_root).await;
+    if let Some(parent) = backup_root.parent() {
+        let _ = tokio::fs::remove_dir(parent).await;
+    }
+}
+
+async fn rollback_pending_memory_commit(pending_commit: &mut Option<StagedMemoryCommit>) {
+    if let Some(commit) = pending_commit.take() {
+        if let Err(e) = commit.rollback().await {
+            tracing::error!(
+                error = %e,
+                "[dream] Failed to roll back staged memory commit after final state save failure"
+            );
+        }
+    }
+}
+
+async fn recover_dream_commit_backups(
+    config_dir: &Path,
+    real_memory_dir: &Path,
+    roll_back_pending: bool,
+) -> Result<(), DreamError> {
+    let backup_parent = real_memory_dir
+        .parent()
+        .unwrap_or(real_memory_dir)
+        .join(DREAM_COMMIT_BACKUP_DIR);
+
+    if !fs::try_exists(&backup_parent)
+        .await
+        .map_err(DreamError::Io)?
+    {
+        return Ok(());
+    }
+
+    let mut entries = fs::read_dir(&backup_parent).await.map_err(DreamError::Io)?;
+    while let Some(entry) = entries.next_entry().await.map_err(DreamError::Io)? {
+        if !entry.file_type().await.map_err(DreamError::Io)?.is_dir() {
+            continue;
+        }
+
+        let backup_root = entry.path();
+        if roll_back_pending {
+            let manifest = match read_commit_manifest(&backup_root).await {
+                Ok(manifest) => manifest,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %backup_root.display(),
+                        error = %e,
+                        "[dream] Found dream commit backup without readable manifest; leaving it for manual recovery"
+                    );
+                    continue;
+                }
+            };
+            let changes = changes_from_manifest(real_memory_dir, manifest);
+            rollback_staged_memory_changes(&changes, &backup_root).await?;
+            tracing::warn!(
+                path = %backup_root.display(),
+                "[dream] Rolled back stale dream memory commit from manifest"
+            );
+        }
+
+        cleanup_commit_backup(&backup_root).await;
+    }
+
+    let _ = tokio::fs::remove_dir(&backup_parent).await;
+    tracing::debug!(
+        path = %config_dir.display(),
+        rollback = roll_back_pending,
+        "[dream] Recovered dream commit backup directory"
+    );
+    Ok(())
+}
+
 /// 收集到的信号
 #[derive(Debug, Clone)]
 pub struct GatheredSignal {
@@ -315,6 +918,8 @@ pub async fn check_gates(
     config_dir: &Path,
     config: &ConsolidatorConfig,
 ) -> GateCheckResult {
+    let memory_dir = config_dir.join("memory");
+
     // 1. 检查锁门控
     if state.is_consolidating {
         // 检查是否为 stale 标记：consolidating_started_at 超过阈值
@@ -374,6 +979,12 @@ pub async fn check_gates(
                 started_at = ?state.consolidating_started_at,
                 "[dream] 检测到 stale 的 is_consolidating 标记，自动清除恢复"
             );
+            if let Err(e) = recover_dream_commit_backups(config_dir, &memory_dir, true).await {
+                tracing::warn!(
+                    error = %e,
+                    "[dream] Failed to recover stale dream memory commit backups"
+                );
+            }
             state.is_consolidating = false;
             state.consolidating_started_at = None;
             // 持久化清除后的状态，确保后续 gate 不再被卡住
@@ -387,6 +998,11 @@ pub async fn check_gates(
         } else {
             return GateCheckResult::LockGateFailed;
         }
+    } else if let Err(e) = recover_dream_commit_backups(config_dir, &memory_dir, false).await {
+        tracing::warn!(
+            error = %e,
+            "[dream] Failed to clean finalized dream memory commit backups"
+        );
     }
 
     // 2. 检查时间门控
@@ -464,10 +1080,14 @@ impl DreamConsolidator {
 
     /// 执行梦境整合
     ///
-    /// timeout_secs: 单次整合的超时时间（秒），超时后仍会执行清理逻辑
+    /// timeout_secs: forked-agent 整合阶段的超时时间（秒）。
+    /// 真实 memory commit 和最终状态保存不受该 timeout 取消，以保证能显式完成或回滚。
     pub async fn dream(&mut self, timeout_secs: u64) -> Result<(), DreamError> {
         // 获取锁
         self.acquire_lock().await?;
+        let memory_dir = self.config_dir.join("memory");
+        recover_dream_commit_backups(&self.config_dir, &memory_dir, self.state.is_consolidating)
+            .await?;
 
         // 记录 Layer 6 dream_started 事件
         let sessions_count = self.state.current_session_count;
@@ -506,40 +1126,63 @@ impl DreamConsolidator {
 
         let start_time = Instant::now();
 
-        // 在 consolidate 前扫描 memory 目录
-        let memory_dir = self.config_dir.join("memory");
-        let pre_memory_state = self.scan_memory_dir(&memory_dir).await;
-
-        // 执行四阶段（带超时保护），收集统计
-        // 超时后不会 drop 整个 dream()，而是返回 Err(DreamError::Timeout)，
-        // 确保后续清理逻辑（is_consolidating=false、保存状态、释放锁）始终执行
         let mut stats = DreamStats::default();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
-            self.orient().await?;
-            memory_event!(layer6, phase_completed, "orient");
-            let signals = self.gather().await?;
-            memory_event!(layer6, phase_completed, "gather");
-            self.consolidate(&signals).await?;
-            memory_event!(layer6, phase_completed, "consolidate");
-            // 在 consolidate 后计算 memory 变化
-            let post_memory_state = self.scan_memory_dir(&memory_dir).await;
-            stats = self.compute_memory_diff(&pre_memory_state, &post_memory_state);
-            // prune 返回修剪统计
-            let prune_stats = self.prune().await?;
-            memory_event!(layer6, phase_completed, "prune");
-            stats.sessions_pruned = prune_stats.sessions_pruned;
-            stats.sessions_processed = prune_stats.sessions_processed;
+        let mut staging_root: Option<PathBuf> = None;
+        let mut pending_memory_commit: Option<StagedMemoryCommit> = None;
+
+        // state 已标记为 is_consolidating=true。这里之后所有错误都必须汇总进 result，
+        // 不能用裸 `?` 早退，否则会绕过底部状态清理和 dream lock 释放。
+        let result = async {
+            fs::create_dir_all(&memory_dir).await?;
+            let pre_memory_snapshot = snapshot_memory_tree(&memory_dir).await?;
+            let staging = prepare_dream_staging(&self.config_dir, &memory_dir).await?;
+            staging_root = Some(staging.root.clone());
+            let staging_memory_dir = staging.memory_dir.clone();
+
+            // timeout 只包住可重跑的整合阶段。真实 memory commit 必须在 timeout 外完成，
+            // 否则 timeout 取消 future 时可能跳过 rollback，留下半提交文件。
+            tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+                self.orient().await?;
+                memory_event!(layer6, phase_completed, "orient");
+                let signals = self.gather().await?;
+                memory_event!(layer6, phase_completed, "gather");
+                self.consolidate(&signals, &staging_memory_dir).await?;
+                validate_staged_memory(&staging_memory_dir).await?;
+                memory_event!(layer6, phase_completed, "consolidate");
+                Ok::<(), DreamError>(())
+            })
+            .await
+            .map_err(|_| {
+                tracing::error!(
+                    timeout_secs,
+                    "[dream] Consolidation timed out, executing cleanup"
+                );
+                DreamError::Timeout(timeout_secs)
+            })??;
+
+            // 真实 memory commit 不放进 timeout：进入提交阶段后必须显式成功或回滚。
+            // 备份会保留到最终 dream state 成功落盘之后，避免 state 保存失败时留下已提交 memory。
+            let commit = commit_staged_memory_transaction(
+                &memory_dir,
+                &pre_memory_snapshot,
+                &staging_memory_dir,
+            )
+            .await?;
+            stats = commit.stats.clone();
+            pending_memory_commit = Some(commit);
             Ok::<(), DreamError>(())
-        })
-        .await
-        .map_err(|_| {
-            tracing::error!(
-                timeout_secs,
-                "[dream] Consolidation timed out, executing cleanup"
-            );
-            DreamError::Timeout(timeout_secs)
-        })
-        .and_then(|r| r);
+        }
+        .await;
+
+        if let Some(staging_root) = &staging_root {
+            if let Err(e) = fs::remove_dir_all(staging_root).await {
+                tracing::warn!(
+                    path = %staging_root.display(),
+                    error = %e,
+                    "[dream] Failed to clean up dream staging directory"
+                );
+            }
+        }
 
         // 清理：无论成功、失败或超时，都要释放锁和重置标记
         self.state.is_consolidating = false;
@@ -584,6 +1227,7 @@ impl DreamConsolidator {
                             retries = retry_count,
                             "[dream] 获取状态锁失败（已重试 {retry_count} 次），is_consolidating=false 无法落盘，返回错误"
                         );
+                        rollback_pending_memory_commit(&mut pending_memory_commit).await;
                         // 释放 dream lock
                         if let Err(e) = self.release_lock().await {
                             tracing::warn!(error = %e, "[dream] Failed to release lock");
@@ -650,6 +1294,7 @@ impl DreamConsolidator {
                             );
                             // 状态锁在 drop 时自动释放
                             drop(state_lock_guard);
+                            rollback_pending_memory_commit(&mut pending_memory_commit).await;
                             // 释放 dream lock
                             if let Err(e) = self.release_lock().await {
                                 tracing::warn!(error = %e, "[dream] Failed to release lock");
@@ -668,6 +1313,26 @@ impl DreamConsolidator {
 
             // 状态锁在 _state_lock_guard drop 时自动释放
             drop(state_lock_guard);
+        }
+
+        if let Some(commit) = pending_memory_commit.take() {
+            commit.finalize().await;
+        }
+
+        if result.is_ok() {
+            match self.prune().await {
+                Ok(prune_stats) => {
+                    memory_event!(layer6, phase_completed, "prune");
+                    stats.sessions_pruned = prune_stats.sessions_pruned;
+                    stats.sessions_processed = prune_stats.sessions_processed;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "[dream] Prune failed after successful consolidation; continuing"
+                    );
+                }
+            }
         }
 
         // 释放锁（失败时记录警告但继续）
@@ -1162,7 +1827,11 @@ impl DreamConsolidator {
     }
 
     /// 阶段 3: 整合知识
-    async fn consolidate(&self, signals: &[GatheredSignal]) -> Result<(), DreamError> {
+    async fn consolidate(
+        &self,
+        signals: &[GatheredSignal],
+        memory_dir: &Path,
+    ) -> Result<(), DreamError> {
         tracing::debug!(
             signal_count = signals.len(),
             "[dream] Phase 3: Consolidating knowledge"
@@ -1175,7 +1844,6 @@ impl DreamConsolidator {
             .ok_or(DreamError::NoProviderPool)?;
 
         // 构建整合提示（包含收集的信号）
-        let memory_dir = self.config_dir.join("memory");
         fs::create_dir_all(&memory_dir).await?;
         let prompt = self.build_consolidation_prompt(&memory_dir, signals);
 
@@ -1200,7 +1868,7 @@ impl DreamConsolidator {
             .cache_safe_params(cache_safe_params)
             .can_use_tool(can_use_tool)
             // 将执行层也限制在记忆目录内，避免无 working_dir 时接受任意绝对路径。
-            .working_dir(memory_dir)
+            .working_dir(memory_dir.to_path_buf())
             .query_source("auto_dream")
             .fork_label("auto_dream")
             .max_turns(10)
@@ -1221,7 +1889,7 @@ impl DreamConsolidator {
                     cb.record_failure();
 
                     tracing::error!(
-                        session_ids = ?agent_result.files_modified,
+                        files_modified = ?agent_result.files_modified,
                         response = ?agent_result.final_content,
                         truncated = agent_result.truncated,
                         had_tool_error = agent_result.had_tool_error,
@@ -1443,97 +2111,6 @@ impl DreamConsolidator {
                 }
             }
             Err(_) => Ok(false),
-        }
-    }
-
-    /// 扫描 memory 目录，获取文件状态
-    ///
-    /// 返回 (文件数量, 总字节数, 文件修改时间映射)
-    async fn scan_memory_dir(&self, memory_dir: &Path) -> MemoryDirState {
-        let mut file_count = 0;
-        let mut total_bytes = 0u64;
-        let mut file_mtimes: std::collections::HashMap<String, u64> =
-            std::collections::HashMap::new();
-
-        match fs::try_exists(memory_dir).await {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::debug!(path = %memory_dir.display(), "Memory directory does not exist");
-                return MemoryDirState::default();
-            }
-            Err(e) => {
-                tracing::debug!(path = %memory_dir.display(), error = %e, "Failed to check memory directory existence");
-                return MemoryDirState::default();
-            }
-        }
-
-        match fs::read_dir(memory_dir).await {
-            Ok(mut entries) => {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if path.extension().map(|e| e == "md").unwrap_or(false) {
-                        file_count += 1;
-                        if let Ok(metadata) = fs::metadata(&path).await {
-                            total_bytes += metadata.len();
-                            if let Ok(modified) = metadata.modified() {
-                                let mtime = modified
-                                    .duration_since(UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0);
-                                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                                    file_mtimes.insert(name.to_string(), mtime);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::debug!(path = %memory_dir.display(), error = %e, "Failed to read memory directory");
-            }
-        }
-
-        MemoryDirState {
-            file_count,
-            total_bytes,
-            file_mtimes,
-        }
-    }
-
-    /// 计算前后 memory 目录的差异
-    fn compute_memory_diff(&self, pre: &MemoryDirState, post: &MemoryDirState) -> DreamStats {
-        let mut created = 0;
-        let mut updated = 0;
-        let mut deleted = 0;
-
-        // 检查新增和更新
-        for (name, post_mtime) in &post.file_mtimes {
-            match pre.file_mtimes.get(name) {
-                Some(pre_mtime) => {
-                    // 文件已存在，检查是否更新
-                    if post_mtime > pre_mtime {
-                        updated += 1;
-                    }
-                }
-                None => {
-                    // 新文件
-                    created += 1;
-                }
-            }
-        }
-
-        // 检查删除
-        for name in pre.file_mtimes.keys() {
-            if !post.file_mtimes.contains_key(name) {
-                deleted += 1;
-            }
-        }
-
-        DreamStats {
-            memories_created: created,
-            memories_updated: updated,
-            memories_deleted: deleted,
-            ..Default::default()
         }
     }
 
@@ -1815,6 +2392,16 @@ fn is_journal_started_at_expired(journal: &serde_json::Value, threshold_secs: u6
 mod tests {
     use super::*;
 
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "blockcell-{}-{}",
+            label,
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        dir
+    }
+
     #[test]
     fn test_dream_state_default() {
         let state = DreamState::default();
@@ -1900,6 +2487,378 @@ mod tests {
         };
 
         assert!(validate_dream_agent_result(&agent_result).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dream_staging_commit_applies_updates_atomically() {
+        let root = temp_test_dir("dream-staging-commit");
+        let real = root.join("memory");
+        let staging = root.join(".dream_staging").join("run").join("memory");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        tokio::fs::write(real.join("project.md"), "old")
+            .await
+            .unwrap();
+        tokio::fs::write(staging.join("project.md"), "new")
+            .await
+            .unwrap();
+        tokio::fs::write(staging.join("new.md"), "created")
+            .await
+            .unwrap();
+
+        let pre = snapshot_memory_tree(&real).await.unwrap();
+        let stats = commit_staged_memory(&real, &pre, &staging).await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("project.md"))
+                .await
+                .unwrap(),
+            "new"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("new.md"))
+                .await
+                .unwrap(),
+            "created"
+        );
+        assert_eq!(stats.memories_updated, 1);
+        assert_eq!(stats.memories_created, 1);
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn test_dream_staging_commit_rejects_conflicting_real_file() {
+        let root = temp_test_dir("dream-staging-conflict");
+        let real = root.join("memory");
+        let staging = root.join(".dream_staging").join("run").join("memory");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        tokio::fs::write(real.join("project.md"), "old")
+            .await
+            .unwrap();
+        let pre = snapshot_memory_tree(&real).await.unwrap();
+        tokio::fs::write(real.join("project.md"), "concurrent")
+            .await
+            .unwrap();
+        tokio::fs::write(staging.join("project.md"), "new")
+            .await
+            .unwrap();
+
+        let err = commit_staged_memory(&real, &pre, &staging)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("changed during dream staging"));
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("project.md"))
+                .await
+                .unwrap(),
+            "concurrent"
+        );
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn test_dream_staging_commit_rejects_non_markdown_change() {
+        let root = temp_test_dir("dream-staging-non-md");
+        let real = root.join("memory");
+        let staging = root.join(".dream_staging").join("run").join("memory");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        tokio::fs::write(real.join("project.md"), "old")
+            .await
+            .unwrap();
+        let pre = snapshot_memory_tree(&real).await.unwrap();
+        tokio::fs::write(staging.join("project.md"), "old")
+            .await
+            .unwrap();
+        tokio::fs::write(staging.join("notes.json"), "{}")
+            .await
+            .unwrap();
+
+        let err = commit_staged_memory(&real, &pre, &staging)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("unsupported file"));
+        assert!(!real.join("notes.json").exists());
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn test_dream_staging_commit_rolls_back_written_files_when_later_write_fails() {
+        let root = temp_test_dir("dream-staging-rollback");
+        let real = root.join("memory");
+        let staging = root.join(".dream_staging").join("run").join("memory");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        tokio::fs::write(real.join("a.md"), "old-a").await.unwrap();
+        tokio::fs::write(real.join("b.md"), "old-b").await.unwrap();
+        tokio::fs::write(staging.join("a.md"), "new-a")
+            .await
+            .unwrap();
+        tokio::fs::write(staging.join("b.md"), "new-b")
+            .await
+            .unwrap();
+        let pre = snapshot_memory_tree(&real).await.unwrap();
+
+        let err = commit_staged_memory_with_injected_write_failure_for_test(
+            &real,
+            &pre,
+            &staging,
+            Path::new("b.md"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("injected write failure"));
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("a.md")).await.unwrap(),
+            "old-a"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("b.md")).await.unwrap(),
+            "old-b"
+        );
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn test_dream_staging_commit_removes_created_files_when_later_write_fails() {
+        let root = temp_test_dir("dream-staging-rollback-created");
+        let real = root.join("memory");
+        let staging = root.join(".dream_staging").join("run").join("memory");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        tokio::fs::write(real.join("b.md"), "old-b").await.unwrap();
+        tokio::fs::write(staging.join("a-new.md"), "created")
+            .await
+            .unwrap();
+        tokio::fs::write(staging.join("b.md"), "new-b")
+            .await
+            .unwrap();
+        let pre = snapshot_memory_tree(&real).await.unwrap();
+
+        let err = commit_staged_memory_with_injected_write_failure_for_test(
+            &real,
+            &pre,
+            &staging,
+            Path::new("b.md"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("injected write failure"));
+        assert!(!real.join("a-new.md").exists());
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("b.md")).await.unwrap(),
+            "old-b"
+        );
+        assert!(!root.join(".dream_commit_backup").exists());
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn test_dream_staging_commit_can_roll_back_after_successful_write() {
+        let root = temp_test_dir("dream-staging-post-commit-rollback");
+        let real = root.join("memory");
+        let staging = root.join(".dream_staging").join("run").join("memory");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        tokio::fs::write(real.join("a.md"), "old-a").await.unwrap();
+        tokio::fs::write(real.join("b.md"), "old-b").await.unwrap();
+        tokio::fs::write(staging.join("a.md"), "new-a")
+            .await
+            .unwrap();
+        tokio::fs::write(staging.join("b.md"), "old-b")
+            .await
+            .unwrap();
+        tokio::fs::write(staging.join("b-new.md"), "created")
+            .await
+            .unwrap();
+        let pre = snapshot_memory_tree(&real).await.unwrap();
+
+        let commit = commit_staged_memory_transaction(&real, &pre, &staging)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("a.md")).await.unwrap(),
+            "new-a"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("b-new.md"))
+                .await
+                .unwrap(),
+            "created"
+        );
+
+        commit.rollback().await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("a.md")).await.unwrap(),
+            "old-a"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("b.md")).await.unwrap(),
+            "old-b"
+        );
+        assert!(!real.join("b-new.md").exists());
+        assert!(!root.join(".dream_commit_backup").exists());
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn test_dream_recovers_stale_commit_backup_from_manifest() {
+        let root = temp_test_dir("dream-staging-manifest-rollback");
+        let real = root.join("memory");
+        let staging = root.join(".dream_staging").join("run").join("memory");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        tokio::fs::write(real.join("a.md"), "old-a").await.unwrap();
+        tokio::fs::write(staging.join("a.md"), "new-a")
+            .await
+            .unwrap();
+        tokio::fs::write(staging.join("created.md"), "created")
+            .await
+            .unwrap();
+        let pre = snapshot_memory_tree(&real).await.unwrap();
+
+        let _commit = commit_staged_memory_transaction(&real, &pre, &staging)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("a.md")).await.unwrap(),
+            "new-a"
+        );
+        assert!(real.join("created.md").exists());
+        assert!(root.join(DREAM_COMMIT_BACKUP_DIR).exists());
+
+        recover_dream_commit_backups(&root, &real, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("a.md")).await.unwrap(),
+            "old-a"
+        );
+        assert!(!real.join("created.md").exists());
+        assert!(!root.join(DREAM_COMMIT_BACKUP_DIR).exists());
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn test_dream_cleans_finalized_commit_backup_without_rollback() {
+        let root = temp_test_dir("dream-staging-manifest-finalized");
+        let real = root.join("memory");
+        let staging = root.join(".dream_staging").join("run").join("memory");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        tokio::fs::write(real.join("a.md"), "old-a").await.unwrap();
+        tokio::fs::write(staging.join("a.md"), "new-a")
+            .await
+            .unwrap();
+        let pre = snapshot_memory_tree(&real).await.unwrap();
+
+        let _commit = commit_staged_memory_transaction(&real, &pre, &staging)
+            .await
+            .unwrap();
+
+        recover_dream_commit_backups(&root, &real, false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("a.md")).await.unwrap(),
+            "new-a"
+        );
+        assert!(!root.join(DREAM_COMMIT_BACKUP_DIR).exists());
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn test_dream_final_state_save_failure_helper_rolls_back_pending_commit() {
+        let root = temp_test_dir("dream-staging-final-state-rollback");
+        let real = root.join("memory");
+        let staging = root.join(".dream_staging").join("run").join("memory");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        tokio::fs::write(real.join("a.md"), "old-a").await.unwrap();
+        tokio::fs::write(staging.join("a.md"), "new-a")
+            .await
+            .unwrap();
+        let pre = snapshot_memory_tree(&real).await.unwrap();
+        let commit = commit_staged_memory_transaction(&real, &pre, &staging)
+            .await
+            .unwrap();
+        let mut pending = Some(commit);
+
+        rollback_pending_memory_commit(&mut pending).await;
+
+        assert!(pending.is_none());
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("a.md")).await.unwrap(),
+            "old-a"
+        );
+        assert!(!root.join(DREAM_COMMIT_BACKUP_DIR).exists());
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn test_dream_check_gates_rolls_back_stale_commit_backup() {
+        let root = temp_test_dir("dream-staging-gate-stale-rollback");
+        let real = root.join("memory");
+        let staging = root.join(".dream_staging").join("run").join("memory");
+        tokio::fs::create_dir_all(&real).await.unwrap();
+        tokio::fs::create_dir_all(&staging).await.unwrap();
+        tokio::fs::write(real.join("a.md"), "old-a").await.unwrap();
+        tokio::fs::write(staging.join("a.md"), "new-a")
+            .await
+            .unwrap();
+        let pre = snapshot_memory_tree(&real).await.unwrap();
+        let _commit = commit_staged_memory_transaction(&real, &pre, &staging)
+            .await
+            .unwrap();
+
+        let mut state = DreamState {
+            current_session_count: 10,
+            is_consolidating: true,
+            consolidating_started_at: Some(0),
+            ..Default::default()
+        };
+
+        let result = check_gates(&mut state, &root, &ConsolidatorConfig::default()).await;
+
+        assert_eq!(result, GateCheckResult::Passed);
+        assert!(!state.is_consolidating);
+        assert_eq!(
+            tokio::fs::read_to_string(real.join("a.md")).await.unwrap(),
+            "old-a"
+        );
+        assert!(!root.join(DREAM_COMMIT_BACKUP_DIR).exists());
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_dream_cleans_state_and_lock_when_staging_prepare_fails() {
+        let root = temp_test_dir("dream-staging-prepare-fails");
+        let memory = root.join("memory");
+        tokio::fs::create_dir_all(&memory).await.unwrap();
+        std::os::unix::fs::symlink(root.join("missing-target"), memory.join("bad-link")).unwrap();
+
+        let mut consolidator = DreamConsolidator::new(&root).await.unwrap();
+        consolidator.state.current_session_count = 10;
+
+        let err = consolidator.dream(5).await.unwrap_err();
+
+        assert!(err.to_string().contains("symlink is not allowed"));
+        assert!(!root.join(LOCK_FILE_NAME).exists());
+        let persisted = DreamState::load(&root).await.unwrap();
+        assert!(!persisted.is_consolidating);
+        assert!(persisted.consolidating_started_at.is_none());
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[tokio::test]
