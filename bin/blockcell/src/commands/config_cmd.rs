@@ -47,6 +47,12 @@ pub async fn schema() -> anyhow::Result<()> {
                             "provider": { "type": "string", "description": "Explicit provider name override" },
                             "evolutionModel": { "type": "string", "description": "Model for self-evolution pipeline" },
                             "evolutionProvider": { "type": "string", "description": "Provider for self-evolution pipeline" },
+                            "routingStrategy": {
+                                "type": "string",
+                                "enum": ["manual", "cost_optimized", "quality_first", "latency_first"],
+                                "default": "manual",
+                                "description": "ModelPool routing strategy"
+                            },
                             "maxContextTokens": { "type": "integer", "default": 1048576 },
                             "allowedMcpServers": { "type": "array", "items": { "type": "string" }, "description": "MCP server allowlist for this agent" },
                             "allowedMcpTools": { "type": "array", "items": { "type": "string" }, "description": "MCP tool allowlist for this agent" }
@@ -61,6 +67,11 @@ pub async fn schema() -> anyhow::Result<()> {
                                 "enabled": { "type": "boolean", "default": true },
                                 "name": { "type": "string" },
                                 "intentProfile": { "type": "string", "description": "Intent router profile bound to this agent" },
+                                "routingStrategy": {
+                                    "type": "string",
+                                    "enum": ["manual", "cost_optimized", "quality_first", "latency_first"],
+                                    "description": "Optional per-agent modelPool routing override"
+                                },
                                 "allowedMcpServers": { "type": "array", "items": { "type": "string" } },
                                 "allowedMcpTools": { "type": "array", "items": { "type": "string" } }
                             }

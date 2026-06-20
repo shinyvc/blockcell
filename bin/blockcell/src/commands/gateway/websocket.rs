@@ -144,6 +144,33 @@ fn ws_confirm_response_allowed(
     }
 }
 
+fn route_chat_to_active_steering(
+    active_steering: &std::collections::HashMap<
+        blockcell_agent::SteeringSessionKey,
+        blockcell_agent::SteeringSender,
+    >,
+    agent_id: &str,
+    chat_id: &str,
+    content: String,
+    channel: &str,
+) -> bool {
+    let key = blockcell_agent::SteeringSessionKey {
+        agent_id: agent_id.to_string(),
+        chat_id: chat_id.to_string(),
+    };
+    let Some(sender) = active_steering.get(&key) else {
+        return false;
+    };
+
+    sender
+        .try_send(blockcell_agent::SteeringMessage {
+            content,
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+        })
+        .is_ok()
+}
+
 pub(super) async fn handle_ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<GatewayState>,
@@ -435,6 +462,27 @@ pub(super) async fn handle_ws_connection(socket: WebSocket, state: GatewayState)
                                         });
                                         // 继续正常流程，转发给 AgentRuntime
                                     }
+                                }
+                            }
+
+                            let is_runtime_command =
+                                ws_metadata.get("source").and_then(|v| v.as_str())
+                                    == Some("slash_command");
+                            if !is_runtime_command && media.is_empty() {
+                                let active_steering = state.active_steering.lock().await;
+                                if route_chat_to_active_steering(
+                                    &active_steering,
+                                    &resolved_agent_id,
+                                    &chat_id,
+                                    content.clone(),
+                                    "ws",
+                                ) {
+                                    tracing::info!(
+                                        agent_id = %resolved_agent_id,
+                                        chat_id = %chat_id,
+                                        "Routed WebSocket chat message to active steering channel"
+                                    );
+                                    continue;
                                 }
                             }
 
@@ -832,5 +880,32 @@ mod tests {
             &mut limiter,
             std::time::Instant::now()
         ));
+    }
+
+    #[test]
+    fn active_ws_chat_routes_to_steering_channel() {
+        let (mut channel, sender) = blockcell_agent::SteeringChannel::new(4);
+        let active_steering = std::collections::HashMap::from([(
+            blockcell_agent::SteeringSessionKey {
+                agent_id: "ops".to_string(),
+                chat_id: "chat-a".to_string(),
+            },
+            sender,
+        )]);
+
+        let routed = route_chat_to_active_steering(
+            &active_steering,
+            "ops",
+            "chat-a",
+            "adjust course".to_string(),
+            "ws",
+        );
+
+        assert!(routed);
+        let drained = channel.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].content, "adjust course");
+        assert_eq!(drained[0].channel, "ws");
+        assert_eq!(drained[0].chat_id, "chat-a");
     }
 }

@@ -58,6 +58,7 @@ pub trait Provider: Send + Sync {
 }
 
 pub use anthropic::AnthropicProvider;
+pub use blockcell_core::config::RoutingStrategy;
 pub use embeddings::{create_embedder, OpenAICompatibleEmbedder};
 pub use factory::{
     create_evolution_provider, create_main_provider, create_provider, infer_provider_from_model,
@@ -66,4 +67,4 @@ pub use gemini::GeminiProvider;
 pub use ollama::OllamaProvider;
 pub use openai::OpenAIProvider;
 pub use openai_responses::OpenAIResponsesProvider;
-pub use pool::{CallResult, PoolEntryStatus, ProviderPool};
+pub use pool::{CallResult, PoolEntryStatus, ProviderPool, ProviderPoolEntry, RoutingContext};

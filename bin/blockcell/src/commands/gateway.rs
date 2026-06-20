@@ -1,7 +1,7 @@
 use blockcell_agent::{
     AgentRuntime, CapabilityRegistryAdapter, CheckpointManager, ConfirmRequest,
     CoreEvolutionAdapter, MemoryStoreAdapter, MessageBus, ProviderLLMBridge, ResponseCacheConfig,
-    SkillEvolutionLLMBridge, TaskManager,
+    SkillEvolutionLLMBridge, SteeringRegistry, TaskManager,
 };
 #[cfg(feature = "dingtalk")]
 use blockcell_channels::dingtalk::DingTalkChannel;
@@ -234,6 +234,8 @@ struct GatewayState {
     evolution_service: Arc<Mutex<EvolutionService>>,
     /// Shared ResponseCache for all agents (for /clear command)
     response_caches: Arc<RwLock<HashMap<String, blockcell_agent::ResponseCache>>>,
+    /// Active per-chat steering senders exposed by running agent tasks.
+    active_steering: SteeringRegistry,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -856,6 +858,7 @@ async fn spawn_agent_runtime(
     shutdown_tx: broadcast::Sender<()>,
     task_manager: TaskManager,
     response_caches: Arc<RwLock<HashMap<String, blockcell_agent::ResponseCache>>>,
+    active_steering: SteeringRegistry,
 ) -> anyhow::Result<(
     mpsc::Sender<InboundMessage>,
     tokio::task::JoinHandle<()>,
@@ -986,6 +989,7 @@ async fn spawn_agent_runtime(
     });
 
     runtime.set_event_tx(ws_broadcast_tx);
+    runtime.set_active_steering_registry(active_steering);
 
     // Create shared ResponseCache and register it
     let response_cache = blockcell_agent::ResponseCache::with_config(ResponseCacheConfig::from(
@@ -1527,6 +1531,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     // Shared ResponseCache for /clear command
     let response_caches: Arc<RwLock<HashMap<String, blockcell_agent::ResponseCache>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    let active_steering: SteeringRegistry = Arc::new(Mutex::new(HashMap::new()));
     let mut runtime_senders: HashMap<String, mpsc::Sender<InboundMessage>> = HashMap::new();
     let mut runtime_handles: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut agent_memory_stores: HashMap<String, MemoryStoreHandle> = HashMap::new();
@@ -1544,6 +1549,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
             shutdown_tx.clone(),
             task_manager.clone(),
             response_caches.clone(),
+            active_steering.clone(),
         )
         .await?;
         if let Some(memory_store_handle) = memory_store_handle {
@@ -2112,6 +2118,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
         channel_manager: Arc::clone(&channel_manager),
         evolution_service: shared_evo_service,
         response_caches: response_caches.clone(),
+        active_steering,
     };
 
     let app = Router::new()
@@ -2728,6 +2735,7 @@ mod tests {
                 model: None,
                 provider: None,
                 model_pool: Vec::new(),
+                routing_strategy: None,
                 max_tokens: None,
                 temperature: None,
                 max_tool_iterations: None,

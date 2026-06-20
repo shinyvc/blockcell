@@ -91,6 +91,17 @@ BlockCell 可以在真实使用中沉淀长期有效的经验：
 - 将可复用流程整理成 workspace skills
 - 后台 review 失败不影响当前对话，所有自动写入都有审计、快照和撤销入口
 
+### 🧭 ModelRouter 智能路由与连接阶段降级
+
+当你配置多个模型时，BlockCell 可以按策略选择合适的 Provider：
+
+- `manual`：沿用 Provider Pool 的优先级 + 权重选择
+- `cost_optimized`：短上下文优先使用低成本模型，长上下文回到主力模型
+- `quality_first`：优先使用高优先级主力模型
+- `latency_first`：为延迟优先策略预留入口，当前按可用条目的成功历史做稳定性近似
+
+主对话 LLM 调用还支持**连接阶段自动降级**：如果首选 Provider 在建立流之前出现连接、超时、DNS 等错误，会立即尝试下一个可用 Provider；一旦流式输出已经开始，中途错误不会切换模型，避免把部分输出和另一个模型的结果混在一起。
+
 ### 🤖 多智能体与自定义 Agent
 
 - 支持 typed agent、forked subagent、checkpoint 和链式取消
@@ -243,6 +254,28 @@ blockcell gateway
 }
 ```
 
+多模型路由示例：
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "routingStrategy": "cost_optimized",
+      "modelPool": [
+        { "model": "deepseek-v4-pro", "provider": "deepseek", "priority": 1, "weight": 3 },
+        { "model": "gpt-5.4-mini", "provider": "openai", "priority": 5, "weight": 1 }
+      ]
+    }
+  },
+  "providers": {
+    "deepseek": { "apiKey": "YOUR_DEEPSEEK_KEY" },
+    "openai": { "apiKey": "YOUR_OPENAI_KEY" }
+  }
+}
+```
+
+`cost_optimized` 会让短对话优先使用低优先级的便宜条目，复杂长上下文仍优先使用主力模型。更多策略与降级细节见 [ModelRouter 智能路由与自动降级](docs/28_model_router.md)。
+
 如果要启用多 agent 与外部渠道，建议按代码当前支持的结构补充，例如下面这个“2 个 agent + 2 个 Telegram 账号”的配置：
 
 ```json
@@ -379,6 +412,7 @@ blockcell gateway
 - [技能系统](docs/04_skill_system.md)
 - [记忆系统](docs/05_memory_system.md)
 - [Ghost Native 学习闭环](docs/27_ghost_learning_design.md)
+- [ModelRouter 智能路由与自动降级](docs/28_model_router.md)
 - [渠道配置](docs/06_channels.md)
 - [浏览器自动化](docs/07_browser_automation.md)
 - [Gateway 模式](docs/08_gateway_mode.md)

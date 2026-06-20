@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use blockcell_core::config::ToolCallMode;
+use blockcell_core::config::{RoutingStrategy, ToolCallMode};
 use blockcell_core::Config;
 use tracing::{info, warn};
 
@@ -63,6 +63,15 @@ struct BuiltEntry {
     provider: Arc<dyn Provider>,
 }
 
+/// Public entry type for constructing a ProviderPool from already-built providers.
+pub struct ProviderPoolEntry {
+    pub model: String,
+    pub provider_name: String,
+    pub weight: u32,
+    pub priority: u32,
+    pub provider: Arc<dyn Provider>,
+}
+
 /// 多模型高可用 Provider 池。
 ///
 /// 工作流程：
@@ -77,6 +86,14 @@ pub struct ProviderPool {
     fail_threshold: u32,
     /// 冷却时长，默认 60 秒
     cooldown: Duration,
+}
+
+/// Context used by model routing strategies.
+#[derive(Debug, Clone, Default)]
+pub struct RoutingContext {
+    pub message_count: usize,
+    pub estimated_tokens: usize,
+    pub intent: Option<String>,
 }
 
 impl ProviderPool {
@@ -97,6 +114,32 @@ impl ProviderPool {
             }],
             state: Mutex::new(PoolState {
                 health: HashMap::from([(0, EntryHealth::Healthy)]),
+                stats: HashMap::new(),
+            }),
+            fail_threshold: 3,
+            cooldown: Duration::from_secs(60),
+        })
+    }
+
+    /// Build a pool from already-constructed provider entries.
+    pub fn from_entries(entries: Vec<ProviderPoolEntry>) -> Arc<Self> {
+        let entries: Vec<BuiltEntry> = entries
+            .into_iter()
+            .map(|entry| BuiltEntry {
+                model: entry.model,
+                provider_name: entry.provider_name,
+                weight: entry.weight,
+                priority: entry.priority,
+                provider: entry.provider,
+            })
+            .collect();
+        let health = (0..entries.len())
+            .map(|idx| (idx, EntryHealth::Healthy))
+            .collect();
+        Arc::new(Self {
+            entries,
+            state: Mutex::new(PoolState {
+                health,
                 stats: HashMap::new(),
             }),
             fail_threshold: 3,
@@ -247,6 +290,88 @@ impl ProviderPool {
         Some((selected, Arc::clone(&self.entries[selected].provider)))
     }
 
+    /// Acquire a provider using an explicit routing strategy and request context.
+    pub fn acquire_with_strategy(
+        &self,
+        strategy: RoutingStrategy,
+        context: &RoutingContext,
+    ) -> Option<(usize, Arc<dyn Provider>)> {
+        self.acquire_with_strategy_excluding(strategy, context, &[])
+    }
+
+    /// Acquire using a routing strategy while excluding entries already tried for this call.
+    pub fn acquire_with_strategy_excluding(
+        &self,
+        strategy: RoutingStrategy,
+        context: &RoutingContext,
+        excluded: &[usize],
+    ) -> Option<(usize, Arc<dyn Provider>)> {
+        match strategy {
+            RoutingStrategy::Manual | RoutingStrategy::QualityFirst => {
+                self.acquire_excluding(excluded)
+            }
+            RoutingStrategy::CostOptimized => {
+                if context.message_count <= 4 {
+                    self.acquire_cheapest_excluding(excluded)
+                } else {
+                    self.acquire_excluding(excluded)
+                }
+            }
+            RoutingStrategy::LatencyFirst => self.acquire_lowest_latency_excluding(excluded),
+        }
+    }
+
+    fn acquire_excluding(&self, excluded: &[usize]) -> Option<(usize, Arc<dyn Provider>)> {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("ProviderPool 状态 Mutex 被污染，正在恢复");
+            poisoned.into_inner()
+        });
+        self.recover_cooling_entries(&mut state);
+
+        let candidates = self.healthy_or_cooling_fallback_indices(&mut state, excluded)?;
+        let selected = self.select_entry_from_candidates(candidates)?;
+        Some((selected, Arc::clone(&self.entries[selected].provider)))
+    }
+
+    fn acquire_cheapest_excluding(&self, excluded: &[usize]) -> Option<(usize, Arc<dyn Provider>)> {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("ProviderPool 状态 Mutex 被污染，正在恢复");
+            poisoned.into_inner()
+        });
+        self.recover_cooling_entries(&mut state);
+
+        let healthy = self.healthy_or_cooling_fallback_indices(&mut state, excluded)?;
+        let max_priority = healthy
+            .iter()
+            .map(|idx| self.entries[*idx].priority)
+            .max()?;
+        let candidates: Vec<usize> = healthy
+            .into_iter()
+            .filter(|idx| self.entries[*idx].priority == max_priority)
+            .collect();
+        let selected = self.select_weighted_from_candidates(candidates)?;
+        Some((selected, Arc::clone(&self.entries[selected].provider)))
+    }
+
+    fn acquire_lowest_latency_excluding(
+        &self,
+        excluded: &[usize],
+    ) -> Option<(usize, Arc<dyn Provider>)> {
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("ProviderPool 状态 Mutex 被污染，正在恢复");
+            poisoned.into_inner()
+        });
+        self.recover_cooling_entries(&mut state);
+
+        let healthy = self.healthy_or_cooling_fallback_indices(&mut state, excluded)?;
+        let selected = healthy
+            .iter()
+            .copied()
+            .max_by_key(|idx| state.stats.get(idx).map(|s| s.success_count).unwrap_or(0))
+            .or_else(|| self.select_entry_from_candidates(healthy))?;
+        Some((selected, Arc::clone(&self.entries[selected].provider)))
+    }
+
     /// Acquire a provider that exactly matches the requested model.
     ///
     /// Unlike `acquire()`, this never falls back to another model: callers that set an
@@ -288,6 +413,40 @@ impl ProviderPool {
         }
     }
 
+    fn healthy_or_cooling_fallback_indices(
+        &self,
+        state: &mut PoolState,
+        excluded: &[usize],
+    ) -> Option<Vec<usize>> {
+        let healthy: Vec<usize> = (0..self.entries.len())
+            .filter(|idx| state.health.get(idx) == Some(&EntryHealth::Healthy))
+            .filter(|idx| !excluded.contains(idx))
+            .collect();
+
+        if !healthy.is_empty() {
+            return Some(healthy);
+        }
+
+        let fallback: Vec<usize> = (0..self.entries.len())
+            .filter(|idx| !excluded.contains(idx))
+            .filter(|idx| {
+                matches!(
+                    state.health.get(idx),
+                    Some(EntryHealth::Healthy) | Some(EntryHealth::Cooling(_))
+                )
+            })
+            .collect();
+        if fallback.is_empty() {
+            warn!("ProviderPool: all entries are dead or unavailable");
+            return None;
+        }
+        warn!("ProviderPool: all entries cooling, using fallback selection");
+        for idx in &fallback {
+            state.health.insert(*idx, EntryHealth::Healthy);
+        }
+        Some(fallback)
+    }
+
     fn select_entry_from_candidates(&self, candidates: Vec<usize>) -> Option<usize> {
         // 按 priority 分组，取最高优先级（最小值）
         let min_priority = candidates
@@ -314,6 +473,30 @@ impl ProviderPool {
         let mut cumulative = 0u32;
         let mut selected = top_group[0];
         for idx in &top_group {
+            cumulative += self.entries[*idx].weight;
+            if rand_val < cumulative {
+                selected = *idx;
+                break;
+            }
+        }
+
+        Some(selected)
+    }
+
+    fn select_weighted_from_candidates(&self, candidates: Vec<usize>) -> Option<usize> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let total_weight: u32 = candidates.iter().map(|idx| self.entries[*idx].weight).sum();
+        if total_weight == 0 {
+            return None;
+        }
+
+        let rand_val = rand::thread_rng().gen_range(0..total_weight);
+        let mut cumulative = 0u32;
+        let mut selected = candidates[0];
+        for idx in &candidates {
             cumulative += self.entries[*idx].weight;
             if rand_val < cumulative {
                 selected = *idx;
@@ -615,5 +798,46 @@ mod tests {
             .expect("model-b should be available");
         assert_eq!(idx, 1);
         assert!(pool.acquire_by_model("missing-model").is_none());
+    }
+
+    #[test]
+    fn cost_optimized_short_context_selects_lowest_priority_entry() {
+        let pool = ProviderPool {
+            entries: vec![
+                BuiltEntry {
+                    model: "strong-model".to_string(),
+                    provider_name: "test".to_string(),
+                    weight: 1,
+                    priority: 1,
+                    provider: Arc::new(DummyProvider),
+                },
+                BuiltEntry {
+                    model: "cheap-model".to_string(),
+                    provider_name: "test".to_string(),
+                    weight: 1,
+                    priority: 10,
+                    provider: Arc::new(DummyProvider),
+                },
+            ],
+            state: Mutex::new(PoolState {
+                health: HashMap::from([(0, EntryHealth::Healthy), (1, EntryHealth::Healthy)]),
+                stats: HashMap::new(),
+            }),
+            fail_threshold: 3,
+            cooldown: Duration::from_secs(60),
+        };
+
+        let (idx, _) = pool
+            .acquire_with_strategy(
+                blockcell_core::config::RoutingStrategy::CostOptimized,
+                &RoutingContext {
+                    message_count: 2,
+                    estimated_tokens: 128,
+                    intent: None,
+                },
+            )
+            .expect("cheap entry should be selected");
+
+        assert_eq!(idx, 1);
     }
 }

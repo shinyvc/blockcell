@@ -127,6 +127,25 @@ fn is_default_tool_call_mode(mode: &ToolCallMode) -> bool {
     matches!(mode, ToolCallMode::Native)
 }
 
+/// Model routing strategy for selecting entries from agents.defaults.model_pool.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingStrategy {
+    /// Existing behavior: priority group plus weighted random selection.
+    #[default]
+    Manual,
+    /// Short contexts use cheaper lower-priority entries; longer contexts use normal priority.
+    CostOptimized,
+    /// Prefer highest-priority entries.
+    QualityFirst,
+    /// Prefer entries with the best observed fast-success signal, falling back to normal priority.
+    LatencyFirst,
+}
+
+fn is_default_routing_strategy(strategy: &RoutingStrategy) -> bool {
+    matches!(strategy, RoutingStrategy::Manual)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDefaults {
@@ -166,6 +185,9 @@ pub struct AgentDefaults {
     /// 若留空，则沿用旧的单 model + provider 配置（向后兼容）。
     #[serde(default)]
     pub model_pool: Vec<ModelEntry>,
+    /// ProviderPool routing strategy for this agent.
+    #[serde(default, skip_serializing_if = "is_default_routing_strategy")]
+    pub routing_strategy: RoutingStrategy,
     /// Allowed MCP server names visible to this agent.
     #[serde(default)]
     pub allowed_mcp_servers: Vec<String>,
@@ -233,6 +255,7 @@ impl Default for AgentDefaults {
             evolution_model: None,
             evolution_provider: None,
             model_pool: Vec::new(),
+            routing_strategy: RoutingStrategy::Manual,
             allowed_mcp_servers: Vec::new(),
             allowed_mcp_tools: Vec::new(),
             reasoning_effort: None,
@@ -386,6 +409,8 @@ pub struct AgentProfileConfig {
     #[serde(default)]
     pub model_pool: Vec<ModelEntry>,
     #[serde(default)]
+    pub routing_strategy: Option<RoutingStrategy>,
+    #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -423,6 +448,7 @@ impl Default for AgentProfileConfig {
             model: None,
             provider: None,
             model_pool: Vec::new(),
+            routing_strategy: None,
             max_tokens: None,
             temperature: None,
             max_tool_iterations: None,
@@ -1422,6 +1448,9 @@ impl Config {
             } else if has_single_model_override {
                 defaults.model_pool.clear();
             }
+            if let Some(routing_strategy) = agent.routing_strategy {
+                defaults.routing_strategy = routing_strategy;
+            }
             if let Some(max_tokens) = agent.max_tokens {
                 defaults.max_tokens = max_tokens;
             }
@@ -1989,6 +2018,36 @@ mod tests {
             "explicit model/provider override should disable inherited model_pool"
         );
         assert_eq!(resolved.intent_profile.as_deref(), Some("ops"));
+    }
+
+    #[test]
+    fn test_routing_strategy_deserializes_and_agent_overrides_default() {
+        let raw = r#"{
+  "agents": {
+    "defaults": {
+      "routingStrategy": "cost_optimized"
+    },
+    "list": [
+      {
+        "id": "ops",
+        "enabled": true,
+        "routingStrategy": "quality_first"
+      }
+    ]
+  }
+}"#;
+
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            cfg.agents.defaults.routing_strategy,
+            RoutingStrategy::CostOptimized
+        );
+
+        let resolved = cfg.resolve_agent_spec("ops").expect("resolved ops agent");
+        assert_eq!(
+            resolved.defaults.routing_strategy,
+            RoutingStrategy::QualityFirst
+        );
     }
 
     #[test]

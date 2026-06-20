@@ -289,6 +289,7 @@ mod tests {
             channel_manager,
             evolution_service,
             response_caches: Arc::new(RwLock::new(HashMap::new())),
+            active_steering: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
