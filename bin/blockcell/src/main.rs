@@ -196,6 +196,12 @@ enum Commands {
         #[command(subcommand)]
         command: LogsCommands,
     },
+
+    /// Verify audit log integrity
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommands,
+    },
 }
 
 // ── P0: Config ──────────────────────────────────────────────────────────────
@@ -514,6 +520,20 @@ enum LogsCommands {
         /// Skip confirmation prompt
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditCommands {
+    /// Verify audit hash chain integrity
+    Verify {
+        /// Audit date to verify (YYYY-MM-DD), defaults to today
+        #[arg(long)]
+        date: Option<String>,
+
+        /// Verify all audit JSONL files
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -1209,6 +1229,12 @@ async fn main() -> anyhow::Result<()> {
                 commands::logs_cmd::clear(force).await?;
             }
         },
+
+        Commands::Audit { command } => match command {
+            AuditCommands::Verify { date, all } => {
+                commands::audit::verify(&paths, date, all).await?;
+            }
+        },
     }
 
     Ok(())
@@ -1414,6 +1440,38 @@ mod tests {
                     "unexpected memory command: {:?}",
                     std::mem::discriminant(&other)
                 ),
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_audit_verify_parses_date() {
+        let cli = Cli::try_parse_from(["blockcell", "audit", "verify", "--date", "2026-06-20"])
+            .expect("audit verify --date should parse");
+
+        match cli.command {
+            Commands::Audit { command } => match command {
+                AuditCommands::Verify { date, all } => {
+                    assert_eq!(date.as_deref(), Some("2026-06-20"));
+                    assert!(!all);
+                }
+            },
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn test_audit_verify_parses_all() {
+        let cli = Cli::try_parse_from(["blockcell", "audit", "verify", "--all"])
+            .expect("audit verify --all should parse");
+
+        match cli.command {
+            Commands::Audit { command } => match command {
+                AuditCommands::Verify { date, all } => {
+                    assert!(date.is_none());
+                    assert!(all);
+                }
             },
             other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
         }

@@ -6599,6 +6599,7 @@ impl AgentRuntime {
         eval: &PolicyEvalResult,
         msg: &InboundMessage,
     ) {
+        self.audit_logger.set_session_id(&msg.session_key());
         let _ = self.audit_logger.log_permission_decision(
             tool_name,
             format!("{:?}", eval.decision),
@@ -6962,6 +6963,7 @@ impl AgentRuntime {
         }
 
         // Log to audit
+        self.audit_logger.set_session_id(&msg.session_key());
         let _ = self.audit_logger.log_tool_call(
             &tool_call.name,
             tool_call.arguments.clone(),

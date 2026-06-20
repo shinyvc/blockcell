@@ -960,6 +960,30 @@ blockcell logs clear [--force]
 
 ---
 
+## audit — 验证审计日志完整性
+
+```
+blockcell audit verify [--date <YYYY-MM-DD>] [--all]
+```
+
+审计日志写入 `~/.blockcell/audit/<date>.jsonl`，新记录使用 SHA-256 hash chain 包装。`verify` 会重算每条记录的 hash，并检查相邻记录的 `prev_hash` 链接。
+
+| 选项 | 默认值 | 说明 |
+|------|--------|------|
+| `--date <YYYY-MM-DD>` | 今天 | 验证指定日期的审计日志 |
+| `--all` | false | 按文件名顺序验证全部 `.jsonl` 审计日志 |
+
+**示例：**
+```bash
+blockcell audit verify
+blockcell audit verify --date 2026-06-20
+blockcell audit verify --all
+```
+
+**边界：** 当前默认每天独立成链，可检测单日文件内记录被修改、插入或删除中间记录；删除整天文件、或截断某天文件末尾若干条，剩余链仍可能自洽。安全敏感部署应定期外发/异地留存每日末尾 hash。
+
+---
+
 ## completions — 生成 Shell 补全脚本
 
 ```

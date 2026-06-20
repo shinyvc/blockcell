@@ -1,10 +1,19 @@
 use blockcell_core::{Paths, Result};
 use chrono::Utc;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tracing::error;
+use uuid::Uuid;
+
+pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+static AUDIT_WRITE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -45,17 +54,45 @@ pub enum AuditEvent {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditRecord {
+    pub event_id: String,
+    pub timestamp_ms: i64,
+    pub session_id: String,
+    pub event: AuditEvent,
+    pub prev_hash: String,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChainVerifyResult {
+    pub valid: bool,
+    pub total_records: usize,
+    pub skipped_records: usize,
+    pub errors: Vec<String>,
+}
+
 pub struct AuditLogger {
     paths: Paths,
     current_date: String,
+    prev_hash: String,
+    session_id: String,
 }
 
 impl AuditLogger {
     pub fn new(paths: Paths) -> Self {
-        Self {
+        let mut logger = Self {
             paths,
             current_date: Utc::now().format("%Y-%m-%d").to_string(),
-        }
+            prev_hash: GENESIS_HASH.to_string(),
+            session_id: String::new(),
+        };
+        logger.recover_prev_hash();
+        logger
+    }
+
+    pub fn set_session_id(&mut self, session_id: &str) {
+        self.session_id = session_id.to_string();
     }
 
     pub fn log_tool_call(
@@ -139,12 +176,36 @@ impl AuditLogger {
     }
 
     fn write_event(&mut self, event: AuditEvent) -> Result<()> {
+        let _guard = AUDIT_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let log_file = self.current_log_file_path();
 
         // Ensure audit directory exists
         if let Some(parent) = log_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        self.recover_prev_hash();
+
+        let event_id_full = Uuid::new_v4().simple().to_string();
+        let event_id = event_id_full[..16].to_string();
+        let timestamp_ms = Utc::now().timestamp_millis();
+        let hash = compute_record_hash(
+            &event_id,
+            timestamp_ms,
+            &self.session_id,
+            &event,
+            &self.prev_hash,
+        );
+        let record = AuditRecord {
+            event_id,
+            timestamp_ms,
+            session_id: self.session_id.clone(),
+            event,
+            prev_hash: std::mem::replace(&mut self.prev_hash, hash.clone()),
+            hash,
+        };
 
         // Open file in append mode
         let mut file = OpenOptions::new()
@@ -153,8 +214,9 @@ impl AuditLogger {
             .open(&log_file)?;
 
         // Serialize event to JSON and write
-        let json = serde_json::to_string(&event)?;
+        let json = serde_json::to_string(&record)?;
         writeln!(file, "{}", json)?;
+        file.flush()?;
 
         Ok(())
     }
@@ -164,10 +226,30 @@ impl AuditLogger {
         let today = Utc::now().format("%Y-%m-%d").to_string();
         if today != self.current_date {
             self.current_date = today;
+            self.prev_hash = GENESIS_HASH.to_string();
+            self.recover_prev_hash();
         }
         self.paths
             .audit_dir()
             .join(format!("{}.jsonl", self.current_date))
+    }
+
+    fn peek_log_file_path(&self) -> PathBuf {
+        self.paths
+            .audit_dir()
+            .join(format!("{}.jsonl", self.current_date))
+    }
+
+    fn recover_prev_hash(&mut self) {
+        self.prev_hash = GENESIS_HASH.to_string();
+        let log_file = self.peek_log_file_path();
+        let Some(last_line) = read_last_nonempty_line(&log_file) else {
+            return;
+        };
+
+        if let Ok(record) = serde_json::from_str::<AuditRecord>(&last_line) {
+            self.prev_hash = record.hash;
+        }
     }
 
     /// Read audit events from a specific date
@@ -185,11 +267,19 @@ impl AuditLogger {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<AuditEvent>(line) {
-                Ok(event) => events.push(event),
-                Err(e) => {
-                    error!(error = %e, line = %line, "Failed to parse audit event");
-                }
+            match serde_json::from_str::<AuditRecord>(line) {
+                Ok(record) => events.push(record.event),
+                Err(record_error) => match serde_json::from_str::<AuditEvent>(line) {
+                    Ok(event) => events.push(event),
+                    Err(event_error) => {
+                        error!(
+                            record_error = %record_error,
+                            event_error = %event_error,
+                            line = %line,
+                            "Failed to parse audit event"
+                        );
+                    }
+                },
             }
         }
 
@@ -202,6 +292,166 @@ impl AuditLogger {
         let today = Utc::now().format("%Y-%m-%d").to_string();
         self.read_events(&today)
     }
+
+    pub fn verify_chain(log_file: &Path) -> ChainVerifyResult {
+        let content = match std::fs::read_to_string(log_file) {
+            Ok(content) => content,
+            Err(e) => {
+                return ChainVerifyResult {
+                    valid: false,
+                    total_records: 0,
+                    skipped_records: 0,
+                    errors: vec![format!("Cannot read file: {e}")],
+                };
+            }
+        };
+
+        let mut errors = Vec::new();
+        let mut expected_prev = GENESIS_HASH.to_string();
+        let mut total_records = 0;
+        let mut skipped_records = 0;
+
+        for (idx, line) in content.lines().enumerate() {
+            let line_no = idx + 1;
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            total_records += 1;
+            let record = match serde_json::from_str::<AuditRecord>(line) {
+                Ok(record) => record,
+                Err(e) => {
+                    skipped_records += 1;
+                    error!(
+                        error = %e,
+                        line = %line,
+                        "Skipping non-hash-chain audit record"
+                    );
+                    continue;
+                }
+            };
+
+            if record.prev_hash != expected_prev {
+                errors.push(format!(
+                    "Line {line_no}: prev_hash mismatch (expected {}..., got {}...)",
+                    hash_prefix(&expected_prev),
+                    hash_prefix(&record.prev_hash)
+                ));
+            }
+
+            let recomputed = compute_record_hash(
+                &record.event_id,
+                record.timestamp_ms,
+                &record.session_id,
+                &record.event,
+                &record.prev_hash,
+            );
+            if recomputed != record.hash {
+                errors.push(format!(
+                    "Line {line_no}: hash mismatch (stored {}..., recomputed {}...)",
+                    hash_prefix(&record.hash),
+                    hash_prefix(&recomputed)
+                ));
+            }
+
+            expected_prev = record.hash;
+        }
+
+        ChainVerifyResult {
+            valid: errors.is_empty(),
+            total_records,
+            skipped_records,
+            errors,
+        }
+    }
+
+    pub fn verify_today(&self) -> ChainVerifyResult {
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let log_file = self.paths.audit_dir().join(format!("{today}.jsonl"));
+        Self::verify_chain(&log_file)
+    }
+}
+
+fn compute_record_hash(
+    event_id: &str,
+    timestamp_ms: i64,
+    session_id: &str,
+    event: &AuditEvent,
+    prev_hash: &str,
+) -> String {
+    let event_value = canonicalize(&serde_json::to_value(event).unwrap_or(serde_json::Value::Null));
+
+    let mut payload: BTreeMap<&str, serde_json::Value> = BTreeMap::new();
+    payload.insert("event", event_value);
+    payload.insert("event_id", serde_json::Value::from(event_id));
+    payload.insert("prev_hash", serde_json::Value::from(prev_hash));
+    payload.insert("session_id", serde_json::Value::from(session_id));
+    payload.insert("timestamp_ms", serde_json::Value::from(timestamp_ms));
+
+    let json = serde_json::to_string(&payload).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(json.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn canonicalize(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let sorted: BTreeMap<String, serde_json::Value> = map
+                .iter()
+                .map(|(key, value)| (key.clone(), canonicalize(value)))
+                .collect();
+            serde_json::to_value(sorted).unwrap_or(serde_json::Value::Null)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonicalize).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn hash_prefix(hash: &str) -> &str {
+    &hash[..hash.len().min(12)]
+}
+
+fn read_last_nonempty_line(path: &Path) -> Option<String> {
+    const CHUNK_SIZE: u64 = 8192;
+
+    let mut file = File::open(path).ok()?;
+    let mut position = file.seek(SeekFrom::End(0)).ok()?;
+    let mut buffer = Vec::new();
+
+    while position > 0 {
+        let read_size = position.min(CHUNK_SIZE);
+        position -= read_size;
+        file.seek(SeekFrom::Start(position)).ok()?;
+
+        let mut chunk = vec![0; read_size as usize];
+        file.read_exact(&mut chunk).ok()?;
+        chunk.extend(buffer);
+        buffer = chunk;
+
+        let end = buffer
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())
+            .map(|idx| idx + 1)?;
+
+        if let Some(start) = buffer[..end].iter().rposition(|byte| *byte == b'\n') {
+            let candidate = String::from_utf8_lossy(&buffer[start + 1..end])
+                .trim()
+                .to_string();
+            if !candidate.is_empty() {
+                return Some(candidate);
+            }
+        } else if position == 0 {
+            let candidate = String::from_utf8_lossy(&buffer[..end]).trim().to_string();
+            if !candidate.is_empty() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -273,5 +523,225 @@ mod tests {
             }
             _ => panic!("Expected PermissionDecision event"),
         }
+    }
+
+    #[test]
+    fn writes_hash_chained_records_and_verifies_them() {
+        let temp_dir = TempDir::new().unwrap();
+        let paths = Paths::with_base(temp_dir.path().to_path_buf());
+        let mut logger = AuditLogger::new(paths.clone());
+        logger.set_session_id("session-1");
+
+        logger
+            .log_tool_call(
+                "read_file",
+                serde_json::json!({"path": "/tmp/a.txt"}),
+                serde_json::json!({"ok": true}),
+                "cli:default",
+                None,
+                Some(10),
+            )
+            .unwrap();
+        logger
+            .log_permission_decision(
+                "exec",
+                "Allow".to_string(),
+                Some("allow-safe".to_string()),
+                None,
+                false,
+                "cli:default",
+            )
+            .unwrap();
+
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let log_file = paths.audit_dir().join(format!("{today}.jsonl"));
+        let lines: Vec<_> = std::fs::read_to_string(&log_file)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2);
+
+        let first: AuditRecord = serde_json::from_str(&lines[0]).unwrap();
+        let second: AuditRecord = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(first.prev_hash, GENESIS_HASH);
+        assert_eq!(first.hash.len(), 64);
+        assert_eq!(second.prev_hash, first.hash);
+        assert_eq!(first.session_id, "session-1");
+        assert_eq!(second.session_id, "session-1");
+
+        let result = AuditLogger::verify_chain(&log_file);
+        assert!(result.valid, "{:?}", result.errors);
+        assert_eq!(result.total_records, 2);
+    }
+
+    #[test]
+    fn hash_is_stable_for_different_json_object_insertion_order() {
+        let event_a = AuditEvent::ToolCall {
+            tool_name: "echo".to_string(),
+            params: serde_json::json!({"b": 2, "a": {"z": 1, "y": 2}}),
+            result: serde_json::json!({"ok": true}),
+            timestamp_ms: 1000,
+            session_key: "cli:test".to_string(),
+            trace_id: None,
+            duration_ms: Some(5),
+        };
+        let event_b = AuditEvent::ToolCall {
+            tool_name: "echo".to_string(),
+            params: serde_json::json!({"a": {"y": 2, "z": 1}, "b": 2}),
+            result: serde_json::json!({"ok": true}),
+            timestamp_ms: 1000,
+            session_key: "cli:test".to_string(),
+            trace_id: None,
+            duration_ms: Some(5),
+        };
+
+        let hash_a = compute_record_hash("event-id", 2000, "session", &event_a, GENESIS_HASH);
+        let hash_b = compute_record_hash("event-id", 2000, "session", &event_b, GENESIS_HASH);
+
+        assert_eq!(hash_a, hash_b);
+    }
+
+    #[test]
+    fn verify_chain_detects_tampered_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let paths = Paths::with_base(temp_dir.path().to_path_buf());
+        let mut logger = AuditLogger::new(paths.clone());
+
+        logger
+            .log_tool_call(
+                "read_file",
+                serde_json::json!({"path": "/tmp/a.txt"}),
+                serde_json::json!({"ok": true}),
+                "cli:default",
+                None,
+                Some(10),
+            )
+            .unwrap();
+
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let log_file = paths.audit_dir().join(format!("{today}.jsonl"));
+        let line = std::fs::read_to_string(&log_file).unwrap();
+        let mut record: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        record["event"]["result"] = serde_json::json!({"ok": false});
+        std::fs::write(
+            &log_file,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let result = AuditLogger::verify_chain(&log_file);
+        assert!(!result.valid);
+        assert!(result
+            .errors
+            .iter()
+            .any(|err| err.contains("hash mismatch")));
+    }
+
+    #[test]
+    fn verify_chain_detects_deleted_middle_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let paths = Paths::with_base(temp_dir.path().to_path_buf());
+        let mut logger = AuditLogger::new(paths.clone());
+
+        for idx in 0..3 {
+            logger
+                .log_tool_call(
+                    "read_file",
+                    serde_json::json!({"path": format!("/tmp/{idx}.txt")}),
+                    serde_json::json!({"ok": true}),
+                    "cli:default",
+                    None,
+                    Some(10),
+                )
+                .unwrap();
+        }
+
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let log_file = paths.audit_dir().join(format!("{today}.jsonl"));
+        let lines: Vec<_> = std::fs::read_to_string(&log_file)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        std::fs::write(&log_file, format!("{}\n{}\n", lines[0], lines[2])).unwrap();
+
+        let result = AuditLogger::verify_chain(&log_file);
+        assert!(!result.valid);
+        assert!(result
+            .errors
+            .iter()
+            .any(|err| err.contains("prev_hash mismatch")));
+    }
+
+    #[test]
+    fn read_events_accepts_legacy_and_hash_wrapped_records() {
+        let temp_dir = TempDir::new().unwrap();
+        let paths = Paths::with_base(temp_dir.path().to_path_buf());
+        let mut logger = AuditLogger::new(paths.clone());
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let log_file = paths.audit_dir().join(format!("{today}.jsonl"));
+        std::fs::create_dir_all(paths.audit_dir()).unwrap();
+
+        let legacy = AuditEvent::SkillSwitch {
+            skill_name: "legacy".to_string(),
+            from_version: None,
+            to_version: "1.0.0".to_string(),
+            reason: "test".to_string(),
+            timestamp_ms: 1000,
+            session_key: "cli:legacy".to_string(),
+        };
+        std::fs::write(
+            &log_file,
+            format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+        )
+        .unwrap();
+
+        logger
+            .log_permission_decision("exec", "Deny".to_string(), None, None, false, "cli:new")
+            .unwrap();
+
+        let events = logger.read_events(&today).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], AuditEvent::SkillSwitch { .. }));
+        assert!(matches!(events[1], AuditEvent::PermissionDecision { .. }));
+    }
+
+    #[test]
+    fn concurrent_logger_instances_preserve_chain() {
+        let temp_dir = TempDir::new().unwrap();
+        let paths = Paths::with_base(temp_dir.path().to_path_buf());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+
+        for idx in 0..8 {
+            let paths = paths.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut logger = AuditLogger::new(paths);
+                logger.set_session_id(&format!("session-{idx}"));
+                barrier.wait();
+                logger
+                    .log_permission_decision(
+                        "exec",
+                        "Allow".to_string(),
+                        Some(format!("rule-{idx}")),
+                        None,
+                        false,
+                        &format!("cli:{idx}"),
+                    )
+                    .unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let log_file = paths.audit_dir().join(format!("{today}.jsonl"));
+        let result = AuditLogger::verify_chain(&log_file);
+        assert!(result.valid, "{:?}", result.errors);
+        assert_eq!(result.total_records, 8);
     }
 }

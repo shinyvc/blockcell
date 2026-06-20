@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod alerts_cmd;
+pub mod audit;
 pub mod channels;
 pub mod completions_cmd;
 pub mod config_cmd;
