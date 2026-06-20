@@ -1,5 +1,8 @@
 use blockcell_core::path_policy::PathPolicy;
 use blockcell_core::system_event::{EventPriority, EventScope, SessionSummary, SystemEvent};
+use blockcell_core::tool_policy::{
+    PolicyEvalResult, ToolCallContext, ToolPolicy, ToolPolicyDecision,
+};
 use blockcell_core::types::{
     ChatMessage, LLMResponse, StreamChunk, ToolCallAccumulator, ToolCallRequest,
 };
@@ -74,6 +77,12 @@ enum ReviewMode {
     Memory,
     /// 同时审查 Skill 库和用户记忆
     Combined,
+}
+
+enum PolicyOutcome {
+    Proceed,
+    ProceedConfirmed,
+    Denied(String),
 }
 
 struct LearningReviewCompletionGuard {
@@ -624,6 +633,12 @@ fn extract_llm_usage_tokens(usage: &serde_json::Value) -> (u64, u64) {
     );
 
     (input, output)
+}
+
+fn summarize_tool_args(args: &serde_json::Value) -> String {
+    let summary = compact_json_value(args, 0);
+    let text = serde_json::to_string(&summary).unwrap_or_else(|_| "<unserializable>".to_string());
+    truncate_str(&text, 500)
 }
 
 fn append_activated_skill_history(
@@ -2039,6 +2054,8 @@ pub struct AgentRuntime {
     channel_contacts: blockcell_storage::ChannelContacts,
     /// Loaded path-access policy engine (from `~/.blockcell/path_access.json5`).
     path_policy: PathPolicy,
+    /// Loaded tool-call policy engine (from `~/.blockcell/tool_policy.yaml`).
+    tool_policy: ToolPolicy,
     /// Per-session cache for large list/table responses (prevents history token explosion).
     response_cache: crate::response_cache::ResponseCache,
     /// 7-Layer Memory System integration.
@@ -2087,6 +2104,7 @@ impl AgentRuntime {
         let audit_logger = AuditLogger::new(paths.clone());
         let channel_contacts = blockcell_storage::ChannelContacts::new(paths.clone());
         let path_policy = load_path_policy(&config, &paths);
+        let tool_policy = ToolPolicy::load(&paths.base.join("tool_policy.yaml"));
         let system_event_store = InMemorySystemEventStore::default();
         let summary_queue = MainSessionSummaryQueue::with_policy(
             5,
@@ -2172,6 +2190,7 @@ impl AgentRuntime {
             cap_request_cooldown: HashMap::new(),
             channel_contacts,
             path_policy,
+            tool_policy,
             response_cache: crate::response_cache::ResponseCache::with_config(
                 response_cache_config,
             ),
@@ -6536,6 +6555,60 @@ impl AgentRuntime {
         }
     }
 
+    async fn check_tool_policy(
+        &mut self,
+        tool_name: &str,
+        tool_args: &serde_json::Value,
+        msg: &InboundMessage,
+    ) -> PolicyOutcome {
+        let eval = self.tool_policy.evaluate(&ToolCallContext {
+            tool_name,
+            tool_args,
+            channel: &msg.channel,
+        });
+        self.audit_policy_decision(tool_name, &eval, msg);
+
+        match eval.decision {
+            ToolPolicyDecision::Allow => PolicyOutcome::Proceed,
+            ToolPolicyDecision::Deny => {
+                let reason = eval.description.unwrap_or_else(|| {
+                    format!(
+                        "Policy denied tool call by rule: {}",
+                        eval.matched_rule.as_deref().unwrap_or("default")
+                    )
+                });
+                PolicyOutcome::Denied(reason)
+            }
+            ToolPolicyDecision::Ask => {
+                let items = vec![format!("{}: {}", tool_name, summarize_tool_args(tool_args))];
+                if self
+                    .confirm_dangerous_operation(tool_name, items, msg)
+                    .await
+                {
+                    PolicyOutcome::ProceedConfirmed
+                } else {
+                    PolicyOutcome::Denied("用户拒绝了该操作".to_string())
+                }
+            }
+        }
+    }
+
+    fn audit_policy_decision(
+        &mut self,
+        tool_name: &str,
+        eval: &PolicyEvalResult,
+        msg: &InboundMessage,
+    ) {
+        let _ = self.audit_logger.log_permission_decision(
+            tool_name,
+            format!("{:?}", eval.decision),
+            eval.matched_rule.clone(),
+            eval.description.clone(),
+            eval.simulated,
+            &msg.session_key(),
+        );
+    }
+
     async fn execute_tool_call(
         &mut self,
         tool_call: &ToolCallRequest,
@@ -6553,9 +6626,31 @@ impl AgentRuntime {
             return disabled_skill_result(&tool_call.name);
         }
 
+        let policy_confirmed = match self
+            .check_tool_policy(&tool_call.name, &tool_call.arguments, msg)
+            .await
+        {
+            PolicyOutcome::Proceed => false,
+            PolicyOutcome::ProceedConfirmed => {
+                for path in self.extract_paths(&tool_call.name, &tool_call.arguments) {
+                    let resolved = self.resolve_path(&path);
+                    self.authorize_directory(&resolved);
+                }
+                true
+            }
+            PolicyOutcome::Denied(reason) => {
+                return serde_json::json!({
+                    "error": reason,
+                    "tool": tool_call.name,
+                    "policy": "tool_policy"
+                })
+                .to_string();
+            }
+        };
+
         // Dangerous-operation gate: require explicit user confirmation before executing
         // self-destructive commands or destructive file operations.
-        if tool_call.name == "exec" {
+        if !policy_confirmed && tool_call.name == "exec" {
             if let Some(cmd) = tool_call.arguments.get("command").and_then(|v| v.as_str()) {
                 if is_dangerous_exec_command(cmd) {
                     let items = vec![format!("command: {}", cmd)];
@@ -6570,7 +6665,7 @@ impl AgentRuntime {
             }
         }
 
-        if tool_call.name == "file_ops" {
+        if !policy_confirmed && tool_call.name == "file_ops" {
             let action = tool_call
                 .arguments
                 .get("action")
@@ -13662,5 +13757,161 @@ description: local demo
 
         assert_eq!(first, "within budget");
         assert_eq!(second, "within budget");
+    }
+
+    fn tool_policy_rule(
+        name: &str,
+        tool: &str,
+        decision: blockcell_core::tool_policy::ToolPolicyDecision,
+    ) -> blockcell_core::tool_policy::ToolPolicyRule {
+        blockcell_core::tool_policy::ToolPolicyRule {
+            name: name.to_string(),
+            tool: tool.to_string(),
+            decision,
+            when: None,
+            description: None,
+            inherit_from: None,
+        }
+    }
+
+    fn tool_call(name: &str, arguments: serde_json::Value) -> ToolCallRequest {
+        ToolCallRequest {
+            id: format!("call-{}", name),
+            name: name.to_string(),
+            arguments,
+            thought_signature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_policy_deny_blocks_tool_before_execution() {
+        use blockcell_core::tool_policy::{ToolPolicy, ToolPolicyConfig, ToolPolicyDecision};
+
+        let mut runtime = test_runtime();
+        let mut deny_exec = tool_policy_rule("deny-exec", "exec", ToolPolicyDecision::Deny);
+        deny_exec.description = Some("exec is disabled by policy".to_string());
+        runtime.tool_policy = ToolPolicy::from_config(ToolPolicyConfig {
+            rules: vec![deny_exec],
+            ..Default::default()
+        });
+
+        let result = runtime
+            .execute_tool_call(
+                &tool_call("exec", serde_json::json!({"command": "echo hello"})),
+                &test_main_session_inbound("cli", "policy-deny"),
+                None,
+            )
+            .await;
+
+        assert!(result.contains("exec is disabled by policy"));
+        assert!(!result.contains("Unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn tool_policy_ask_uses_existing_confirmation_flow() {
+        use blockcell_core::tool_policy::{ToolPolicy, ToolPolicyConfig, ToolPolicyDecision};
+
+        let mut runtime = test_runtime();
+        let ask_exec = tool_policy_rule("ask-exec", "exec", ToolPolicyDecision::Ask);
+        runtime.tool_policy = ToolPolicy::from_config(ToolPolicyConfig {
+            rules: vec![ask_exec],
+            ..Default::default()
+        });
+        let (confirm_tx, mut confirm_rx) = mpsc::channel(1);
+        runtime.confirm_tx = Some(confirm_tx);
+
+        let msg = test_main_session_inbound("cli", "policy-ask");
+        let call = tool_call("exec", serde_json::json!({"command": "echo hello"}));
+        let handle =
+            tokio::spawn(async move { runtime.execute_tool_call(&call, &msg, None).await });
+
+        let request = confirm_rx
+            .recv()
+            .await
+            .expect("policy ask should send confirmation request");
+        assert_eq!(request.tool_name, "exec");
+        assert_eq!(request.channel, "cli");
+        assert_eq!(request.chat_id, "policy-ask");
+        request.response_tx.send(false).expect("send denial");
+
+        let result = handle.await.expect("policy ask task should finish");
+        assert!(result.contains("用户拒绝") || result.contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn tool_policy_ask_confirmation_skips_duplicate_path_confirmation() {
+        use blockcell_core::tool_policy::{
+            ToolPolicy, ToolPolicyCondition, ToolPolicyConfig, ToolPolicyDecision,
+        };
+
+        let mut runtime = test_runtime();
+        let outside_path = std::env::temp_dir()
+            .join(format!("blockcell-policy-outside-{}", uuid::Uuid::new_v4()))
+            .join("secrets.env");
+        let mut ask_env_write =
+            tool_policy_rule("ask-env-write", "write_file", ToolPolicyDecision::Ask);
+        ask_env_write.when = Some(ToolPolicyCondition {
+            path_glob: Some("*.env".to_string()),
+            ..Default::default()
+        });
+        runtime.tool_policy = ToolPolicy::from_config(ToolPolicyConfig {
+            rules: vec![ask_env_write],
+            ..Default::default()
+        });
+        let (confirm_tx, mut confirm_rx) = mpsc::channel(2);
+        runtime.confirm_tx = Some(confirm_tx);
+
+        let msg = test_main_session_inbound("cli", "policy-single-confirm");
+        let call = tool_call(
+            "write_file",
+            serde_json::json!({"path": outside_path.to_string_lossy(), "content": "secret"}),
+        );
+        let handle =
+            tokio::spawn(async move { runtime.execute_tool_call(&call, &msg, None).await });
+
+        let request = confirm_rx
+            .recv()
+            .await
+            .expect("tool policy ask should send first confirmation");
+        assert_eq!(request.tool_name, "write_file");
+        request.response_tx.send(true).expect("approve policy ask");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("tool should not wait for a second path confirmation")
+            .expect("tool task should finish");
+
+        assert!(result.contains("Unknown tool"));
+        assert!(confirm_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn tool_policy_channel_condition_only_applies_to_matching_channel() {
+        use blockcell_core::tool_policy::{
+            ToolPolicy, ToolPolicyCondition, ToolPolicyConfig, ToolPolicyDecision,
+        };
+
+        let mut runtime = test_runtime();
+        let mut telegram_only =
+            tool_policy_rule("deny-telegram-exec", "exec", ToolPolicyDecision::Deny);
+        telegram_only.when = Some(ToolPolicyCondition {
+            channel: Some("telegram".to_string()),
+            ..Default::default()
+        });
+        runtime.tool_policy = ToolPolicy::from_config(ToolPolicyConfig {
+            rules: vec![telegram_only],
+            ..Default::default()
+        });
+
+        let result = runtime
+            .execute_tool_call(
+                &tool_call("exec", serde_json::json!({"command": "echo hello"})),
+                &test_main_session_inbound("cli", "policy-channel"),
+                None,
+            )
+            .await;
+
+        assert!(!result.contains("Policy denied"));
+        assert!(result.contains("Unknown tool"));
     }
 }

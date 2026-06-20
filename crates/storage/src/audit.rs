@@ -18,6 +18,15 @@ pub enum AuditEvent {
         trace_id: Option<String>,
         duration_ms: Option<u64>,
     },
+    PermissionDecision {
+        tool_name: String,
+        decision: String,
+        matched_rule: Option<String>,
+        description: Option<String>,
+        simulated: bool,
+        timestamp_ms: i64,
+        session_key: String,
+    },
     SkillSwitch {
         skill_name: String,
         from_version: Option<String>,
@@ -66,6 +75,27 @@ impl AuditLogger {
             session_key: session_key.to_string(),
             trace_id,
             duration_ms,
+        };
+        self.write_event(event)
+    }
+
+    pub fn log_permission_decision(
+        &mut self,
+        tool_name: &str,
+        decision: String,
+        matched_rule: Option<String>,
+        description: Option<String>,
+        simulated: bool,
+        session_key: &str,
+    ) -> Result<()> {
+        let event = AuditEvent::PermissionDecision {
+            tool_name: tool_name.to_string(),
+            decision,
+            matched_rule,
+            description,
+            simulated,
+            timestamp_ms: Utc::now().timestamp_millis(),
+            session_key: session_key.to_string(),
         };
         self.write_event(event)
     }
@@ -206,6 +236,42 @@ mod tests {
                 assert_eq!(tool_name, "read_file");
             }
             _ => panic!("Expected ToolCall event"),
+        }
+    }
+
+    #[test]
+    fn test_permission_decision_audit_event() {
+        let temp_dir = TempDir::new().unwrap();
+        let paths = Paths::with_base(temp_dir.path().to_path_buf());
+        let mut logger = AuditLogger::new(paths.clone());
+
+        logger
+            .log_permission_decision(
+                "exec",
+                "Deny".to_string(),
+                Some("deny-exec".to_string()),
+                Some("exec disabled".to_string()),
+                false,
+                "cli:policy",
+            )
+            .unwrap();
+
+        let events = logger.read_today().unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AuditEvent::PermissionDecision {
+                tool_name,
+                decision,
+                matched_rule,
+                session_key,
+                ..
+            } => {
+                assert_eq!(tool_name, "exec");
+                assert_eq!(decision, "Deny");
+                assert_eq!(matched_rule.as_deref(), Some("deny-exec"));
+                assert_eq!(session_key, "cli:policy");
+            }
+            _ => panic!("Expected PermissionDecision event"),
         }
     }
 }

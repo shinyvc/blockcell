@@ -14,6 +14,7 @@ pub mod path_policy;
 pub mod paths;
 pub mod session_key;
 pub mod system_event;
+pub mod tool_policy;
 pub mod types;
 
 pub use abort_token::{AbortToken, CancelledError, CleanupHandle, CleanupRegistry};

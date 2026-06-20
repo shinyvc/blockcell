@@ -1,0 +1,209 @@
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+const MICRO_USD_PER_CENT: u64 = 10_000;
+const MICRO_USD_PER_USD: u64 = 1_000_000;
+
+/// Snapshot of current token and cost budget usage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetSnapshot {
+    pub input_tokens_used: u64,
+    pub output_tokens_used: u64,
+    pub total_tokens_used: u64,
+    pub cost_used_micro_usd: u64,
+    /// 0 means unlimited or not configured.
+    pub tokens_remaining: u64,
+    /// 0 means unlimited or not configured.
+    pub cost_remaining_micro_usd: u64,
+    /// Highest active budget usage ratio. 0.0 means no active limits.
+    pub usage_ratio: f64,
+}
+
+/// Error returned when a token or cost budget has been exhausted.
+#[derive(Debug, Clone)]
+pub struct BudgetExhaustedError {
+    pub message: String,
+    pub snapshot: BudgetSnapshot,
+}
+
+impl std::fmt::Display for BudgetExhaustedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for BudgetExhaustedError {}
+
+/// Per-session token and cost budget configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetConfig {
+    /// Max input + output tokens per session. 0 means unlimited.
+    #[serde(default)]
+    pub max_tokens_per_session: u64,
+    /// Max cost per session, in cents. 0 means unlimited.
+    #[serde(default)]
+    pub max_cost_cents_per_session: u64,
+    /// Warning ratio before exhaustion. Defaults to 0.8.
+    #[serde(default = "default_warning_threshold")]
+    pub warning_threshold: f64,
+}
+
+fn default_warning_threshold() -> f64 {
+    0.8
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens_per_session: 0,
+            max_cost_cents_per_session: 0,
+            warning_threshold: default_warning_threshold(),
+        }
+    }
+}
+
+/// Thread-safe tracker for per-session token and cost budget usage.
+#[derive(Debug)]
+pub struct BudgetTracker {
+    max_tokens: u64,
+    max_cost_micro_usd: u64,
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+    cost_micro_usd: AtomicU64,
+    warning_threshold: f64,
+}
+
+impl BudgetTracker {
+    pub fn new(config: &BudgetConfig) -> Self {
+        let warning_threshold =
+            if config.warning_threshold.is_finite() && config.warning_threshold > 0.0 {
+                config.warning_threshold
+            } else {
+                default_warning_threshold()
+            };
+
+        Self {
+            max_tokens: config.max_tokens_per_session,
+            max_cost_micro_usd: config
+                .max_cost_cents_per_session
+                .saturating_mul(MICRO_USD_PER_CENT),
+            input_tokens: AtomicU64::new(0),
+            output_tokens: AtomicU64::new(0),
+            cost_micro_usd: AtomicU64::new(0),
+            warning_threshold,
+        }
+    }
+
+    /// Record usage for one LLM call and return the current snapshot.
+    pub fn record_usage(&self, input: u64, output: u64, cost_micro_usd: u64) -> BudgetSnapshot {
+        self.input_tokens.fetch_add(input, Ordering::Relaxed);
+        self.output_tokens.fetch_add(output, Ordering::Relaxed);
+        self.cost_micro_usd
+            .fetch_add(cost_micro_usd, Ordering::Relaxed);
+        self.snapshot()
+    }
+
+    /// Return current budget usage.
+    pub fn snapshot(&self) -> BudgetSnapshot {
+        let input = self.input_tokens.load(Ordering::Relaxed);
+        let output = self.output_tokens.load(Ordering::Relaxed);
+        let total = input.saturating_add(output);
+        let cost = self.cost_micro_usd.load(Ordering::Relaxed);
+
+        let tokens_remaining = if self.max_tokens > 0 {
+            self.max_tokens.saturating_sub(total)
+        } else {
+            0
+        };
+        let cost_remaining_micro_usd = if self.max_cost_micro_usd > 0 {
+            self.max_cost_micro_usd.saturating_sub(cost)
+        } else {
+            0
+        };
+        let token_ratio = if self.max_tokens > 0 {
+            total as f64 / self.max_tokens as f64
+        } else {
+            0.0
+        };
+        let cost_ratio = if self.max_cost_micro_usd > 0 {
+            cost as f64 / self.max_cost_micro_usd as f64
+        } else {
+            0.0
+        };
+
+        BudgetSnapshot {
+            input_tokens_used: input,
+            output_tokens_used: output,
+            total_tokens_used: total,
+            cost_used_micro_usd: cost,
+            tokens_remaining,
+            cost_remaining_micro_usd,
+            usage_ratio: token_ratio.max(cost_ratio),
+        }
+    }
+
+    /// Return true if any active budget limit has been reached.
+    pub fn is_exhausted(&self) -> bool {
+        let snapshot = self.snapshot();
+        (self.max_tokens > 0 && snapshot.total_tokens_used >= self.max_tokens)
+            || (self.max_cost_micro_usd > 0
+                && snapshot.cost_used_micro_usd >= self.max_cost_micro_usd)
+    }
+
+    /// Return true when usage has crossed the warning threshold but is not exhausted.
+    pub fn should_warn(&self) -> bool {
+        let snapshot = self.snapshot();
+        snapshot.usage_ratio >= self.warning_threshold && !self.is_exhausted()
+    }
+
+    /// Check the active budget and return an error if it has been exhausted.
+    pub fn check_budget(&self) -> Result<BudgetSnapshot, BudgetExhaustedError> {
+        let snapshot = self.snapshot();
+        if !self.is_exhausted() {
+            return Ok(snapshot);
+        }
+
+        let mut parts = Vec::new();
+        if self.max_tokens > 0 {
+            parts.push(format!(
+                "tokens: {}/{}",
+                snapshot.total_tokens_used, self.max_tokens
+            ));
+        }
+        if self.max_cost_micro_usd > 0 {
+            parts.push(format!(
+                "cost: {}/{}",
+                format_micro_usd(snapshot.cost_used_micro_usd),
+                format_micro_usd(self.max_cost_micro_usd)
+            ));
+        }
+
+        Err(BudgetExhaustedError {
+            message: format!("Budget exhausted ({})", parts.join(", ")),
+            snapshot,
+        })
+    }
+
+    /// Reset all accumulated usage.
+    pub fn reset(&self) {
+        self.input_tokens.store(0, Ordering::Relaxed);
+        self.output_tokens.store(0, Ordering::Relaxed);
+        self.cost_micro_usd.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Shareable budget tracker handle.
+pub type BudgetTrackerHandle = Arc<BudgetTracker>;
+
+fn format_micro_usd(value: u64) -> String {
+    let usd = value / MICRO_USD_PER_USD;
+    let micros = value % MICRO_USD_PER_USD;
+    if micros % MICRO_USD_PER_CENT == 0 {
+        format!("${}.{:02}", usd, micros / MICRO_USD_PER_CENT)
+    } else {
+        format!("${}.{:06}", usd, micros)
+    }
+}
