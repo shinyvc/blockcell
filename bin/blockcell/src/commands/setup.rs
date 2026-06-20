@@ -3,6 +3,8 @@ use blockcell_core::config::{ModelEntry, ToolCallMode};
 use blockcell_core::{Config, Paths};
 use std::io::{self, Write};
 
+use super::provider_defaults::default_model_for_provider;
+
 /// Interactive first-run setup wizard for provider + optional channel.
 pub async fn run(
     force: bool,
@@ -457,7 +459,13 @@ fn prompt_provider(config: &Config) -> anyhow::Result<String> {
         "anthropic",
         "gemini",
         "zhipu",
+        "qwen",
+        "xai",
+        "mistral",
         "minimax",
+        "groq",
+        "siliconflow",
+        "openrouter",
         "ollama (local)",
         "skip",
     ];
@@ -469,8 +477,14 @@ fn prompt_provider(config: &Config) -> anyhow::Result<String> {
         3 => "anthropic",
         4 => "gemini",
         5 => "zhipu",
-        6 => "minimax",
-        7 => "ollama",
+        6 => "qwen",
+        7 => "xai",
+        8 => "mistral",
+        9 => "minimax",
+        10 => "groq",
+        11 => "siliconflow",
+        12 => "openrouter",
+        13 => "ollama",
         _ => "skip",
     };
     Ok(mapped.to_string())
@@ -535,8 +549,14 @@ fn normalize_provider(input: &str) -> Option<&'static str> {
         "kimi" | "moonshot" => Some("kimi"),
         "anthropic" | "claude" => Some("anthropic"),
         "gemini" => Some("gemini"),
-        "zhipu" => Some("zhipu"),
+        "zhipu" | "glm" | "zai" | "z.ai" => Some("zhipu"),
+        "qwen" | "tongyi" | "dashscope" => Some("qwen"),
+        "xai" | "grok" => Some("xai"),
+        "mistral" => Some("mistral"),
         "minimax" => Some("minimax"),
+        "groq" => Some("groq"),
+        "siliconflow" => Some("siliconflow"),
+        "openrouter" => Some("openrouter"),
         "ollama" => Some("ollama"),
         "none" | "skip" => Some("skip"),
         _ => None,
@@ -557,20 +577,6 @@ fn normalize_channel(input: &str) -> Option<&'static str> {
     }
 }
 
-fn default_model_for_provider(provider: &str) -> &'static str {
-    match provider {
-        "deepseek" => "deepseek-v4-pro",
-        "openai" => "gpt-4o",
-        "anthropic" => "claude-sonnet-4-20250514",
-        "kimi" => "moonshot-v1-8k",
-        "gemini" => "gemini-2.0-flash",
-        "zhipu" => "glm-4",
-        "minimax" => "minimax-text-01",
-        "ollama" => "llama3",
-        _ => "gpt-4o",
-    }
-}
-
 fn default_api_base_for_provider(provider: &str) -> Option<&'static str> {
     match provider {
         "deepseek" => Some("https://api.deepseek.com/v1"),
@@ -578,8 +584,14 @@ fn default_api_base_for_provider(provider: &str) -> Option<&'static str> {
         "anthropic" => Some("https://api.anthropic.com"),
         "kimi" => Some("https://api.moonshot.cn/v1"),
         "gemini" => Some("https://generativelanguage.googleapis.com/v1beta/openai"),
-        "zhipu" => Some("https://open.bigmodel.cn/api/paas/v4"),
+        "zhipu" | "glm" => Some("https://open.bigmodel.cn/api/paas/v4"),
         "minimax" => Some("https://api.minimaxi.com/v1"),
+        "groq" => Some("https://api.groq.com/openai/v1"),
+        "siliconflow" => Some("https://api.siliconflow.cn/v1"),
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "qwen" => Some("https://api.qwen.ai/v1"),
+        "xai" => Some("https://api.x.ai/v1"),
+        "mistral" => Some("https://api.mistral.ai/v1"),
         "ollama" => Some("http://localhost:11434"),
         _ => None,
     }
@@ -656,7 +668,14 @@ mod tests {
         assert_eq!(normalize_provider("moonshot"), Some("kimi"));
         assert_eq!(normalize_provider("claude"), Some("anthropic"));
         assert_eq!(normalize_provider("zhipu"), Some("zhipu"));
+        assert_eq!(normalize_provider("glm"), Some("zhipu"));
+        assert_eq!(normalize_provider("qwen"), Some("qwen"));
+        assert_eq!(normalize_provider("grok"), Some("xai"));
+        assert_eq!(normalize_provider("mistral"), Some("mistral"));
         assert_eq!(normalize_provider("minimax"), Some("minimax"));
+        assert_eq!(normalize_provider("groq"), Some("groq"));
+        assert_eq!(normalize_provider("siliconflow"), Some("siliconflow"));
+        assert_eq!(normalize_provider("openrouter"), Some("openrouter"));
         assert_eq!(normalize_provider("none"), Some("skip"));
         assert_eq!(normalize_provider("unknown"), None);
     }
@@ -675,10 +694,27 @@ mod tests {
     #[test]
     fn test_default_model() {
         assert_eq!(default_model_for_provider("deepseek"), "deepseek-v4-pro");
-        assert_eq!(default_model_for_provider("openai"), "gpt-4o");
-        assert_eq!(default_model_for_provider("kimi"), "moonshot-v1-8k");
-        assert_eq!(default_model_for_provider("zhipu"), "glm-4");
-        assert_eq!(default_model_for_provider("minimax"), "minimax-text-01");
+        assert_eq!(default_model_for_provider("openai"), "gpt-5.5");
+        assert_eq!(default_model_for_provider("anthropic"), "claude-opus-4-8");
+        assert_eq!(default_model_for_provider("kimi"), "kimi-k2.6");
+        assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.6");
+        assert_eq!(
+            default_model_for_provider("gemini"),
+            "gemini-3.1-pro-preview"
+        );
+        assert_eq!(default_model_for_provider("zhipu"), "glm-5.2");
+        assert_eq!(default_model_for_provider("glm"), "glm-5.2");
+        assert_eq!(default_model_for_provider("qwen"), "qwen3.7-max");
+        assert_eq!(default_model_for_provider("xai"), "grok-4.3");
+        assert_eq!(default_model_for_provider("mistral"), "mistral-medium-2604");
+        assert_eq!(default_model_for_provider("minimax"), "MiniMax-M3");
+        assert_eq!(default_model_for_provider("groq"), "openai/gpt-oss-120b");
+        assert_eq!(
+            default_model_for_provider("siliconflow"),
+            "deepseek-ai/DeepSeek-V4-Pro"
+        );
+        assert_eq!(default_model_for_provider("openrouter"), "openai/gpt-5.5");
+        assert_eq!(default_model_for_provider("ollama"), "llama3.3");
     }
 
     #[test]

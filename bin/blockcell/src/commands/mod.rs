@@ -16,6 +16,7 @@ pub mod memory;
 pub mod memory_store;
 pub mod onboard;
 pub mod provider;
+pub(crate) mod provider_defaults;
 pub mod run_cmd;
 pub mod setup;
 pub mod skills;

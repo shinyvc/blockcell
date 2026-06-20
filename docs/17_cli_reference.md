@@ -27,20 +27,26 @@ blockcell setup [OPTIONS]
 | 选项 | 说明 |
 |------|------|
 | `--force` | 重置现有配置为默认值后再开始设置 |
-| `--provider <NAME>` | 指定 LLM provider（deepseek/openai/kimi/anthropic/gemini/zhipu/minimax/ollama） |
+| `--provider <NAME>` | 指定 LLM provider（deepseek/openai/kimi/anthropic/gemini/zhipu/qwen/xai/mistral/minimax/groq/siliconflow/openrouter/ollama） |
 | `--api-key <KEY>` | 指定 provider 的 API key |
-| `--model <MODEL>` | 指定模型名（如 deepseek-v4-pro、moonshot-v1-8k、claude-sonnet-4-20250514） |
+| `--model <MODEL>` | 指定模型名（如 deepseek-v4-pro、kimi-k2.6、claude-opus-4-8） |
 | `--channel <NAME>` | 可选渠道配置（telegram/feishu/wecom/dingtalk/lark/none；`skip` 也兼容） |
 | `--skip-provider-test` | 跳过保存后的 provider 配置验证 |
 
 **支持的 provider:**
 - `deepseek` - 推荐，性价比高
-- `openai` - GPT-4o 等模型
+- `openai` - GPT-5.5 等模型
 - `kimi` (moonshot) - 国内访问稳定
 - `anthropic` (claude) - Claude 系列
 - `gemini` - Google Gemini
 - `zhipu` - 智谱 GLM
+- `qwen` - 通义千问
+- `xai` - Grok 系列
+- `mistral` - Mistral
 - `minimax` - MiniMax
+- `groq` - Groq OpenAI-compatible
+- `siliconflow` - 硅基流动
+- `openrouter` - OpenRouter 聚合路由
 - `ollama` - 本地模型，免费
 
 **支持的渠道:**
@@ -94,7 +100,7 @@ blockcell onboard [OPTIONS]
 | `--interactive` | 交互式向导模式 |
 | `--provider <NAME>` | 指定 LLM provider（如 deepseek、openai、kimi、anthropic） |
 | `--api-key <KEY>` | 指定 provider 的 API key |
-| `--model <MODEL>` | 指定模型名（如 deepseek-v4-pro、moonshot-v1-8k） |
+| `--model <MODEL>` | 指定模型名（如 deepseek-v4-pro、kimi-k2.6） |
 | `--channels-only` | 仅更新渠道配置，跳过 provider 设置 |
 
 **示例：**
@@ -144,7 +150,7 @@ blockcell agent -a ops -m "帮我查询 BTC 价格"
 blockcell agent -a ops -s work:finance
 
 # 临时使用不同模型
-blockcell agent --agent ops --model gpt-4o --provider openai
+blockcell agent --agent ops --model gpt-5.5 --provider openai
 ```
 
 **统一斜杠命令：**

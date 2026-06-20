@@ -153,7 +153,7 @@ Find the `providers` section and fill in your API key.
   },
   "agents": {
     "defaults": {
-      "model": "kimi/moonshot-v1-8k"
+      "model": "kimi-k2.6"
     }
   }
 }
@@ -171,7 +171,7 @@ Find the `providers` section and fill in your API key.
   },
   "agents": {
     "defaults": {
-      "model": "anthropic/claude-sonnet-4-20250514"
+      "model": "anthropic/claude-opus-4-8"
     }
   }
 }
@@ -337,7 +337,7 @@ Key fields in `~/.blockcell/config.json5`:
   },
   "agents": {
     "defaults": {
-      "model": "gpt-4o",
+      "model": "gpt-5.5",
       "maxTokens": 4096,
       "temperature": 0.7
     }

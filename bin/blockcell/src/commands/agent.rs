@@ -120,7 +120,7 @@ const BUILTIN_TOOLS: &[(&str, &[(&str, &str)])] = &[
             ("ocr", "Image text recognition (Tesseract/Vision/API)"),
             (
                 "image_understand",
-                "Multimodal image understanding (GPT-4o/Claude/Gemini)",
+                "Multimodal image understanding (GPT-5.5/Claude/Gemini)",
             ),
             (
                 "video_process",

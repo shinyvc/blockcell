@@ -343,12 +343,12 @@ blockcell gateway
 
 ### 支持的 LLM 提供商
 
-- **OpenAI**（GPT-4o、GPT-4.1、o1、o3）
-- **Anthropic**（Claude 3.5 Sonnet、Claude 4）
-- **Google Gemini**（Gemini 2.0 Flash、Pro）
+- **OpenAI**（GPT-5.5、GPT-5.4-mini、o1、o3）
+- **Anthropic**（Claude Opus 4.8、Claude Sonnet 4.6）
+- **Google Gemini**（Gemini 3.1 Pro、Gemini 3.5 Flash）
 - **DeepSeek**（DeepSeek V4 Pro、V3、R1）
 - **Kimi/Moonshot**（月之暗面）
-- **MiniMax**（[MiniMax 2.5](https://www.minimaxi.com/)）
+- **MiniMax**（[MiniMax M3](https://www.minimaxi.com/)）
 - **智谱 AI**（[GLM-5](https://bigmodel.cn/)）
 - **硅基流动**（[SiliconFlow](https://siliconflow.cn/)）
 - **Ollama**（本地模型，完全离线）

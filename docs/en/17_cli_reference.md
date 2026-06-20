@@ -31,7 +31,7 @@ Recommended for first-time users. `setup` walks you through provider setup and o
 | Option | Description |
 |------|------|
 | `--force` | Reset existing config to defaults before starting |
-| `--provider <NAME>` | Provider name (`deepseek` / `openai` / `kimi` / `anthropic` / `gemini` / `zhipu` / `minimax` / `ollama`) |
+| `--provider <NAME>` | Provider name (`deepseek` / `openai` / `kimi` / `anthropic` / `gemini` / `zhipu` / `qwen` / `xai` / `mistral` / `minimax` / `groq` / `siliconflow` / `openrouter` / `ollama`) |
 | `--api-key <KEY>` | API key for the selected provider |
 | `--model <MODEL>` | Model override |
 | `--channel <NAME>` | Optional channel to configure (`telegram` / `feishu` / `wecom` / `dingtalk` / `lark` / `none`) |
@@ -109,7 +109,7 @@ blockcell agent
 blockcell agent --agent ops
 blockcell agent -a ops -m "Check BTC price"
 blockcell agent -a ops -s work:finance
-blockcell agent --agent ops --model gpt-4o --provider openai
+blockcell agent --agent ops --model gpt-5.5 --provider openai
 ```
 
 Unified slash commands:

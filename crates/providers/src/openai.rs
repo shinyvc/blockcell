@@ -1841,13 +1841,13 @@ mod tests {
     #[test]
     fn test_apply_reasoning_effort_unsupported_provider_not_affected() {
         // OpenAI、Groq、Kimi 等不支持 thinking 模式，不应注入任何参数
-        let mut body = json!({"model": "gpt-4o", "messages": []});
+        let mut body = json!({"model": "gpt-5.5", "messages": []});
         OpenAIProvider::apply_reasoning_effort(&mut body, Some("high"), "openai");
         assert!(body.get("thinking").is_none());
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("chat_template_kwargs").is_none());
 
-        let mut body2 = json!({"model": "moonshot-v1", "messages": []});
+        let mut body2 = json!({"model": "kimi-k2.6", "messages": []});
         OpenAIProvider::apply_reasoning_effort(&mut body2, Some("max"), "kimi");
         assert!(body2.get("thinking").is_none());
         assert!(body2.get("reasoning_effort").is_none());

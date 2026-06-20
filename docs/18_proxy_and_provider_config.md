@@ -108,7 +108,7 @@ WebUI 的完整配置编辑器也会直接读取/保存原始 `config.json5` 文
   },
   "agents": {
     "defaults": {
-      "model": "moonshot-v1-8k"
+      "model": "kimi-k2.6"
     }
   }
 }
@@ -157,7 +157,7 @@ WebUI 的完整配置编辑器也会直接读取/保存原始 `config.json5` 文
   },
   "agents": {
     "defaults": {
-      "model": "Qwen2.5-72B-Instruct",
+      "model": "Qwen/Qwen3.6-35B-A3B",
       "provider": "vllm"
     }
   }

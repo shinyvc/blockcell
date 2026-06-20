@@ -646,7 +646,7 @@ mod tests {
     #[test]
     fn test_responses_request_includes_temperature() {
         let request = ResponsesRequest {
-            model: "gpt-4o".to_string(),
+            model: "gpt-5.5".to_string(),
             input: Vec::new(),
             tools: Vec::new(),
             max_output_tokens: 128,

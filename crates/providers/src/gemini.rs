@@ -76,7 +76,7 @@ impl GeminiProvider {
     }
 
     /// Normalize model name: strip "gemini/" prefix if present.
-    /// Config may store "gemini/gemini-2.0-flash" but the API expects "gemini-2.0-flash".
+    /// Config may store "gemini/gemini-3.5-flash" but the API expects "gemini-3.5-flash".
     fn normalize_model(model: &str) -> &str {
         model.strip_prefix("gemini/").unwrap_or(model)
     }
@@ -711,8 +711,8 @@ mod tests {
     #[test]
     fn test_normalize_model() {
         assert_eq!(
-            GeminiProvider::normalize_model("gemini/gemini-2.0-flash"),
-            "gemini-2.0-flash"
+            GeminiProvider::normalize_model("gemini/gemini-3.5-flash"),
+            "gemini-3.5-flash"
         );
         assert_eq!(
             GeminiProvider::normalize_model("gemini-1.5-pro"),

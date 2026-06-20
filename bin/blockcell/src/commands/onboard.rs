@@ -5,6 +5,8 @@ use blockcell_core::{
 use std::io::{self, Write};
 use std::process::Command;
 
+use super::provider_defaults::default_model_for_provider;
+
 const AGENTS_MD: &str = r#"# Agent Guidelines
 
 You are blockcell, a helpful AI assistant.
@@ -396,7 +398,7 @@ pub async fn run(
     println!(
         "  blockcell onboard --provider deepseek --api-key YOUR_API_KEY --model deepseek-v4-pro"
     );
-    println!("  blockcell onboard --provider kimi --api-key YOUR_API_KEY --model kimi-k2.5");
+    println!("  blockcell onboard --provider kimi --api-key YOUR_API_KEY --model kimi-k2.6");
     println!("  blockcell onboard --provider openai --api-key YOUR_API_KEY");
 
     Ok(())
@@ -431,27 +433,13 @@ fn ensure_auto_upgrade_defaults(json: &mut serde_json::Value) {
     }
 }
 
-fn default_model_for_provider(provider: &str) -> &'static str {
-    match provider.to_lowercase().as_str() {
-        "deepseek" => "deepseek-v4-pro",
-        "openai" => "gpt-4o",
-        "anthropic" => "claude-sonnet-4-20250514",
-        "kimi" | "moonshot" => "kimi-k2.5",
-        "gemini" => "gemini-1.5-flash",
-        "groq" => "llama-3.1-70b-versatile",
-        "zhipu" => "glm-4",
-        "ollama" => "llama3",
-        _ => "gpt-4o",
-    }
-}
-
 fn default_max_context_tokens_for_provider(provider: &str) -> u32 {
     match provider.to_lowercase().as_str() {
         "deepseek" => 1_048_576,        // 1M — DeepSeek V4 Pro
         "anthropic" => 200_000,         // 200K — Claude Sonnet 4
-        "gemini" => 1_048_576,          // 1M — Gemini 1.5
+        "gemini" => 1_048_576,          // 1M — Gemini 3.5
         "kimi" | "moonshot" => 262_144, // 256K — Kimi K2.6
-        "openai" => 131_072,            // 128K — GPT-4o
+        "openai" => 131_072,            // 128K — GPT-5.5
         "groq" => 131_072,              // 128K
         "zhipu" => 131_072,             // 128K — GLM-5
         "ollama" => 8_192,              // 8K — depends on local model

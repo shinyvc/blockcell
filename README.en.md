@@ -343,12 +343,12 @@ Notes:
 
 ### Supported LLM Providers
 
-- **OpenAI** (GPT-4o, GPT-4.1, o1, o3)
-- **Anthropic** (Claude 3.5 Sonnet, Claude 4)
-- **Google Gemini** (Gemini 2.0 Flash, Pro)
+- **OpenAI** (GPT-5.5, GPT-5.4-mini, o1, o3)
+- **Anthropic** (Claude Opus 4.8, Claude Sonnet 4.6)
+- **Google Gemini** (Gemini 3.1 Pro, Gemini 3.5 Flash)
 - **DeepSeek** (DeepSeek V4 Pro, V3, R1)
 - **Kimi/Moonshot**
-- **MiniMax** ([MiniMax 2.5](https://www.minimaxi.com/))
+- **MiniMax** ([MiniMax M3](https://www.minimaxi.com/))
 - **Zhipu AI** ([GLM-5](https://bigmodel.cn/))
 - **SiliconFlow** ([SiliconFlow](https://siliconflow.cn/))
 - **Ollama** (local models, fully offline)

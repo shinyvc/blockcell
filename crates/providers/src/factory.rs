@@ -13,8 +13,13 @@ pub(crate) fn default_api_base(provider_name: &str) -> &'static str {
         "openai" => "https://api.openai.com/v1",
         "deepseek" => "https://api.deepseek.com/v1",
         "groq" => "https://api.groq.com/openai/v1",
-        "zhipu" => "https://open.bigmodel.cn/api/paas/v4",
+        "zhipu" | "glm" => "https://open.bigmodel.cn/api/paas/v4",
         "kimi" | "moonshot" => "https://api.moonshot.cn/v1",
+        "qwen" => "https://api.qwen.ai/v1",
+        "xai" => "https://api.x.ai/v1",
+        "mistral" => "https://api.mistral.ai/v1",
+        "minimax" => "https://api.minimaxi.com/v1",
+        "siliconflow" => "https://api.siliconflow.cn/v1",
         _ => "https://api.openai.com/v1",
     }
 }
@@ -22,23 +27,42 @@ pub(crate) fn default_api_base(provider_name: &str) -> &'static str {
 /// 从 model 字符串前缀推断 provider 名字
 /// 返回 None 表示无法从前缀推断（需要 fallback）
 pub fn infer_provider_from_model(model: &str) -> Option<&'static str> {
-    if model.starts_with("anthropic/") || model.starts_with("claude-") {
+    let model = model.trim();
+    let lower = model.to_ascii_lowercase();
+
+    if lower.starts_with("anthropic/") || lower.starts_with("claude-") {
         Some("anthropic")
-    } else if model.starts_with("gemini/") || model.starts_with("gemini-") {
+    } else if lower.starts_with("gemini/") || lower.starts_with("gemini-") {
         Some("gemini")
-    } else if model.starts_with("ollama/") {
+    } else if lower.starts_with("ollama/") {
         Some("ollama")
-    } else if model.starts_with("kimi") || model.starts_with("moonshot") {
+    } else if lower.starts_with("kimi") || lower.starts_with("moonshot") {
         Some("kimi")
-    } else if model.starts_with("openai/")
-        || model.starts_with("gpt-")
-        || model.starts_with("o1")
-        || model.starts_with("o3")
+    } else if lower.starts_with("openai/")
+        || lower.starts_with("gpt-")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
     {
         Some("openai")
-    } else if model.starts_with("deepseek") {
+    } else if lower.starts_with("deepseek-ai/")
+        || lower.starts_with("zai-org/")
+        || lower.starts_with("qwen/")
+    {
+        Some("siliconflow")
+    } else if lower.starts_with("deepseek") {
         Some("deepseek")
-    } else if model.starts_with("groq/") {
+    } else if lower.starts_with("grok-") {
+        Some("xai")
+    } else if lower.starts_with("mistral") {
+        Some("mistral")
+    } else if lower.starts_with("glm-") {
+        Some("zhipu")
+    } else if lower.starts_with("qwen") {
+        Some("qwen")
+    } else if lower.starts_with("minimax") {
+        Some("minimax")
+    } else if lower.starts_with("groq/") {
         Some("groq")
     } else {
         None
@@ -56,7 +80,12 @@ fn fallback_provider_name(config: &Config) -> Option<&str> {
         "kimi",
         "gemini",
         "zhipu",
+        "qwen",
+        "xai",
+        "mistral",
+        "minimax",
         "groq",
+        "siliconflow",
         "vllm",
         "ollama",
     ];
@@ -115,7 +144,7 @@ pub fn create_provider_with_tool_mode(
     } else {
         return Err(anyhow::anyhow!(
             "No LLM provider configured. Set 'provider' in config, use a recognized model prefix \
-             (e.g. 'anthropic/claude-...', 'gpt-4o', 'gemini-...'), or add an API key to providers section."
+             (e.g. 'anthropic/claude-...', 'gpt-5.5', 'gemini-...'), or add an API key to providers section."
         ));
     };
 
@@ -311,7 +340,7 @@ mod tests {
             Some("anthropic")
         );
         assert_eq!(
-            infer_provider_from_model("gemini-2.0-flash"),
+            infer_provider_from_model("gemini-3.5-flash"),
             Some("gemini")
         );
         assert_eq!(
@@ -319,8 +348,21 @@ mod tests {
             Some("gemini")
         );
         assert_eq!(infer_provider_from_model("ollama/llama3"), Some("ollama"));
-        assert_eq!(infer_provider_from_model("kimi-moonshot-v1"), Some("kimi"));
-        assert_eq!(infer_provider_from_model("gpt-4o"), Some("openai"));
+        assert_eq!(infer_provider_from_model("kimi-k2.6"), Some("kimi"));
+        assert_eq!(infer_provider_from_model("gpt-5.5"), Some("openai"));
+        assert_eq!(infer_provider_from_model("o4-mini"), Some("openai"));
+        assert_eq!(infer_provider_from_model("grok-4.3"), Some("xai"));
+        assert_eq!(
+            infer_provider_from_model("mistral-medium-2604"),
+            Some("mistral")
+        );
+        assert_eq!(infer_provider_from_model("glm-5.2"), Some("zhipu"));
+        assert_eq!(infer_provider_from_model("qwen3.7-max"), Some("qwen"));
+        assert_eq!(infer_provider_from_model("MiniMax-M3"), Some("minimax"));
+        assert_eq!(
+            infer_provider_from_model("deepseek-ai/DeepSeek-V4-Pro"),
+            Some("siliconflow")
+        );
         assert_eq!(
             infer_provider_from_model("deepseek-coder"),
             Some("deepseek")
@@ -369,7 +411,7 @@ mod tests {
     #[test]
     fn test_create_provider_explicit_missing_fails() {
         let config = Config::default(); // anthropic key 为空
-        let result = create_provider(&config, "gpt-4o", Some("anthropic"));
+        let result = create_provider(&config, "gpt-5.5", Some("anthropic"));
         assert!(result.is_err(), "显式指定但无 api_key 时应报错");
     }
 }

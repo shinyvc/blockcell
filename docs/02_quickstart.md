@@ -80,7 +80,7 @@ blockcell setup
 
 **支持的 provider:**
 - `deepseek` - 推荐,便宜且性能好
-- `openai` - GPT-4o 等
+- `openai` - GPT-5.5 等
 - `kimi` - 国内访问稳定
 - `anthropic` - Claude 系列
 - `gemini` - Google Gemini
@@ -187,11 +187,11 @@ nano ~/.blockcell/config.json5
   },
   "agents": {
     "defaults": {
-      "model": "moonshot-v1-8k",
+      "model": "kimi-k2.6",
       "provider": "kimi",
       "modelPool": [
         {
-          "model": "moonshot-v1-8k",
+          "model": "kimi-k2.6",
           "provider": "kimi",
           "weight": 1,
           "priority": 1
@@ -214,11 +214,11 @@ nano ~/.blockcell/config.json5
   },
   "agents": {
     "defaults": {
-      "model": "anthropic/claude-sonnet-4-20250514",
+      "model": "anthropic/claude-opus-4-8",
       "provider": "openrouter",
       "modelPool": [
         {
-          "model": "anthropic/claude-sonnet-4-20250514",
+          "model": "anthropic/claude-opus-4-8",
           "provider": "openrouter",
           "weight": 1,
           "priority": 1
@@ -405,13 +405,13 @@ blockcell doctor
   },
   "agents": {
     "defaults": {
-      "model": "gpt-4o",
+      "model": "gpt-5.5",
       "provider": "openai",
       "maxTokens": 8192,
       "temperature": 0.7,
       "modelPool": [
         {
-          "model": "gpt-4o",
+          "model": "gpt-5.5",
           "provider": "openai",
           "weight": 2,
           "priority": 1
@@ -457,7 +457,7 @@ blockcell doctor
 `modelPool` 是一个可选的高级功能，用于配置多模型负载均衡和自动降级：
 
 **字段说明：**
-- `model`: 模型名称（如 "gpt-4o"、"deepseek-v4-pro"）
+- `model`: 模型名称（如 "gpt-5.5"、"deepseek-v4-pro"）
 - `provider`: 对应 providers 表中的 key
 - `weight`: 负载均衡权重（正整数，越大越优先被选中），默认 1
 - `priority`: 优先级（小数字 = 高优先级），同优先级内按 weight 加权随机，默认 1

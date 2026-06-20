@@ -454,9 +454,9 @@ mod tests {
 
     #[test]
     fn test_parse_config_cli_value_accepts_json5_objects() {
-        let value = parse_config_cli_value("{ enabled: true, models: ['gpt-4o',], }");
+        let value = parse_config_cli_value("{ enabled: true, models: ['gpt-5.5',], }");
         assert_eq!(value["enabled"], serde_json::json!(true));
-        assert_eq!(value["models"][0], serde_json::json!("gpt-4o"));
+        assert_eq!(value["models"][0], serde_json::json!("gpt-5.5"));
     }
 
     #[test]

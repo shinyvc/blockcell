@@ -330,7 +330,7 @@ impl AnthropicProvider {
     }
 
     /// Strip the "anthropic/" or "claude-" prefix from model names for the API.
-    /// Config may store "anthropic/claude-sonnet-4-20250514" but the API expects "claude-sonnet-4-20250514".
+    /// Config may store "anthropic/claude-opus-4-8" but the API expects "claude-opus-4-8".
     fn normalize_model(model: &str) -> &str {
         model.strip_prefix("anthropic/").unwrap_or(model)
     }
@@ -900,8 +900,8 @@ mod tests {
     #[test]
     fn test_normalize_model() {
         assert_eq!(
-            AnthropicProvider::normalize_model("anthropic/claude-sonnet-4-20250514"),
-            "claude-sonnet-4-20250514"
+            AnthropicProvider::normalize_model("anthropic/claude-opus-4-8"),
+            "claude-opus-4-8"
         );
         assert_eq!(
             AnthropicProvider::normalize_model("claude-3-opus-20240229"),
