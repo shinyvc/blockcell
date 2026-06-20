@@ -4,8 +4,8 @@ use blockcell_core::types::{
     ChatMessage, LLMResponse, StreamChunk, ToolCallAccumulator, ToolCallRequest,
 };
 use blockcell_core::{
-    scope_abort_token, scope_agent_context, AbortToken, AgentIdentity, Config, InboundMessage,
-    OutboundMessage, Paths, Result,
+    scope_abort_token, scope_agent_context, AbortToken, AgentIdentity, BudgetExhaustedError,
+    BudgetTracker, BudgetTrackerHandle, Config, InboundMessage, OutboundMessage, Paths, Result,
 };
 use blockcell_providers::{CallResult, Provider, ProviderPool};
 use blockcell_skills::SkillCard;
@@ -19,7 +19,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
@@ -583,6 +583,47 @@ fn normalize_selected_skill_name(
         raw_skill_name,
         &candidates,
     )
+}
+
+fn extract_llm_usage_tokens(usage: &serde_json::Value) -> (u64, u64) {
+    fn read_u64(usage: &serde_json::Value, keys: &[&str]) -> u64 {
+        keys.iter()
+            .find_map(|key| usage.get(*key))
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+                    .or_else(|| {
+                        value
+                            .as_str()
+                            .and_then(|text| text.trim().parse::<u64>().ok())
+                    })
+            })
+            .unwrap_or(0)
+    }
+
+    let input = read_u64(
+        usage,
+        &[
+            "input_tokens",
+            "inputTokens",
+            "prompt_tokens",
+            "promptTokens",
+            "promptTokenCount",
+        ],
+    );
+    let output = read_u64(
+        usage,
+        &[
+            "output_tokens",
+            "outputTokens",
+            "completion_tokens",
+            "completionTokens",
+            "candidatesTokenCount",
+        ],
+    );
+
+    (input, output)
 }
 
 fn append_activated_skill_history(
@@ -2019,6 +2060,8 @@ pub struct AgentRuntime {
     agent_type_registry: crate::agent_types::AgentTypeRegistry,
     /// Unified write guard for coordinated write protection across memory + skill files
     write_guard: Arc<crate::write_guard::WriteGuard>,
+    /// Token and cost budget trackers keyed by persisted session key.
+    budget_trackers: Arc<Mutex<HashMap<String, BudgetTrackerHandle>>>,
 }
 
 impl AgentRuntime {
@@ -2095,6 +2138,8 @@ impl AgentRuntime {
             loader.load_all()
         };
 
+        let budget_trackers = Arc::new(Mutex::new(HashMap::new()));
+
         Ok(Self {
             config,
             paths,
@@ -2153,6 +2198,7 @@ impl AgentRuntime {
             // 使用 WriteGuard 作为 SkillMutexHandle，替换已废弃的 SkillMutex
             skill_mutex: write_guard.clone() as blockcell_tools::SkillMutexHandle,
             write_guard,
+            budget_trackers,
         })
     }
 
@@ -3344,6 +3390,79 @@ impl AgentRuntime {
             Err(blockcell_core::Error::Config(
                 "ProviderPool: no healthy providers".to_string(),
             ))
+        }
+    }
+
+    fn budget_tracker_for_session(&self, session_key: &str) -> BudgetTrackerHandle {
+        let mut trackers = self.budget_trackers.lock().unwrap_or_else(|poisoned| {
+            warn!("Budget tracker map mutex poisoned, recovering");
+            poisoned.into_inner()
+        });
+        trackers
+            .entry(session_key.to_string())
+            .or_insert_with(|| Arc::new(BudgetTracker::new(&self.config.budget)))
+            .clone()
+    }
+
+    fn record_llm_budget(
+        &self,
+        session_key: &str,
+        response: &LLMResponse,
+    ) -> std::result::Result<(), BudgetExhaustedError> {
+        let (input_tokens, output_tokens) = extract_llm_usage_tokens(&response.usage);
+        if input_tokens == 0 && output_tokens == 0 {
+            return Ok(());
+        }
+
+        let cost_micro_usd = self.estimate_llm_cost_micro_usd(input_tokens, output_tokens);
+        let tracker = self.budget_tracker_for_session(session_key);
+        let snapshot = tracker.record_usage(input_tokens, output_tokens, cost_micro_usd);
+
+        if tracker.should_warn() {
+            warn!(
+                session_key,
+                usage_ratio = snapshot.usage_ratio,
+                tokens_used = snapshot.total_tokens_used,
+                cost_used_micro_usd = snapshot.cost_used_micro_usd,
+                "Budget warning: usage at {:.0}%",
+                snapshot.usage_ratio * 100.0
+            );
+        }
+
+        tracker.check_budget().map(|_| ())
+    }
+
+    fn estimate_llm_cost_micro_usd(&self, input_tokens: u64, output_tokens: u64) -> u64 {
+        let defaults = &self.config.agents.defaults;
+        let priced_entry = defaults
+            .model_pool
+            .iter()
+            .find(|entry| {
+                entry.model == defaults.model
+                    && defaults
+                        .provider
+                        .as_ref()
+                        .map(|provider| provider == &entry.provider)
+                        .unwrap_or(true)
+                    && (entry.input_price.is_some() || entry.output_price.is_some())
+            })
+            .or_else(|| {
+                defaults
+                    .model_pool
+                    .iter()
+                    .find(|entry| entry.input_price.is_some() || entry.output_price.is_some())
+            });
+
+        let Some(entry) = priced_entry else {
+            return 0;
+        };
+
+        let cost_micro_usd = input_tokens as f64 * entry.input_price.unwrap_or(0.0)
+            + output_tokens as f64 * entry.output_price.unwrap_or(0.0);
+        if cost_micro_usd <= 0.0 || !cost_micro_usd.is_finite() {
+            0
+        } else {
+            cost_micro_usd.ceil() as u64
         }
     }
 
@@ -4963,6 +5082,16 @@ impl AgentRuntime {
                 "LLM response received"
             );
             debug!(target: "chat::response", response = serde_json::to_string(&response).unwrap_or_default(), "Response detail");
+
+            // Budget usage is reported by providers after an LLM call completes, so this
+            // is post-hoc enforcement: the current call may exceed the configured limit,
+            // and the runtime stops before the next loop iteration.
+            if let Err(e) = self.record_llm_budget(&persist_session_key, &response) {
+                error!(error = %e, "Budget exhausted, stopping agent loop");
+                final_response = format!("⚠️ {}", e.message);
+                history.push(ChatMessage::assistant_with_reasoning(&final_response, None));
+                break;
+            }
 
             // Handle tool calls
             if !response.tool_calls.is_empty() {
@@ -13477,5 +13606,61 @@ description: local demo
 
         // 验证 usage metrics
         assert!(result.total_usage.input_tokens > 0 || result.total_usage.output_tokens > 0);
+    }
+
+    #[tokio::test]
+    async fn process_message_stops_when_token_budget_is_exhausted() {
+        let mut config = Config::default();
+        config.agents.defaults.model = "test/mock".to_string();
+        config.agents.defaults.provider = Some("test".to_string());
+        config.agents.ghost.learning.enabled = false;
+        config.budget.max_tokens_per_session = 120;
+
+        let provider = Arc::new(MockInterAgentProvider::new(
+            "This response should be replaced by budget exhaustion.",
+        ));
+        let base =
+            std::env::temp_dir().join(format!("blockcell-budget-runtime-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).expect("create temp budget runtime dir");
+        let paths = Paths::with_base(base);
+        let mut runtime = test_runtime_with_provider_and_paths(paths, provider, config);
+
+        let result = runtime
+            .process_message(test_main_session_inbound("cli", "budget-test"))
+            .await
+            .expect("process message");
+
+        assert!(result.contains("Budget exhausted"));
+        assert!(result.contains("tokens: 150/120"));
+    }
+
+    #[tokio::test]
+    async fn token_budget_is_tracked_per_session_key() {
+        let mut config = Config::default();
+        config.agents.defaults.model = "test/mock".to_string();
+        config.agents.defaults.provider = Some("test".to_string());
+        config.agents.ghost.learning.enabled = false;
+        config.budget.max_tokens_per_session = 200;
+
+        let provider = Arc::new(MockInterAgentProvider::new("within budget"));
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-budget-sessions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp budget session runtime dir");
+        let paths = Paths::with_base(base);
+        let mut runtime = test_runtime_with_provider_and_paths(paths, provider, config);
+
+        let first = runtime
+            .process_message(test_main_session_inbound("cli", "budget-session-a"))
+            .await
+            .expect("first session message");
+        let second = runtime
+            .process_message(test_main_session_inbound("cli", "budget-session-b"))
+            .await
+            .expect("second session message");
+
+        assert_eq!(first, "within budget");
+        assert_eq!(second, "within budget");
     }
 }

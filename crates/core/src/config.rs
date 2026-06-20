@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::budget::BudgetConfig;
 use crate::error::Result;
 use crate::paths::Paths;
 
@@ -706,6 +707,8 @@ pub struct Config {
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
+    pub budget: BudgetConfig,
+    #[serde(default)]
     pub memory: MemoryConfig,
     #[serde(default)]
     pub network: NetworkConfig,
@@ -886,6 +889,7 @@ impl Default for Config {
 
         Self {
             providers,
+            budget: BudgetConfig::default(),
             memory: MemoryConfig::default(),
             network: NetworkConfig::default(),
             community_hub: CommunityHubConfig::default(),

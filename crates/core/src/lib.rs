@@ -3,6 +3,7 @@ pub mod abort_token_context;
 pub mod agent_context;
 pub mod agent_identity;
 pub mod agent_result;
+pub mod budget;
 pub mod capability;
 pub mod config;
 pub mod error;
@@ -20,6 +21,9 @@ pub use abort_token_context::{current_abort_token, scope_abort_token, spawn_with
 pub use agent_context::{can_spawn_subagent, current_agent_context, scope_agent_context};
 pub use agent_identity::{AgentIdentity, AgentRole};
 pub use agent_result::{AgentResult, ContentBlock, FileAction, ResultStatus, UsageMetrics};
+pub use budget::{
+    BudgetConfig, BudgetExhaustedError, BudgetSnapshot, BudgetTracker, BudgetTrackerHandle,
+};
 
 pub use capability::{
     CapabilityCost, CapabilityDescriptor, CapabilityLifecycle, CapabilityStatus, CapabilityType,
