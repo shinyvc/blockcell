@@ -140,7 +140,7 @@ WebUI 的完整配置编辑器也会直接读取/保存原始 `config.json5` 文
   },
   "agents": {
     "defaults": {
-      "model": "ollama/llama3"
+      "model": "ollama/qwen3.6"
     }
   }
 }
@@ -234,7 +234,7 @@ WebUI 的完整配置编辑器也会直接读取/保存原始 `config.json5` 文
 { "model": "anthropic/claude-3-5-sonnet", "provider": "openrouter" }
 
 // 情形3：本地 Ollama 模型
-{ "model": "ollama/qwen2.5:32b" }
+{ "model": "ollama/qwen3.6" }
 // → 自动推断使用 ollama provider
 ```
 

@@ -347,7 +347,7 @@ mod tests {
             infer_provider_from_model("gemini/gemini-pro"),
             Some("gemini")
         );
-        assert_eq!(infer_provider_from_model("ollama/llama3"), Some("ollama"));
+        assert_eq!(infer_provider_from_model("ollama/qwen3.6"), Some("ollama"));
         assert_eq!(infer_provider_from_model("kimi-k2.6"), Some("kimi"));
         assert_eq!(infer_provider_from_model("gpt-5.5"), Some("openai"));
         assert_eq!(infer_provider_from_model("o4-mini"), Some("openai"));
@@ -392,7 +392,7 @@ mod tests {
     fn test_create_provider_ollama_no_key_needed() {
         let config = Config::default();
         // ollama 不需要 api_key
-        let result = create_provider(&config, "llama3", Some("ollama"));
+        let result = create_provider(&config, "qwen3.6", Some("ollama"));
         assert!(result.is_ok(), "ollama 不需要 api_key");
     }
 

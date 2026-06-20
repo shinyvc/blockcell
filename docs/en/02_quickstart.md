@@ -190,7 +190,7 @@ If you already have Ollama installed and pulled a model:
   },
   "agents": {
     "defaults": {
-      "model": "ollama/llama3"
+      "model": "ollama/qwen3.6"
     }
   }
 }

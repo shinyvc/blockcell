@@ -63,7 +63,7 @@ impl OllamaProvider {
     }
 
     /// Strip "ollama/" prefix from model names.
-    /// Config may store "ollama/llama3" but the API expects "llama3".
+    /// Config may store "ollama/qwen3.6" but the API expects "qwen3.6".
     fn normalize_model(model: &str) -> &str {
         model.strip_prefix("ollama/").unwrap_or(model)
     }
@@ -648,8 +648,8 @@ mod tests {
 
     #[test]
     fn test_normalize_model() {
-        assert_eq!(OllamaProvider::normalize_model("ollama/llama3"), "llama3");
-        assert_eq!(OllamaProvider::normalize_model("qwen2.5:7b"), "qwen2.5:7b");
+        assert_eq!(OllamaProvider::normalize_model("ollama/qwen3.6"), "qwen3.6");
+        assert_eq!(OllamaProvider::normalize_model("qwen3.6"), "qwen3.6");
     }
 
     #[test]
@@ -681,7 +681,7 @@ mod tests {
     #[test]
     fn test_parse_response() {
         let json = r#"{
-            "model": "llama3",
+            "model": "qwen3.6",
             "message": {
                 "role": "assistant",
                 "content": "Hello! How can I help?"
@@ -700,7 +700,7 @@ mod tests {
     #[test]
     fn test_parse_response_with_tool_calls() {
         let json = r#"{
-            "model": "llama3",
+            "model": "qwen3.6",
             "message": {
                 "role": "assistant",
                 "content": "",

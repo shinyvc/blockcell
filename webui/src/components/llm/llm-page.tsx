@@ -31,7 +31,7 @@ const KNOWN_PROVIDERS: KnownProvider[] = [
   { id: 'groq',         label: 'Groq',                 defaultBase: 'https://api.groq.com/openai/v1',                     models: ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'qwen/qwen3-32b'],              keyHint: 'gsk_...' },
   { id: 'siliconflow',  label: 'SiliconFlow (硅基流动)', defaultBase: 'https://api.siliconflow.cn/v1',                      models: ['deepseek-ai/DeepSeek-V4-Pro', 'zai-org/GLM-5.2', 'Qwen/Qwen3.6-35B-A3B'],              keyHint: 'sk-...' },
   { id: 'openrouter',   label: 'OpenRouter',           defaultBase: 'https://openrouter.ai/api/v1',                       models: ['openai/gpt-5.5', 'anthropic/claude-opus-4.8', 'deepseek/deepseek-v4-pro'], keyHint: 'sk-or-...' },
-  { id: 'ollama',       label: 'Ollama (本地)',         defaultBase: 'http://localhost:11434/v1',                          models: ['llama3.3', 'mistral', 'qwen2.5-coder'],              keyHint: '(无需 Key)' },
+  { id: 'ollama',       label: 'Ollama (本地)',         defaultBase: 'http://localhost:11434/v1',                          models: ['qwen3.6', 'qwen3.5', 'deepseek-v4-pro', 'deepseek-v4-flash', 'glm-5.2', 'glm-5.1', 'hf.co/unsloth/MiniMax-M3-GGUF', 'hf.co/unsloth/MiniMax-M2.7-GGUF'],              keyHint: '(无需 Key)' },
   { id: 'vllm',         label: 'vLLM (本地)',           defaultBase: 'http://localhost:8000/v1',                           models: ['custom-model'],              keyHint: 'dummy' },
 ];
 

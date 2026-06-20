@@ -125,7 +125,7 @@ Three primary models share traffic in a 2:1:1 ratio.
 
 ```json
 "modelPool": [
-  { "model": "ollama/qwen2.5:7b", "provider": "ollama", "weight": 1, "priority": 1 },
+  { "model": "ollama/qwen3.6", "provider": "ollama", "weight": 1, "priority": 1 },
   { "model": "deepseek-v4-pro", "provider": "deepseek", "weight": 1, "priority": 2 }
 ]
 ```

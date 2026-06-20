@@ -714,7 +714,7 @@ mod tests {
             "deepseek-ai/DeepSeek-V4-Pro"
         );
         assert_eq!(default_model_for_provider("openrouter"), "openai/gpt-5.5");
-        assert_eq!(default_model_for_provider("ollama"), "llama3.3");
+        assert_eq!(default_model_for_provider("ollama"), "qwen3.6");
     }
 
     #[test]

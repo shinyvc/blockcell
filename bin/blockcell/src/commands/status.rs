@@ -525,7 +525,7 @@ mod tests {
     fn test_ollama_marked_configured_when_selected_in_pool() {
         let mut config = Config::default();
         config.agents.defaults.model_pool = vec![blockcell_core::config::ModelEntry {
-            model: "llama3".to_string(),
+            model: "qwen3.6".to_string(),
             provider: "ollama".to_string(),
             weight: 1,
             priority: 1,
@@ -535,7 +535,7 @@ mod tests {
             tool_call_mode: blockcell_core::config::ToolCallMode::Native,
         }];
         config.agents.defaults.provider = Some("ollama".to_string());
-        config.agents.defaults.model = "llama3".to_string();
+        config.agents.defaults.model = "qwen3.6".to_string();
 
         let ollama_key = config
             .providers

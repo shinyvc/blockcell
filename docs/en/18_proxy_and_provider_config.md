@@ -132,7 +132,7 @@ Current inference rules include:
 { model: "anthropic/claude-3-5-sonnet", provider: "openrouter" }
 
 // Local Ollama model
-{ model: "ollama/qwen2.5:32b" }
+{ model: "ollama/qwen3.6" }
 ```
 
 ---

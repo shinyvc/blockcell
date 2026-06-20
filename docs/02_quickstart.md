@@ -244,11 +244,11 @@ nano ~/.blockcell/config.json5
   },
   "agents": {
     "defaults": {
-      "model": "llama3",
+      "model": "qwen3.6",
       "provider": "ollama",
       "modelPool": [
         {
-          "model": "llama3",
+          "model": "qwen3.6",
           "provider": "ollama",
           "weight": 1,
           "priority": 1

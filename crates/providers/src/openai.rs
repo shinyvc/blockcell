@@ -1852,7 +1852,7 @@ mod tests {
         assert!(body2.get("thinking").is_none());
         assert!(body2.get("reasoning_effort").is_none());
 
-        let mut body3 = json!({"model": "llama3", "messages": []});
+        let mut body3 = json!({"model": "qwen/qwen3-32b", "messages": []});
         OpenAIProvider::apply_reasoning_effort(&mut body3, Some("high"), "groq");
         assert!(body3.get("thinking").is_none());
         assert!(body3.get("reasoning_effort").is_none());

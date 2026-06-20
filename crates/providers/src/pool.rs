@@ -518,7 +518,7 @@ mod tests {
     fn test_pool_from_config_with_pool_entries() {
         let mut config = Config::default();
         config.agents.defaults.model_pool = vec![blockcell_core::config::ModelEntry {
-            model: "ollama/llama3".to_string(),
+            model: "ollama/qwen3.6".to_string(),
             provider: "ollama".to_string(),
             weight: 2,
             priority: 1,
@@ -535,7 +535,7 @@ mod tests {
         let pool = result.unwrap();
         let status = pool.status_summary();
         assert_eq!(status.len(), 1);
-        assert_eq!(status[0].model, "ollama/llama3");
+        assert_eq!(status[0].model, "ollama/qwen3.6");
         assert_eq!(status[0].weight, 2);
     }
 
@@ -543,7 +543,7 @@ mod tests {
     fn test_report_transient_fails_then_cooling() {
         let mut config = Config::default();
         config.agents.defaults.model_pool = vec![blockcell_core::config::ModelEntry {
-            model: "ollama/llama3".to_string(),
+            model: "ollama/qwen3.6".to_string(),
             provider: "ollama".to_string(),
             weight: 1,
             priority: 1,
@@ -568,7 +568,7 @@ mod tests {
     fn test_report_auth_error_dead() {
         let mut config = Config::default();
         config.agents.defaults.model_pool = vec![blockcell_core::config::ModelEntry {
-            model: "ollama/llama3".to_string(),
+            model: "ollama/qwen3.6".to_string(),
             provider: "ollama".to_string(),
             weight: 1,
             priority: 1,
