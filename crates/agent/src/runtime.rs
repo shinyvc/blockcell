@@ -4755,8 +4755,11 @@ impl AgentRuntime {
             return result;
         }
 
-        let available_tools: HashSet<String> =
-            self.tool_registry.model_visible_tool_names().into_iter().collect();
+        let available_tools: HashSet<String> = self
+            .tool_registry
+            .model_visible_tool_names()
+            .into_iter()
+            .collect();
 
         let routed_agent_id = self.agent_id.as_deref();
         let mut tool_names = resolve_effective_tool_names(
@@ -4841,9 +4844,10 @@ impl AgentRuntime {
             .tool_registry
             .get_prompt_rules(&tool_name_refs, &prompt_ctx);
         // MCP meta-rule: inject if any loaded tool is an MCP tool (name contains "__")
-        if tool_names.iter().any(|t| {
-            t.contains("__") || t == blockcell_tools::mcp::search::MCP_SEARCH_TOOL_NAME
-        }) {
+        if tool_names
+            .iter()
+            .any(|t| t.contains("__") || t == blockcell_tools::mcp::search::MCP_SEARCH_TOOL_NAME)
+        {
             tool_prompt_rules.push("- **MCP (Model Context Protocol)**: blockcell **已内置 MCP 客户端支持**，可连接任意 MCP 服务器（SQLite、GitHub、文件系统、数据库等）。MCP 工具会以 `<serverName>__<toolName>` 格式出现在工具列表中。若用户询问 MCP 功能或当前工具列表中无 MCP 工具，说明尚未配置 MCP 服务器，请引导用户使用 `blockcell mcp add <template>` 快捷添加，或直接编辑 `~/.blockcell/mcp.json` / `~/.blockcell/mcp.d/*.json`。例如：`blockcell mcp add sqlite --db-path /tmp/test.db`，重启后即可使用。".to_string());
         }
 

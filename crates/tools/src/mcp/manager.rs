@@ -9,6 +9,7 @@ use blockcell_core::{Error, Paths, Result};
 
 use crate::mcp::client::McpClient;
 use crate::mcp::provider::McpToolWrapper;
+use crate::mcp::search::McpSearchTool;
 use crate::ToolRegistry;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,54 @@ impl McpToolTarget {
             server_name: server_name.to_string(),
             tool_name: tool_name.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::mcp::client::McpTool;
+    use crate::mcp::search::McpSearchTool;
+    use serde_json::json;
+
+    fn mcp_tool(name: &str, description: &str) -> McpTool {
+        McpTool {
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "q": { "type": "string" }
+                },
+                "required": ["q"]
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_search_tool_returns_ranked_full_tool_definitions() {
+        let search = McpSearchTool::new(vec![
+            (
+                "postgres".to_string(),
+                mcp_tool("query", "Run SQL database queries"),
+            ),
+            (
+                "github".to_string(),
+                mcp_tool("create_issue", "Create GitHub issues"),
+            ),
+        ]);
+
+        let result = search.search_value("database query", 5);
+
+        let tools = result["tools"]
+            .as_array()
+            .expect("tools should be an array");
+        assert_eq!(tools[0]["name"], "postgres__query");
+        assert_eq!(tools[0]["server"], "postgres");
+        assert_eq!(tools[0]["schema"]["function"]["name"], "postgres__query");
+        assert_eq!(
+            tools[0]["schema"]["function"]["parameters"]["required"][0],
+            "q"
+        );
     }
 }
 
@@ -56,6 +105,8 @@ pub struct McpManager {
 }
 
 impl McpManager {
+    pub const PROGRESSIVE_DISCOVERY_THRESHOLD: usize = 20;
+
     pub async fn load(paths: &Paths) -> Result<Self> {
         let resolved = McpResolvedConfig::load_merged(paths)?;
         let manager = Self {
@@ -155,6 +206,8 @@ impl McpManager {
         allowed_servers: &[String],
         allowed_tools: &[String],
     ) -> Result<()> {
+        let mut allowed_mcp_tools = Vec::new();
+
         for server_name in self.enabled_server_names() {
             let client = match self.client_for(&server_name).await {
                 Ok(client) => client,
@@ -167,12 +220,28 @@ impl McpManager {
             for tool in client.list_tools().await {
                 let qualified_tool_name = format!("{}__{}", server_name, tool.name);
                 if mcp_access_allows(allowed_servers, allowed_tools, &qualified_tool_name) {
-                    registry.register(Arc::new(McpToolWrapper::new(
-                        &server_name,
-                        tool,
-                        client.clone(),
-                    )));
+                    allowed_mcp_tools.push((server_name.clone(), tool, client.clone()));
                 }
+            }
+        }
+
+        if allowed_mcp_tools.len() > Self::PROGRESSIVE_DISCOVERY_THRESHOLD {
+            let search_index = allowed_mcp_tools
+                .iter()
+                .map(|(server_name, tool, _)| (server_name.clone(), tool.clone()))
+                .collect();
+            registry.register(Arc::new(McpSearchTool::new(search_index)));
+
+            for (server_name, tool, client) in allowed_mcp_tools {
+                registry.register_model_hidden(Arc::new(McpToolWrapper::new(
+                    &server_name,
+                    tool,
+                    client,
+                )));
+            }
+        } else {
+            for (server_name, tool, client) in allowed_mcp_tools {
+                registry.register(Arc::new(McpToolWrapper::new(&server_name, tool, client)));
             }
         }
 

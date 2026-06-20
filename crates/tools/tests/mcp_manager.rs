@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 use blockcell_core::Paths;
 use blockcell_tools::mcp::manager::{mcp_access_allows, McpManager, McpToolTarget};
+use blockcell_tools::mcp::search::MCP_SEARCH_TOOL_NAME;
+use blockcell_tools::ToolRegistry;
 use serde_json::json;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -141,6 +143,77 @@ fn write_test_mcp_config(
     .expect("write mcp config");
 }
 
+fn bulk_mcp_script(tool_count: usize) -> String {
+    format!(
+        r#"import json, sys
+
+TOOLS = [
+    {{
+        "name": f"tool_{{idx}}",
+        "description": f"Bulk test tool {{idx}} for database operations",
+        "inputSchema": {{
+            "type": "object",
+            "properties": {{"q": {{"type": "string"}}}},
+            "required": ["q"]
+        }}
+    }}
+    for idx in range({tool_count})
+]
+
+def respond(req_id, result):
+    sys.stdout.write(json.dumps({{"jsonrpc": "2.0", "id": req_id, "result": result}}) + "\n")
+    sys.stdout.flush()
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    msg = json.loads(raw)
+    method = msg.get("method")
+    if method == "initialize":
+        respond(msg["id"], {{
+            "protocolVersion": "2024-11-05",
+            "capabilities": {{}},
+            "serverInfo": {{"name": "bulk", "version": "1.0"}}
+        }})
+    elif method == "tools/list":
+        respond(msg["id"], {{"tools": TOOLS}})
+    elif method == "tools/call":
+        respond(msg["id"], {{
+            "content": [{{"type": "text", "text": "ok"}}],
+            "isError": False
+        }})
+"#
+    )
+}
+
+fn write_bulk_mcp_config(paths: &Paths, tool_count: usize) {
+    let args = vec![
+        "-u".to_string(),
+        "-c".to_string(),
+        bulk_mcp_script(tool_count),
+    ];
+
+    let config = json!({
+        "servers": {
+            "bulk": {
+                "command": "python3",
+                "args": args,
+                "enabled": true,
+                "autoStart": true,
+                "startupTimeoutSecs": 2,
+                "callTimeoutSecs": 2
+            }
+        }
+    });
+
+    fs::write(
+        paths.mcp_config_file(),
+        serde_json::to_string_pretty(&config).expect("serialize mcp config"),
+    )
+    .expect("write bulk mcp config");
+}
+
 #[tokio::test]
 async fn mcp_manager_bounds_auto_start_with_startup_timeout() {
     let home = TestMcpHome::new();
@@ -205,4 +278,32 @@ async fn mcp_client_respects_call_timeout() {
         err.contains("timeout") || err.contains("timed out"),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test]
+async fn mcp_manager_uses_progressive_discovery_when_tool_count_exceeds_threshold() {
+    let home = TestMcpHome::new();
+    let paths = home.paths();
+    paths.ensure_dirs().expect("ensure dirs");
+    write_bulk_mcp_config(&paths, McpManager::PROGRESSIVE_DISCOVERY_THRESHOLD + 1);
+
+    let manager = timeout(Duration::from_secs(4), McpManager::load(&paths))
+        .await
+        .expect("manager load should not hang")
+        .expect("manager should start bulk server");
+
+    let mut registry = ToolRegistry::new();
+    timeout(
+        Duration::from_secs(4),
+        manager.extend_registry_all(&mut registry),
+    )
+    .await
+    .expect("extend registry should not hang")
+    .expect("extend registry should succeed");
+
+    let visible = registry.model_visible_tool_names();
+    assert!(visible.contains(&MCP_SEARCH_TOOL_NAME.to_string()));
+    assert!(!visible.contains(&"bulk__tool_0".to_string()));
+    assert!(registry.tool_names().contains(&"bulk__tool_0".to_string()));
+    assert!(registry.is_model_hidden("bulk__tool_0"));
 }

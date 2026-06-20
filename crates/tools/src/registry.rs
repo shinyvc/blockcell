@@ -1,6 +1,6 @@
 use blockcell_core::{Error, Result};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -77,12 +77,14 @@ pub fn global_core_tool_names() -> &'static [&'static str] {
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    model_hidden_tools: HashSet<String>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            model_hidden_tools: HashSet::new(),
         }
     }
 
@@ -223,7 +225,18 @@ impl ToolRegistry {
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         let schema = tool.schema();
         debug!(name = schema.name, "Registering tool");
+        self.model_hidden_tools.remove(&schema.name);
         self.tools.insert(schema.name.to_string(), tool);
+    }
+
+    /// Register a tool that remains executable but is hidden from the initial
+    /// model-visible tool list. Progressive MCP discovery uses this so tools
+    /// can be revealed after `mcp_search_tools` returns their schema.
+    pub fn register_model_hidden(&mut self, tool: Arc<dyn Tool>) {
+        let schema = tool.schema();
+        debug!(name = schema.name, "Registering model-hidden tool");
+        self.model_hidden_tools.insert(schema.name.clone());
+        self.tools.insert(schema.name, tool);
     }
 
     /// Register all tools exposed by an MCP server provider.
@@ -326,6 +339,19 @@ impl ToolRegistry {
     /// Get all registered tool names.
     pub fn tool_names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
+    }
+
+    /// Get names of tools that should be visible in the initial model prompt.
+    pub fn model_visible_tool_names(&self) -> Vec<String> {
+        self.tools
+            .keys()
+            .filter(|name| !self.model_hidden_tools.contains(*name))
+            .cloned()
+            .collect()
+    }
+
+    pub fn is_model_hidden(&self, name: &str) -> bool {
+        self.model_hidden_tools.contains(name)
     }
 
     /// Collect prompt rules from loaded tools.
@@ -469,6 +495,30 @@ mod tests {
         reg.register(Arc::new(crate::exec::ExecTool));
         assert!(reg.get("exec").is_some());
         assert_eq!(reg.tool_names().len(), 1);
+    }
+
+    #[test]
+    fn test_registry_model_hidden_tools_remain_executable_but_not_visible() {
+        let mut reg = ToolRegistry::new();
+        reg.register_model_hidden(Arc::new(NoRequiredTool));
+
+        assert!(reg.get("no_required_tool").is_some());
+        assert!(reg.tool_names().contains(&"no_required_tool".to_string()));
+        assert!(!reg
+            .model_visible_tool_names()
+            .contains(&"no_required_tool".to_string()));
+        assert!(reg.is_model_hidden("no_required_tool"));
+    }
+
+    #[test]
+    fn test_hidden_tool_schema_can_be_requested_after_discovery() {
+        let mut reg = ToolRegistry::new();
+        reg.register_model_hidden(Arc::new(NoRequiredTool));
+
+        let schemas = reg.get_tiered_schemas(&["no_required_tool"], GLOBAL_CORE_TOOL_NAMES);
+
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0]["function"]["name"], "no_required_tool");
     }
 
     #[test]
