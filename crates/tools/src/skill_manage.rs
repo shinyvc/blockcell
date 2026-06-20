@@ -1060,6 +1060,19 @@ mod tests {
         assert_eq!(schema.name, "skill_manage");
     }
 
+    #[tokio::test]
+    async fn test_atomic_write_text_creates_file_with_extension() {
+        let dir = temp_skills_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("memorytest.md");
+
+        atomic_write_text(&path, "temp").await.unwrap();
+
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(written, "temp");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
     #[test]
     fn test_validate_create_ok() {
         let tool = SkillManageTool;

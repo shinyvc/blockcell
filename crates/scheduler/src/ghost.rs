@@ -133,7 +133,7 @@ impl GhostMaintenanceService {
     pub fn build_routine_prompt(config: &GhostMaintenanceServiceConfig) -> String {
         let mut steps = vec![
             "1. memory_maintenance(action=\"garden\") → follow returned instructions. Promote only stable facts to SQLite long_term memory; delete trivial entries. Do not create skills.".to_string(),
-            "2. list_dir workspace/media + workspace/downloads → file_ops delete files >7 days old. Skip if age unknown.".to_string(),
+            "2. list_dir media + downloads → file_ops delete files >7 days old. Paths are relative to workspace; do not prefix workspace/. Skip if age unknown.".to_string(),
         ];
 
         if config.auto_social {
@@ -365,5 +365,21 @@ mod tests {
         assert!(prompt.contains("SQLite long_term memory"));
         assert!(prompt.contains(&format!("memory_{}", "upsert")));
         assert!(prompt.contains("Do not create skills"));
+    }
+
+    #[test]
+    fn test_routine_prompt_uses_workspace_relative_cleanup_paths() {
+        let config = GhostMaintenanceServiceConfig {
+            enabled: true,
+            model: None,
+            schedule: "0 0 */4 * * *".to_string(),
+            max_syncs_per_day: 10,
+            auto_social: false,
+        };
+        let prompt = GhostMaintenanceService::build_routine_prompt(&config);
+
+        assert!(prompt.contains("list_dir media + downloads"));
+        assert!(!prompt.contains("workspace/media"));
+        assert!(!prompt.contains("workspace/downloads"));
     }
 }

@@ -41,6 +41,7 @@ const DREAM_COMMIT_MANIFEST_FILE: &str = "manifest.json";
 pub const SESSION_MEMORY_EXPIRY_DAYS: u64 = 7;
 /// 每次处理的最大 session memory 文件数
 pub const MAX_SESSIONS_TO_PROCESS: usize = 10;
+pub const DREAM_FORKED_AGENT_MAX_TURNS: u32 = 16;
 /// is_consolidating 标记的 stale 阈值（秒）
 ///
 /// 超过此时间仍为 is_consolidating=true 时，视为上次整合异常退出留下的 stale 标记，
@@ -1876,7 +1877,7 @@ impl DreamConsolidator {
             .working_dir(memory_dir.to_path_buf())
             .query_source("auto_dream")
             .fork_label("auto_dream")
-            .max_turns(10)
+            .max_turns(DREAM_FORKED_AGENT_MAX_TURNS)
             .skip_transcript(true)
             .tool_schemas(build_forked_tool_schemas(&["exec".to_string()]))
             .build()
@@ -1960,9 +1961,13 @@ impl DreamConsolidator {
 示例：
 - list_dir: path="."
 - read_file: file_path="reference.md"
-- grep/glob: path="."
+- glob: path="."
+- grep: path="reference.md"（只能对已确认存在的具体文件使用，不能对 "." 目录使用）
 - edit_file/write_file: file_path="reference.md" 或其他现有/需要创建的 .md 相对路径
-- 错误示例: file_path="memory/reference.md", path="../", file_path="/absolute/path/reference.md"
+- 只能读取 list_dir/glob 已确认存在的文件；不要猜测 memory.md、index.md 等入口文件名
+- 如果 read_file 返回 File not found，不要重试该路径，回到 list_dir/glob 结果继续
+- 完成必要写入后立即返回最终简短总结，不要继续探索
+- 错误示例: file_path="memory/reference.md", path="../", file_path="/absolute/path/reference.md", file_path="memory.md"（除非已列出存在）, grep path="."
 
 ## 收集的新信号
 {}
@@ -2439,11 +2444,21 @@ mod tests {
         assert!(prompt.contains("当前工作目录就是记忆目录"));
         assert!(prompt.contains("相对路径"));
         assert!(prompt.contains("不要加 `memory/` 前缀"));
+        assert!(prompt.contains("grep: path=\"reference.md\""));
+        assert!(prompt.contains("glob: path=\".\""));
+        assert!(prompt.contains("只能读取 list_dir/glob 已确认存在的文件"));
+        assert!(prompt.contains("不要猜测 memory.md"));
+        assert!(!prompt.contains("grep/glob: path=\".\""));
         assert!(prompt.contains("list_dir"));
         assert!(prompt.contains("read_file"));
         assert!(!prompt.contains(".dream_staging"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[test]
+    fn test_dream_forked_agent_turn_budget_allows_recovery_from_exploration() {
+        assert!(DREAM_FORKED_AGENT_MAX_TURNS >= 16);
     }
 
     #[test]

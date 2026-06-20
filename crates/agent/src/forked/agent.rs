@@ -771,7 +771,11 @@ fn resolve_to_existing_ancestor(path: &Path) -> Result<PathBuf, ForkedAgentError
                 }
                 if let Some(parent) = existing_ancestor.parent() {
                     if let Some(file_name) = existing_ancestor.file_name() {
-                        suffix = PathBuf::from(file_name).join(suffix);
+                        suffix = if suffix.as_os_str().is_empty() {
+                            PathBuf::from(file_name)
+                        } else {
+                            PathBuf::from(file_name).join(suffix)
+                        };
                     }
                     existing_ancestor = parent.to_path_buf();
                 } else {
@@ -1080,8 +1084,16 @@ async fn execute_forked_tool(
             let resolved = resolve_forked_path(file_path, working_dir)?;
 
             // 检查文件大小
-            let metadata = tokio::fs::metadata(&resolved).await
-                .map_err(ForkedAgentError::Io)?;
+            let metadata = match tokio::fs::metadata(&resolved).await {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(format!(
+                        "File not found: {}. Use list_dir or glob to inspect existing files before reading.",
+                        file_path
+                    ));
+                }
+                Err(e) => return Err(ForkedAgentError::Io(e)),
+            };
             if metadata.len() as usize > MAX_FILE_SIZE {
                 return Err(ForkedAgentError::ToolError(format!(
                     "File too large: {} bytes (max {})",
@@ -1249,7 +1261,11 @@ async fn execute_forked_tool(
             // 原子写入文件 (temp file + rename, 防止崩溃时损坏)
             atomic_write_text(&resolved, content)
                 .await
-                .map_err(|e| ForkedAgentError::ToolError(format!("Failed to write file: {}", e)))?;
+                .map_err(|e| ForkedAgentError::ToolError(format!(
+                    "Failed to write file '{}': {}",
+                    resolved.display(),
+                    e
+                )))?;
 
             Ok(format!("Successfully wrote {}", file_path))
         },
@@ -2629,6 +2645,15 @@ pub async fn run_forked_agent(
                             ForkedAgentError::NoProviderAvailable => "NoProviderAvailable",
                             ForkedAgentError::Aborted(_) => "Aborted",
                         };
+                        tracing::warn!(
+                            event = "tool_failed",
+                            fork_label = %params.fork_label,
+                            tool_name = %tool_name,
+                            error_type,
+                            error = %e,
+                            input = %tool_input,
+                            "[forked_agent] tool execution failed"
+                        );
                         format!("Tool execution error ({}): {}", error_type, e)
                     }
                 };
@@ -3414,6 +3439,60 @@ mod tests {
         assert!(!serialized.contains("The absolute directory path to list"));
     }
 
+    #[tokio::test]
+    async fn test_execute_forked_write_file_creates_relative_file_in_working_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let working_dir = Some(tmp.path().to_path_buf());
+        let can_use_tool: CanUseToolFn = Arc::new(|_, _| ToolPermission::Allow);
+
+        let result = execute_forked_tool(
+            "write_file",
+            &json!({"file_path": "memorytest.md", "content": "temp"}),
+            &can_use_tool,
+            &[],
+            &None,
+            &None,
+            &None,
+            &None,
+            &[],
+            &None,
+            &working_dir,
+        )
+        .await;
+
+        assert!(result.is_ok(), "write_file failed: {:?}", result.err());
+        let written = tokio::fs::read_to_string(tmp.path().join("memorytest.md"))
+            .await
+            .unwrap();
+        assert_eq!(written, "temp");
+    }
+
+    #[tokio::test]
+    async fn test_execute_forked_read_file_missing_is_recoverable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let working_dir = Some(tmp.path().to_path_buf());
+        let can_use_tool: CanUseToolFn = Arc::new(|_, _| ToolPermission::Allow);
+
+        let result = execute_forked_tool(
+            "read_file",
+            &json!({"file_path": "memory.md"}),
+            &can_use_tool,
+            &[],
+            &None,
+            &None,
+            &None,
+            &None,
+            &[],
+            &None,
+            &working_dir,
+        )
+        .await;
+
+        let message = result.expect("missing read_file should be a recoverable tool result");
+        assert!(message.contains("File not found"));
+        assert!(message.contains("memory.md"));
+    }
+
     // 注意：ForkedAgentParams 不再实现 Default trait
     // 必须通过 new() 或 builder() 创建，强制设置 provider_pool
 
@@ -3523,6 +3602,26 @@ mod tests {
         assert!(
             resolved.ends_with(Path::new("src").join("main.rs")),
             "resolved '{}' should end with 'src/main.rs'",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn test_resolve_forked_path_keeps_nonexistent_file_parent_as_working_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let working_dir = Some(tmp.path().to_path_buf());
+        let canonical_base = std::fs::canonicalize(tmp.path()).unwrap();
+
+        let resolved = resolve_forked_path("memorytest.md", &working_dir).unwrap();
+
+        assert_eq!(resolved, canonical_base.join("memorytest.md"));
+        assert_eq!(resolved.parent(), Some(canonical_base.as_path()));
+        assert!(
+            !resolved
+                .as_os_str()
+                .to_string_lossy()
+                .ends_with(std::path::MAIN_SEPARATOR),
+            "resolved path must not have a trailing separator: '{}'",
             resolved.display()
         );
     }
