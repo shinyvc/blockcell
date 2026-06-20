@@ -1181,16 +1181,28 @@ impl TaskManager {
     /// ```rust,ignore
     /// let task_manager = Arc::new(TaskManager::new());
     /// let workspace_dir = paths.workspace();
-    /// task_manager.clone().spawn_cleanup_loop(&workspace_dir);
+    /// let cleanup_shutdown_rx = shutdown_tx.subscribe();
+    /// task_manager.clone().spawn_cleanup_loop(&workspace_dir, cleanup_shutdown_rx);
     /// ```
-    pub fn spawn_cleanup_loop(self: Arc<Self>, workspace_dir: &Path) -> JoinHandle<()> {
+    pub fn spawn_cleanup_loop(
+        self: Arc<Self>,
+        workspace_dir: &Path,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) -> JoinHandle<()> {
         let workspace_dir = workspace_dir.to_path_buf();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
-                interval.tick().await;
-                self.cleanup_evicted_tasks(&workspace_dir).await;
-                tracing::debug!("Completed eviction cleanup cycle");
+                tokio::select! {
+                    _ = interval.tick() => {
+                        self.cleanup_evicted_tasks(&workspace_dir).await;
+                        tracing::debug!("Completed eviction cleanup cycle");
+                    }
+                    _ = shutdown_rx.recv() => {
+                        tracing::info!("cleanup_loop shutting down");
+                        break;
+                    }
+                }
             }
         })
     }
@@ -1329,6 +1341,21 @@ impl TaskManagerOps for TaskManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_cleanup_loop_exits_on_shutdown_signal() {
+        let manager = Arc::new(TaskManager::new());
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let handle = manager.spawn_cleanup_loop(workspace.path(), shutdown_rx);
+
+        tokio::task::yield_now().await;
+        let _ = shutdown_tx.send(());
+
+        let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        assert!(result.is_ok(), "cleanup loop did not exit after shutdown");
+        result.unwrap().expect("cleanup loop panicked");
+    }
 
     #[tokio::test]
     async fn test_task_manager_tracks_agent_scoped_tasks_in_memory() {

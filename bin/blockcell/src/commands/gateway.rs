@@ -1231,7 +1231,8 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     }
 
     // Start periodic cleanup of evicted tasks (with file cleanup)
-    let cleanup_handle = Arc::new(task_manager.clone()).spawn_cleanup_loop(&paths.workspace());
+    let cleanup_handle = Arc::new(task_manager.clone())
+        .spawn_cleanup_loop(&paths.workspace(), shutdown_tx.subscribe());
 
     // ── Bridge progress events to WebSocket broadcast + Channel forwarding ──
     let ws_broadcast_for_progress = ws_broadcast_tx.clone();

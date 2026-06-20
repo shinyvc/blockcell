@@ -671,7 +671,8 @@ pub async fn run(
         }
 
         // Start periodic cleanup of evicted tasks (with file cleanup)
-        let cleanup_handle = Arc::new(task_manager.clone()).spawn_cleanup_loop(&paths.workspace());
+        let cleanup_handle = Arc::new(task_manager.clone())
+            .spawn_cleanup_loop(&paths.workspace(), shutdown_tx.subscribe());
 
         // 启动进度事件监听：在控制台打印任务阶段进度
         tokio::spawn(async move {
@@ -1478,15 +1479,13 @@ pub async fn run(
 
         info!("Shutting down agent...");
 
-        // Stop cleanup loop
-        cleanup_handle.abort();
-
         let _ = shutdown_tx.send(());
 
         // Drop inbound_tx to close the channel and stop runtime
         drop(inbound_tx);
 
         let mut handles: Vec<tokio::task::JoinHandle<()>> = vec![
+            cleanup_handle,
             runtime_handle,
             cron_handle,
             printer_handle,
