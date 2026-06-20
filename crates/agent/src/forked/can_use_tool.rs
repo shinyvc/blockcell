@@ -3,7 +3,7 @@
 //! 定义 Forked Agent 的工具权限检查机制。
 //! Forked Agent 运行在受限环境中，只能执行特定工具和特定操作。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// 工具权限决策
@@ -561,16 +561,29 @@ fn allow_read_only_path(
         };
     };
 
-    if is_path_within_directory(path, allowed_dir) {
+    let resolved_path = resolve_path_against_allowed_dir(path, allowed_dir);
+
+    if is_path_within_directory_path(&resolved_path, allowed_dir) {
         ToolPermission::Allow
     } else {
         ToolPermission::Deny {
             message: format!(
-                "{} 只能访问记忆目录内的路径: {}",
+                "{} 只能访问记忆目录内的路径: {} (requested: {}, resolved: {})",
                 tool_name,
-                allowed_dir.display()
+                allowed_dir.display(),
+                path,
+                resolved_path.display()
             ),
         }
+    }
+}
+
+fn resolve_path_against_allowed_dir(path: &str, allowed_dir: &Path) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        allowed_dir.join(path)
     }
 }
 
@@ -811,8 +824,10 @@ fn is_auto_mem_path(path: &str, memory_dir: &Path) -> bool {
 
 /// 检查路径是否在指定目录内（安全版本，解析符号链接）
 fn is_path_within_directory(path: &str, directory: &Path) -> bool {
-    let path = Path::new(path);
+    is_path_within_directory_path(Path::new(path), directory)
+}
 
+fn is_path_within_directory_path(path: &Path, directory: &Path) -> bool {
     // 快速路径：直接前缀检查
     if !path.starts_with(directory) {
         return false;
@@ -1017,6 +1032,32 @@ mod tests {
         ));
 
         fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn test_dream_read_tools_allow_relative_paths_within_memory_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let memory_root = temp_dir.path();
+        std::fs::write(memory_root.join("reference.md"), "memory").unwrap();
+        let can_use = create_dream_can_use_tool(memory_root);
+
+        assert!(matches!(
+            can_use("list_dir", &json!({"path": "."})),
+            ToolPermission::Allow
+        ));
+        assert!(matches!(
+            can_use("read_file", &json!({"file_path": "reference.md"})),
+            ToolPermission::Allow
+        ));
+
+        assert!(matches!(
+            can_use("list_dir", &json!({"path": ".."})),
+            ToolPermission::Deny { .. }
+        ));
+        assert!(matches!(
+            can_use("read_file", &json!({"file_path": "../secret.md"})),
+            ToolPermission::Deny { .. }
+        ));
     }
 
     #[test]

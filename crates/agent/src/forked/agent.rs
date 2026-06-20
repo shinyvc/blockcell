@@ -3096,7 +3096,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "The absolute path to the file to read. Must be within the allowed memory directory."
+                            "description": "The file path to read. Prefer a relative path resolved from the agent working directory, such as 'reference.md'. Absolute paths are allowed only when they remain within the allowed directory."
                         }
                     },
                     "required": ["file_path"]
@@ -3114,7 +3114,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The absolute directory path to list. Must be within the allowed memory directory."
+                            "description": "The directory path to list. Prefer a relative path resolved from the agent working directory, such as '.'. Absolute paths are allowed only when they remain within the allowed directory."
                         }
                     },
                     "required": ["path"]
@@ -3136,7 +3136,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                         },
                         "path": {
                             "type": "string",
-                            "description": "The file path to search in."
+                            "description": "The file path to search in. Prefer a relative path resolved from the agent working directory."
                         }
                     },
                     "required": ["pattern", "path"]
@@ -3158,7 +3158,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                         },
                         "path": {
                             "type": "string",
-                            "description": "The absolute directory path to search in. Must be within the allowed memory directory."
+                            "description": "The directory path to search in. Prefer a relative path resolved from the agent working directory, such as '.'. Absolute paths are allowed only when they remain within the allowed directory."
                         }
                     },
                     "required": ["pattern", "path"]
@@ -3176,7 +3176,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "The path to the file to edit."
+                            "description": "The file path to edit. Prefer a relative path resolved from the agent working directory."
                         },
                         "old_string": {
                             "type": "string",
@@ -3206,7 +3206,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "The path to the file to write."
+                            "description": "The file path to write. Prefer a relative path resolved from the agent working directory."
                         },
                         "content": {
                             "type": "string",
@@ -3401,6 +3401,17 @@ mod tests {
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"write_file".to_string()));
         assert!(!names.contains(&"exec".to_string()));
+    }
+
+    #[test]
+    fn test_forked_tool_schemas_prefer_relative_paths() {
+        let schemas = build_forked_tool_schemas(&[]);
+        let serialized = serde_json::to_string(&schemas).unwrap();
+
+        assert!(serialized.contains("relative path"));
+        assert!(serialized.contains("working directory"));
+        assert!(!serialized.contains("The absolute path to the file to read"));
+        assert!(!serialized.contains("The absolute directory path to list"));
     }
 
     // 注意：ForkedAgentParams 不再实现 Default trait

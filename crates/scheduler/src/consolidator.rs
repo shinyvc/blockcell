@@ -1926,7 +1926,7 @@ impl DreamConsolidator {
     }
 
     /// 构建整合提示
-    fn build_consolidation_prompt(&self, memory_dir: &Path, signals: &[GatheredSignal]) -> String {
+    fn build_consolidation_prompt(&self, _memory_dir: &Path, signals: &[GatheredSignal]) -> String {
         // 按重要性排序信号
         let mut sorted_signals = signals.to_vec();
         sorted_signals.sort_by_key(|b| std::cmp::Reverse(b.importance));
@@ -1956,7 +1956,12 @@ impl DreamConsolidator {
 对记忆文件进行回顾、整理、更新和索引优化。
 
 ## 记忆目录
-{}
+当前工作目录就是记忆目录。所有文件工具都必须使用相对路径，不要复制或猜测绝对路径。
+示例：
+- list_dir: path="."
+- read_file: file_path="reference.md"
+- grep/glob: path="."
+- edit_file/write_file: file_path="reference.md" 或其他现有/需要创建的 .md 相对路径
 
 ## 收集的新信号
 {}
@@ -1987,16 +1992,15 @@ impl DreamConsolidator {
 - 优化索引结构
 
 ## 工具限制
-- 只读工具: read_file/list_dir/grep/glob 必须使用上方记忆目录内的显式路径
+- 只读工具: read_file/list_dir/grep/glob 使用相对路径，路径会自动限定在当前记忆目录内
 - Shell/Exec: 默认不提供；如被调用，也必须限定在记忆目录内
-- Edit/Write: 仅限记忆目录内
+- Edit/Write: 仅限记忆目录内的 .md 文件；不要创建测试文件或临时文件
 
 ## 注意事项
 - 不要删除现有记忆，除非确认过时
 - 合并相似条目
 - 保持信息密度
 "#,
-            memory_dir.display(),
             signals_section
         )
     }
@@ -2421,6 +2425,23 @@ mod tests {
         let mut state = DreamState::default();
         state.increment_session_count();
         assert_eq!(state.current_session_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_dream_prompt_prefers_relative_memory_paths() {
+        let root = temp_test_dir("dream-relative-prompt");
+        let memory_dir = root.join(".dream_staging").join("run").join("memory");
+        let consolidator = DreamConsolidator::new(&root).await.unwrap();
+
+        let prompt = consolidator.build_consolidation_prompt(&memory_dir, &[]);
+
+        assert!(prompt.contains("当前工作目录就是记忆目录"));
+        assert!(prompt.contains("相对路径"));
+        assert!(prompt.contains("list_dir"));
+        assert!(prompt.contains("read_file"));
+        assert!(!prompt.contains(".dream_staging"));
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[test]
