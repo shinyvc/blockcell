@@ -1956,12 +1956,13 @@ impl DreamConsolidator {
 对记忆文件进行回顾、整理、更新和索引优化。
 
 ## 记忆目录
-当前工作目录就是记忆目录。所有文件工具都必须使用相对路径，不要复制或猜测绝对路径。
+当前工作目录就是记忆目录。所有文件工具都必须使用相对路径，不要复制或猜测绝对路径，也不要加 `memory/` 前缀。
 示例：
 - list_dir: path="."
 - read_file: file_path="reference.md"
 - grep/glob: path="."
 - edit_file/write_file: file_path="reference.md" 或其他现有/需要创建的 .md 相对路径
+- 错误示例: file_path="memory/reference.md", path="../", file_path="/absolute/path/reference.md"
 
 ## 收集的新信号
 {}
@@ -2437,6 +2438,7 @@ mod tests {
 
         assert!(prompt.contains("当前工作目录就是记忆目录"));
         assert!(prompt.contains("相对路径"));
+        assert!(prompt.contains("不要加 `memory/` 前缀"));
         assert!(prompt.contains("list_dir"));
         assert!(prompt.contains("read_file"));
         assert!(!prompt.contains(".dream_staging"));

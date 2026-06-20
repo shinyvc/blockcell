@@ -3096,7 +3096,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "The file path to read. Prefer a relative path resolved from the agent working directory, such as 'reference.md'. Absolute paths are allowed only when they remain within the allowed directory."
+                            "description": "The file path to read. Prefer a relative path resolved from the agent working directory, such as 'reference.md'. Do not prefix paths with 'memory/'. Absolute paths are allowed only when they remain within the allowed directory."
                         }
                     },
                     "required": ["file_path"]
@@ -3114,7 +3114,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "The directory path to list. Prefer a relative path resolved from the agent working directory, such as '.'. Absolute paths are allowed only when they remain within the allowed directory."
+                            "description": "The directory path to list. Prefer a relative path resolved from the agent working directory, such as '.'. Do not prefix paths with 'memory/'. Absolute paths are allowed only when they remain within the allowed directory."
                         }
                     },
                     "required": ["path"]
@@ -3136,7 +3136,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                         },
                         "path": {
                             "type": "string",
-                            "description": "The file path to search in. Prefer a relative path resolved from the agent working directory."
+                            "description": "The file path to search in. Prefer a relative path resolved from the agent working directory. Do not prefix paths with 'memory/'."
                         }
                     },
                     "required": ["pattern", "path"]
@@ -3158,7 +3158,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                         },
                         "path": {
                             "type": "string",
-                            "description": "The directory path to search in. Prefer a relative path resolved from the agent working directory, such as '.'. Absolute paths are allowed only when they remain within the allowed directory."
+                            "description": "The directory path to search in. Prefer a relative path resolved from the agent working directory, such as '.'. Do not prefix paths with 'memory/'. Absolute paths are allowed only when they remain within the allowed directory."
                         }
                     },
                     "required": ["pattern", "path"]
@@ -3176,7 +3176,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "The file path to edit. Prefer a relative path resolved from the agent working directory."
+                            "description": "The file path to edit. Prefer a relative path resolved from the agent working directory. Do not prefix paths with 'memory/'."
                         },
                         "old_string": {
                             "type": "string",
@@ -3206,7 +3206,7 @@ pub fn build_forked_tool_schemas(disallowed_tools: &[String]) -> Vec<serde_json:
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "The file path to write. Prefer a relative path resolved from the agent working directory."
+                            "description": "The file path to write. Prefer a relative path resolved from the agent working directory. Do not prefix paths with 'memory/'."
                         },
                         "content": {
                             "type": "string",

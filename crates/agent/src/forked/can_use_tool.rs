@@ -81,14 +81,12 @@ pub fn create_auto_mem_can_use_tool(memory_dir: &Path) -> CanUseToolFn {
             tool_name,
             "file_edit" | "edit_file" | "file_write" | "write_file"
         ) {
-            if let Some(file_path) = input.get("file_path").and_then(|v| v.as_str()) {
-                if is_auto_mem_path(file_path, &memory_dir) {
-                    return ToolPermission::Allow;
-                }
-            }
-            return ToolPermission::Deny {
-                message: "Only Edit/Write within memory dir allowed".to_string(),
-            };
+            return allow_write_path(
+                tool_name,
+                input,
+                &memory_dir,
+                "Only Edit/Write within memory dir allowed",
+            );
         }
 
         // 其他工具全部拒绝
@@ -124,15 +122,12 @@ pub fn create_dream_can_use_tool(memory_root: &Path) -> CanUseToolFn {
             tool_name,
             "file_edit" | "edit_file" | "file_write" | "write_file"
         ) {
-            if let Some(file_path) = input.get("file_path").and_then(|v| v.as_str()) {
-                // 安全检查：解析符号链接防止路径遍历
-                if is_path_within_directory(file_path, &memory_root) {
-                    return ToolPermission::Allow;
-                }
-            }
-            return ToolPermission::Deny {
-                message: "Only Edit/Write within memory directory".to_string(),
-            };
+            return allow_write_path(
+                tool_name,
+                input,
+                &memory_root,
+                "Only Edit/Write within memory directory",
+            );
         }
 
         ToolPermission::Deny {
@@ -599,6 +594,33 @@ fn read_only_tool_path<'a>(tool_name: &str, input: &'a serde_json::Value) -> Opt
     }
 }
 
+fn allow_write_path(
+    _tool_name: &str,
+    input: &serde_json::Value,
+    allowed_dir: &Path,
+    deny_message: &str,
+) -> ToolPermission {
+    let Some(file_path) = input.get("file_path").and_then(|v| v.as_str()) else {
+        return ToolPermission::Deny {
+            message: deny_message.to_string(),
+        };
+    };
+
+    let resolved_path = resolve_path_against_allowed_dir(file_path, allowed_dir);
+    if is_auto_mem_path(&resolved_path.to_string_lossy(), allowed_dir) {
+        ToolPermission::Allow
+    } else {
+        ToolPermission::Deny {
+            message: format!(
+                "{} (requested: {}, resolved: {})",
+                deny_message,
+                file_path,
+                resolved_path.display()
+            ),
+        }
+    }
+}
+
 fn allow_restricted_shell(input: &serde_json::Value, allowed_dir: &Path) -> ToolPermission {
     let Some(cmd) = input.get("command").and_then(|v| v.as_str()) else {
         return ToolPermission::Deny {
@@ -995,6 +1017,10 @@ mod tests {
             can_use("file_edit", &json!({"file_path": memory_file_str.as_ref()})),
             ToolPermission::Allow
         ));
+        assert!(matches!(
+            can_use("file_edit", &json!({"file_path": "user.md"})),
+            ToolPermission::Allow
+        ));
 
         // 拒绝在 memory 目录外写入
         assert!(matches!(
@@ -1049,6 +1075,14 @@ mod tests {
             can_use("read_file", &json!({"file_path": "reference.md"})),
             ToolPermission::Allow
         ));
+        assert!(matches!(
+            can_use("write_file", &json!({"file_path": "summary.md"})),
+            ToolPermission::Allow
+        ));
+        assert!(matches!(
+            can_use("edit_file", &json!({"file_path": "reference.md"})),
+            ToolPermission::Allow
+        ));
 
         assert!(matches!(
             can_use("list_dir", &json!({"path": ".."})),
@@ -1056,6 +1090,10 @@ mod tests {
         ));
         assert!(matches!(
             can_use("read_file", &json!({"file_path": "../secret.md"})),
+            ToolPermission::Deny { .. }
+        ));
+        assert!(matches!(
+            can_use("write_file", &json!({"file_path": "../secret.md"})),
             ToolPermission::Deny { .. }
         ));
     }
