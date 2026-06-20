@@ -1086,8 +1086,13 @@ impl DreamConsolidator {
         // 获取锁
         self.acquire_lock().await?;
         let memory_dir = self.config_dir.join("memory");
-        recover_dream_commit_backups(&self.config_dir, &memory_dir, self.state.is_consolidating)
-            .await?;
+        if let Err(e) =
+            recover_dream_commit_backups(&self.config_dir, &memory_dir, self.state.is_consolidating)
+                .await
+        {
+            let _ = self.release_lock().await;
+            return Err(e);
+        }
 
         // 记录 Layer 6 dream_started 事件
         let sessions_count = self.state.current_session_count;
@@ -2774,6 +2779,22 @@ mod tests {
             "new-a"
         );
         assert!(!root.join(DREAM_COMMIT_BACKUP_DIR).exists());
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn test_dream_releases_lock_when_commit_backup_recovery_fails() {
+        let root = temp_test_dir("dream-recovery-fails-release-lock");
+        tokio::fs::write(root.join(DREAM_COMMIT_BACKUP_DIR), "not a directory")
+            .await
+            .unwrap();
+
+        let mut consolidator = DreamConsolidator::new(&root).await.unwrap();
+
+        let err = consolidator.dream(5).await.unwrap_err();
+
+        assert!(matches!(err, DreamError::Io(_)));
+        assert!(!root.join(LOCK_FILE_NAME).exists());
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
