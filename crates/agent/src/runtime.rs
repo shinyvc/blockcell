@@ -10,7 +10,7 @@ use blockcell_core::{
     scope_abort_token, scope_agent_context, AbortToken, AgentIdentity, BudgetExhaustedError,
     BudgetTracker, BudgetTrackerHandle, Config, InboundMessage, OutboundMessage, Paths, Result,
 };
-use blockcell_providers::{CallResult, Provider, ProviderPool};
+use blockcell_providers::{CallResult, Provider, ProviderPool, RoutingContext};
 use blockcell_skills::SkillCard;
 use blockcell_storage::ghost_ledger::{GhostEpisodeSource, NewGhostEpisode};
 use blockcell_storage::{AuditLogger, GhostLedger, SessionStore};
@@ -46,6 +46,9 @@ use crate::session_metrics::{ProcessingMetrics, ScopedTimer};
 use crate::skill_executor::{determine_manual_load_mode, SkillExecutionResult};
 use crate::skill_file_store::SkillFileStore;
 use crate::skill_kernel::SkillRunMode;
+use crate::steering::{
+    SteeringChannel, SteeringMessage, SteeringRegistry, SteeringSender, SteeringSessionKey,
+};
 use crate::summary_queue::MainSessionSummaryQueue;
 use crate::system_event_orchestrator::{
     HeartbeatDecision, NotificationRequest, SystemEventOrchestrator,
@@ -324,6 +327,19 @@ fn tool_round_throttle_delay(saw_rate_limit_this_turn: bool) -> std::time::Durat
     } else {
         std::time::Duration::from_millis(TOOL_ROUND_THROTTLE_MS)
     }
+}
+
+fn is_connection_phase_error(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("connection")
+        || lower.contains("connect")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("dns")
+        || lower.contains("refused")
+        || lower.contains("reset")
+        || lower.contains("network")
+        || lower.contains("unreachable")
 }
 
 fn build_activate_skill_tool_schema(skill_cards: &[SkillCard]) -> Option<serde_json::Value> {
@@ -1291,6 +1307,9 @@ fn global_core_tool_names() -> Vec<String> {
     blockcell_tools::registry::GLOBAL_CORE_TOOL_NAMES
         .iter()
         .map(|name| (*name).to_string())
+        .chain(std::iter::once(
+            blockcell_tools::mcp::search::MCP_SEARCH_TOOL_NAME.to_string(),
+        ))
         .collect()
 }
 
@@ -1513,6 +1532,30 @@ fn should_supplement_tool_schema(result: &str) -> bool {
         || lower.contains("config error:")
         || lower.contains("missing required parameter")
         || lower.contains("' is required for")
+}
+
+fn extract_mcp_search_revealed_tools(result: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(result) else {
+        return Vec::new();
+    };
+
+    let mut seen = HashSet::new();
+    value
+        .get("tools")
+        .and_then(|tools| tools.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("name").and_then(|name| name.as_str()))
+        .map(str::trim)
+        .filter(|name| {
+            let Some((server, tool)) = name.split_once("__") else {
+                return false;
+            };
+            !server.trim().is_empty() && !tool.trim().is_empty()
+        })
+        .map(str::to_string)
+        .filter(|name| seen.insert(name.clone()))
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -2079,6 +2122,12 @@ pub struct AgentRuntime {
     write_guard: Arc<crate::write_guard::WriteGuard>,
     /// Token and cost budget trackers keyed by persisted session key.
     budget_trackers: Arc<Mutex<HashMap<String, BudgetTrackerHandle>>>,
+    /// Receives real-time user interjections for the currently running message task.
+    steering: SteeringChannel,
+    /// Cloneable send handle exposed to gateway/WS routing.
+    steering_sender: SteeringSender,
+    /// Shared gateway-visible registry of active steering senders.
+    active_steering_registry: Option<SteeringRegistry>,
 }
 
 impl AgentRuntime {
@@ -2157,6 +2206,7 @@ impl AgentRuntime {
         };
 
         let budget_trackers = Arc::new(Mutex::new(HashMap::new()));
+        let (steering, steering_sender) = SteeringChannel::new(16);
 
         Ok(Self {
             config,
@@ -2218,6 +2268,9 @@ impl AgentRuntime {
             skill_mutex: write_guard.clone() as blockcell_tools::SkillMutexHandle,
             write_guard,
             budget_trackers,
+            steering,
+            steering_sender,
+            active_steering_registry: None,
         })
     }
 
@@ -2621,6 +2674,19 @@ impl AgentRuntime {
     /// Set the broadcast sender for streaming events to WebSocket clients.
     pub fn set_event_tx(&mut self, tx: broadcast::Sender<String>) {
         self.event_tx = Some(tx);
+    }
+
+    pub fn steering_sender(&self) -> SteeringSender {
+        self.steering_sender.clone()
+    }
+
+    pub fn set_steering_channel(&mut self, steering: SteeringChannel, sender: SteeringSender) {
+        self.steering = steering;
+        self.steering_sender = sender;
+    }
+
+    pub fn set_active_steering_registry(&mut self, registry: SteeringRegistry) {
+        self.active_steering_registry = Some(registry);
     }
 
     pub fn set_event_emitter(&mut self, emitter: EventEmitterHandle) {
@@ -3733,7 +3799,7 @@ impl AgentRuntime {
     fn resolved_skill_tool_names(&self, active_skill: &ActiveSkillContext) -> Vec<String> {
         let available_tools = self
             .tool_registry
-            .tool_names()
+            .model_visible_tool_names()
             .into_iter()
             .collect::<HashSet<_>>();
         let mut declared_tools = active_skill.tools.clone();
@@ -3985,6 +4051,15 @@ impl AgentRuntime {
             current_messages,
             ghost_recall_context_block,
         );
+        let routing_context = RoutingContext {
+            message_count: api_messages.len(),
+            estimated_tokens: estimate_messages_tokens(&api_messages),
+            intent: msg
+                .metadata
+                .get("intent")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+        };
 
         for attempt in 0..=max_retries {
             if attempt > 0 {
@@ -3998,201 +4073,230 @@ impl AgentRuntime {
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
-            let (pool_idx, provider) = match self.provider_pool.acquire() {
-                Some(p) => p,
-                None => {
-                    last_error = Some(blockcell_core::Error::Config(
-                        "ProviderPool: no healthy providers available".to_string(),
-                    ));
-                    break;
-                }
-            };
+            let mut excluded_provider_indices = Vec::new();
 
-            match provider.chat_stream(&api_messages, tools).await {
-                Ok(mut stream_rx) => {
-                    if attempt > 0 {
-                        info!(
-                            attempt,
-                            ?iteration,
-                            pool_idx,
-                            "LLM stream call succeeded after retry"
-                        );
+            loop {
+                let (pool_idx, provider) = match self.provider_pool.acquire_with_strategy_excluding(
+                    self.config.agents.defaults.routing_strategy,
+                    &routing_context,
+                    &excluded_provider_indices,
+                ) {
+                    Some(p) => p,
+                    None => {
+                        if last_error.is_none() {
+                            last_error = Some(blockcell_core::Error::Config(
+                                "ProviderPool: no healthy providers available".to_string(),
+                            ));
+                        }
+                        break;
                     }
-                    let mut accumulated_content = String::new();
-                    let mut accumulated_reasoning = String::new();
-                    let mut tool_call_accumulators: HashMap<String, ToolCallAccumulator> =
-                        HashMap::new();
-                    let mut emitted_text_delta = false;
-                    let mut stream_error: Option<blockcell_core::Error> = None;
+                };
 
-                    const STREAM_TIMEOUT_SECS: u64 = 300;
+                match provider.chat_stream(&api_messages, tools).await {
+                    Ok(mut stream_rx) => {
+                        if attempt > 0 {
+                            info!(
+                                attempt,
+                                ?iteration,
+                                pool_idx,
+                                "LLM stream call succeeded after retry"
+                            );
+                        }
+                        let mut accumulated_content = String::new();
+                        let mut accumulated_reasoning = String::new();
+                        let mut tool_call_accumulators: HashMap<String, ToolCallAccumulator> =
+                            HashMap::new();
+                        let mut emitted_text_delta = false;
+                        let mut stream_error: Option<blockcell_core::Error> = None;
 
-                    loop {
-                        let recv_result = tokio::time::timeout(
-                            std::time::Duration::from_secs(STREAM_TIMEOUT_SECS),
-                            stream_rx.recv(),
-                        )
-                        .await;
+                        const STREAM_TIMEOUT_SECS: u64 = 300;
 
-                        match recv_result {
-                            Ok(Some(chunk)) => match chunk {
-                                StreamChunk::TextDelta { delta } => {
-                                    accumulated_content.push_str(&delta);
-                                    emitted_text_delta = true;
-                                    if let Some(ref event_tx) = self.event_tx {
-                                        let event = serde_json::json!({
-                                            "type": "token",
-                                            "channel": msg.channel,
-                                            "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
-                                            "chat_id": msg.chat_id.clone(),
-                                            "delta": delta,
+                        loop {
+                            let recv_result = tokio::time::timeout(
+                                std::time::Duration::from_secs(STREAM_TIMEOUT_SECS),
+                                stream_rx.recv(),
+                            )
+                            .await;
+
+                            match recv_result {
+                                Ok(Some(chunk)) => match chunk {
+                                    StreamChunk::TextDelta { delta } => {
+                                        accumulated_content.push_str(&delta);
+                                        emitted_text_delta = true;
+                                        if let Some(ref event_tx) = self.event_tx {
+                                            let event = serde_json::json!({
+                                                "type": "token",
+                                                "channel": msg.channel,
+                                                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                                                "chat_id": msg.chat_id.clone(),
+                                                "delta": delta,
+                                            });
+                                            let _ = event_tx.send(event.to_string());
+                                        }
+                                    }
+                                    StreamChunk::ReasoningDelta { delta } => {
+                                        accumulated_reasoning.push_str(&delta);
+                                        if let Some(ref event_tx) = self.event_tx {
+                                            let event = serde_json::json!({
+                                                "type": "thinking",
+                                                "channel": msg.channel,
+                                                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                                                "chat_id": msg.chat_id.clone(),
+                                                "content": delta,
+                                            });
+                                            let _ = event_tx.send(event.to_string());
+                                        }
+                                    }
+                                    StreamChunk::ToolCallStart { index: _, id, name } => {
+                                        let acc =
+                                            tool_call_accumulators.entry(id.clone()).or_default();
+                                        acc.id = id.clone();
+                                        acc.name = name.clone();
+                                    }
+                                    StreamChunk::ToolCallDelta {
+                                        index: _,
+                                        id,
+                                        delta,
+                                    } => {
+                                        if let Some(acc) = tool_call_accumulators.get_mut(&id) {
+                                            acc.arguments.push_str(&delta);
+                                        }
+                                    }
+                                    StreamChunk::Done { response } => {
+                                        let final_tool_calls = if !tool_call_accumulators.is_empty()
+                                        {
+                                            tool_call_accumulators
+                                                .drain()
+                                                .map(|(_, acc)| acc.to_tool_call_request())
+                                                .collect()
+                                        } else {
+                                            response.tool_calls.clone()
+                                        };
+
+                                        let final_content = if !accumulated_content.is_empty() {
+                                            Some(accumulated_content.clone())
+                                        } else {
+                                            response.content.clone()
+                                        };
+
+                                        let final_reasoning = if !accumulated_reasoning.is_empty() {
+                                            Some(accumulated_reasoning.clone())
+                                        } else {
+                                            response.reasoning_content.clone()
+                                        };
+
+                                        return Ok(LLMResponse {
+                                            content: final_content,
+                                            reasoning_content: final_reasoning,
+                                            tool_calls: final_tool_calls,
+                                            finish_reason: response.finish_reason.clone(),
+                                            usage: response.usage.clone(),
                                         });
-                                        let _ = event_tx.send(event.to_string());
                                     }
-                                }
-                                StreamChunk::ReasoningDelta { delta } => {
-                                    accumulated_reasoning.push_str(&delta);
-                                    if let Some(ref event_tx) = self.event_tx {
-                                        let event = serde_json::json!({
-                                            "type": "thinking",
-                                            "channel": msg.channel,
-                                            "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
-                                            "chat_id": msg.chat_id.clone(),
-                                            "content": delta,
-                                        });
-                                        let _ = event_tx.send(event.to_string());
+                                    StreamChunk::Error { message } => {
+                                        warn!(error = %message, "Stream error");
+                                        stream_error =
+                                            Some(blockcell_core::Error::Provider(message));
+                                        break;
                                     }
-                                }
-                                StreamChunk::ToolCallStart { index: _, id, name } => {
-                                    let acc = tool_call_accumulators.entry(id.clone()).or_default();
-                                    acc.id = id.clone();
-                                    acc.name = name.clone();
-                                }
-                                StreamChunk::ToolCallDelta {
-                                    index: _,
-                                    id,
-                                    delta,
-                                } => {
-                                    if let Some(acc) = tool_call_accumulators.get_mut(&id) {
-                                        acc.arguments.push_str(&delta);
-                                    }
-                                }
-                                StreamChunk::Done { response } => {
-                                    let final_tool_calls = if !tool_call_accumulators.is_empty() {
-                                        tool_call_accumulators
-                                            .drain()
-                                            .map(|(_, acc)| acc.to_tool_call_request())
-                                            .collect()
-                                    } else {
-                                        response.tool_calls.clone()
-                                    };
-
-                                    let final_content = if !accumulated_content.is_empty() {
-                                        Some(accumulated_content.clone())
-                                    } else {
-                                        response.content.clone()
-                                    };
-
-                                    let final_reasoning = if !accumulated_reasoning.is_empty() {
-                                        Some(accumulated_reasoning.clone())
-                                    } else {
-                                        response.reasoning_content.clone()
-                                    };
-
-                                    return Ok(LLMResponse {
-                                        content: final_content,
-                                        reasoning_content: final_reasoning,
-                                        tool_calls: final_tool_calls,
-                                        finish_reason: response.finish_reason.clone(),
-                                        usage: response.usage.clone(),
-                                    });
-                                }
-                                StreamChunk::Error { message } => {
-                                    warn!(error = %message, "Stream error");
-                                    stream_error = Some(blockcell_core::Error::Provider(message));
+                                },
+                                Ok(None) => {
                                     break;
                                 }
-                            },
-                            Ok(None) => {
-                                break;
-                            }
-                            Err(_) => {
-                                warn!(
-                                    "Stream receive timeout after {} seconds",
-                                    STREAM_TIMEOUT_SECS
-                                );
-                                stream_error = Some(blockcell_core::Error::Provider(format!(
-                                    "Stream timeout after {} seconds",
-                                    STREAM_TIMEOUT_SECS
-                                )));
-                                break;
+                                Err(_) => {
+                                    warn!(
+                                        "Stream receive timeout after {} seconds",
+                                        STREAM_TIMEOUT_SECS
+                                    );
+                                    stream_error = Some(blockcell_core::Error::Provider(format!(
+                                        "Stream timeout after {} seconds",
+                                        STREAM_TIMEOUT_SECS
+                                    )));
+                                    break;
+                                }
                             }
                         }
-                    }
 
-                    // Fallback: tolerate providers that close the stream cleanly without an
-                    // explicit Done event. If the stream ended with an error, retry instead of
-                    // committing a partial answer.
-                    if stream_error.is_none()
-                        && (!tool_call_accumulators.is_empty() || !accumulated_content.is_empty())
-                    {
-                        self.provider_pool.report(pool_idx, CallResult::Success);
-                        let final_tool_calls: Vec<ToolCallRequest> = tool_call_accumulators
-                            .into_values()
-                            .map(|acc| acc.to_tool_call_request())
-                            .collect();
+                        // Fallback: tolerate providers that close the stream cleanly without an
+                        // explicit Done event. If the stream ended with an error, retry instead of
+                        // committing a partial answer.
+                        if stream_error.is_none()
+                            && (!tool_call_accumulators.is_empty()
+                                || !accumulated_content.is_empty())
+                        {
+                            self.provider_pool.report(pool_idx, CallResult::Success);
+                            let final_tool_calls: Vec<ToolCallRequest> = tool_call_accumulators
+                                .into_values()
+                                .map(|acc| acc.to_tool_call_request())
+                                .collect();
 
-                        return Ok(LLMResponse {
-                            content: if accumulated_content.is_empty() {
-                                None
-                            } else {
-                                Some(accumulated_content)
-                            },
-                            reasoning_content: if accumulated_reasoning.is_empty() {
-                                None
-                            } else {
-                                Some(accumulated_reasoning)
-                            },
-                            tool_calls: final_tool_calls,
-                            finish_reason: "stop".to_string(),
-                            usage: serde_json::Value::Null,
-                        });
-                    }
-
-                    if emitted_text_delta {
-                        if let Some(ref event_tx) = self.event_tx {
-                            let event = serde_json::json!({
-                                "type": "stream_reset",
-                                "channel": msg.channel,
-                                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
-                                "chat_id": msg.chat_id.clone(),
+                            return Ok(LLMResponse {
+                                content: if accumulated_content.is_empty() {
+                                    None
+                                } else {
+                                    Some(accumulated_content)
+                                },
+                                reasoning_content: if accumulated_reasoning.is_empty() {
+                                    None
+                                } else {
+                                    Some(accumulated_reasoning)
+                                },
+                                tool_calls: final_tool_calls,
+                                finish_reason: "stop".to_string(),
+                                usage: serde_json::Value::Null,
                             });
-                            let _ = event_tx.send(event.to_string());
                         }
-                    }
 
-                    let err = stream_error.unwrap_or_else(|| {
-                        blockcell_core::Error::Provider(
-                            "Stream ended unexpectedly before completion".to_string(),
-                        )
-                    });
-                    let err_str = format!("{}", err);
-                    let call_result = ProviderPool::classify_error(&err_str);
-                    if matches!(&call_result, CallResult::RateLimit) {
-                        *saw_rate_limit_this_turn = true;
+                        if emitted_text_delta {
+                            if let Some(ref event_tx) = self.event_tx {
+                                let event = serde_json::json!({
+                                    "type": "stream_reset",
+                                    "channel": msg.channel,
+                                    "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                                    "chat_id": msg.chat_id.clone(),
+                                });
+                                let _ = event_tx.send(event.to_string());
+                            }
+                        }
+
+                        let err = stream_error.unwrap_or_else(|| {
+                            blockcell_core::Error::Provider(
+                                "Stream ended unexpectedly before completion".to_string(),
+                            )
+                        });
+                        let err_str = format!("{}", err);
+                        let call_result = ProviderPool::classify_error(&err_str);
+                        if matches!(&call_result, CallResult::RateLimit) {
+                            *saw_rate_limit_this_turn = true;
+                        }
+                        self.provider_pool.report(pool_idx, call_result);
+                        last_error = Some(err);
+                        break;
                     }
-                    self.provider_pool.report(pool_idx, call_result);
-                    last_error = Some(err);
-                }
-                Err(e) => {
-                    let err_str = format!("{}", e);
-                    warn!(error = %err_str, attempt, max_retries, ?iteration, pool_idx, "LLM stream call failed");
-                    let call_result = ProviderPool::classify_error(&err_str);
-                    if matches!(&call_result, CallResult::RateLimit) {
-                        *saw_rate_limit_this_turn = true;
+                    Err(e) => {
+                        let err_str = format!("{}", e);
+                        warn!(error = %err_str, attempt, max_retries, ?iteration, pool_idx, "LLM stream call failed");
+                        let call_result = ProviderPool::classify_error(&err_str);
+                        if matches!(&call_result, CallResult::RateLimit) {
+                            *saw_rate_limit_this_turn = true;
+                        }
+                        self.provider_pool.report(pool_idx, call_result);
+                        if is_connection_phase_error(&err_str) {
+                            excluded_provider_indices.push(pool_idx);
+                            warn!(
+                                attempt,
+                                max_retries,
+                                ?iteration,
+                                pool_idx,
+                                error = %err_str,
+                                "Connection-phase LLM failure; trying fallback provider"
+                            );
+                            last_error = Some(e);
+                            continue;
+                        }
+                        last_error = Some(e);
+                        break;
                     }
-                    self.provider_pool.report(pool_idx, call_result);
-                    last_error = Some(e);
                 }
             }
         }
@@ -4216,6 +4320,42 @@ impl AgentRuntime {
             scope_abort_token(abort_token, self.process_message_inner(msg)).await
         })
         .await
+    }
+
+    fn drain_steering_messages(
+        &mut self,
+        current_messages: &mut Vec<ChatMessage>,
+        history: &mut Vec<ChatMessage>,
+        active_msg: &InboundMessage,
+    ) -> usize {
+        let mut injected = 0;
+        for steer_msg in self.steering.drain() {
+            if steer_msg.content.trim().is_empty() {
+                continue;
+            }
+            info!(
+                channel = %steer_msg.channel,
+                chat_id = %steer_msg.chat_id,
+                "Injecting steering message into active agent loop"
+            );
+            let chat_message = ChatMessage::user(&steer_msg.content);
+            current_messages.push(chat_message.clone());
+            history.push(chat_message);
+            injected += 1;
+
+            if let Some(event_tx) = &self.event_tx {
+                let _ = event_tx.send(
+                    serde_json::json!({
+                        "type": "steering_received",
+                        "channel": active_msg.channel,
+                        "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                        "chat_id": active_msg.chat_id,
+                    })
+                    .to_string(),
+                );
+            }
+        }
+        injected
     }
 
     async fn process_message_inner(&mut self, msg: InboundMessage) -> Result<String> {
@@ -4616,7 +4756,7 @@ impl AgentRuntime {
         }
 
         let available_tools: HashSet<String> =
-            self.tool_registry.tool_names().into_iter().collect();
+            self.tool_registry.model_visible_tool_names().into_iter().collect();
 
         let routed_agent_id = self.agent_id.as_deref();
         let mut tool_names = resolve_effective_tool_names(
@@ -4701,7 +4841,9 @@ impl AgentRuntime {
             .tool_registry
             .get_prompt_rules(&tool_name_refs, &prompt_ctx);
         // MCP meta-rule: inject if any loaded tool is an MCP tool (name contains "__")
-        if tool_names.iter().any(|t| t.contains("__")) {
+        if tool_names.iter().any(|t| {
+            t.contains("__") || t == blockcell_tools::mcp::search::MCP_SEARCH_TOOL_NAME
+        }) {
             tool_prompt_rules.push("- **MCP (Model Context Protocol)**: blockcell **已内置 MCP 客户端支持**，可连接任意 MCP 服务器（SQLite、GitHub、文件系统、数据库等）。MCP 工具会以 `<serverName>__<toolName>` 格式出现在工具列表中。若用户询问 MCP 功能或当前工具列表中无 MCP 工具，说明尚未配置 MCP 服务器，请引导用户使用 `blockcell mcp add <template>` 快捷添加，或直接编辑 `~/.blockcell/mcp.json` / `~/.blockcell/mcp.d/*.json`。例如：`blockcell mcp add sqlite --db-path /tmp/test.db`，重启后即可使用。".to_string());
         }
 
@@ -5053,6 +5195,16 @@ impl AgentRuntime {
                 should_throttle_next_tool_round = false;
             }
 
+            let injected_steering =
+                self.drain_steering_messages(&mut current_messages, &mut history, &msg);
+            if injected_steering > 0 {
+                debug!(
+                    injected_steering,
+                    current_messages_len = current_messages.len(),
+                    "Steering messages injected before LLM call"
+                );
+            }
+
             // Call LLM with extracted sub-function (#15)
             let llm_timer = ScopedTimer::new();
             let llm_result = self
@@ -5273,6 +5425,44 @@ impl AgentRuntime {
                     };
 
                     metrics.record_tool_execution(&tool_call.name, tool_timer.elapsed_ms());
+
+                    if tool_call.name == blockcell_tools::mcp::search::MCP_SEARCH_TOOL_NAME {
+                        let revealed_tools = extract_mcp_search_revealed_tools(&result);
+                        for revealed_tool in revealed_tools {
+                            if disabled_tools.contains(&revealed_tool)
+                                || !self.tool_registry.is_model_hidden(&revealed_tool)
+                            {
+                                continue;
+                            }
+                            let Some(tool) = self.tool_registry.get(&revealed_tool) else {
+                                continue;
+                            };
+                            if !tool_names.iter().any(|name| name == &revealed_tool) {
+                                tool_names.push(revealed_tool.clone());
+                                tool_names.sort();
+                                tool_names.dedup();
+                            }
+                            if !tools.iter().any(|schema| {
+                                schema
+                                    .get("function")
+                                    .and_then(|function| function.get("name"))
+                                    .and_then(|name| name.as_str())
+                                    == Some(revealed_tool.as_str())
+                            }) {
+                                let schema = tool.schema();
+                                tools.push(serde_json::json!({
+                                    "type": "function",
+                                    "function": {
+                                        "name": schema.name,
+                                        "description": schema.description,
+                                        "parameters": schema.parameters
+                                    }
+                                }));
+                                _schema_cache_dirty = true;
+                                info!(tool = %revealed_tool, "Revealed MCP tool from progressive discovery search");
+                            }
+                        }
+                    }
 
                     // Collect media paths from tool results for WebUI display.
                     // Skip the "message" tool — it already dispatches its own OutboundMessage
@@ -7460,13 +7650,22 @@ impl AgentRuntime {
         let mut tick_interval = tokio::time::interval(std::time::Duration::from_secs(tick_secs));
         tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut active_chat_tasks: HashMap<String, String> = HashMap::new();
+        let mut active_steering_senders: HashMap<String, SteeringSender> = HashMap::new();
         let mut active_message_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
         let mut active_abort_tokens: HashMap<String, AbortToken> = HashMap::new();
         let (task_done_tx, mut task_done_rx) = mpsc::unbounded_channel::<(String, String)>();
+        let active_steering_registry = self.active_steering_registry.clone();
+        let runtime_agent_id = self
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
 
         async fn abort_active_message_tasks(
             task_manager: &TaskManager,
+            runtime_agent_id: &str,
+            active_steering_registry: Option<&SteeringRegistry>,
             active_chat_tasks: &mut HashMap<String, String>,
+            active_steering_senders: &mut HashMap<String, SteeringSender>,
             active_message_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
             active_abort_tokens: &mut HashMap<String, AbortToken>,
         ) {
@@ -7481,7 +7680,17 @@ impl AgentRuntime {
                 }
                 task_manager.remove_task(&task_id).await;
             }
+            if let Some(registry) = active_steering_registry {
+                let mut registry = registry.lock().await;
+                for chat_id in active_chat_tasks.keys() {
+                    registry.remove(&SteeringSessionKey {
+                        agent_id: runtime_agent_id.to_string(),
+                        chat_id: chat_id.clone(),
+                    });
+                }
+            }
             active_chat_tasks.clear();
+            active_steering_senders.clear();
         }
 
         loop {
@@ -7498,7 +7707,10 @@ impl AgentRuntime {
                     }
                     abort_active_message_tasks(
                         &self.task_manager,
+                        &runtime_agent_id,
+                        active_steering_registry.as_ref(),
                         &mut active_chat_tasks,
+                        &mut active_steering_senders,
                         &mut active_message_tasks,
                         &mut active_abort_tokens,
                     ).await;
@@ -7510,6 +7722,13 @@ impl AgentRuntime {
                         active_abort_tokens.remove(&task_id);
                         if active_chat_tasks.get(&chat_id).is_some_and(|id| id == &task_id) {
                             active_chat_tasks.remove(&chat_id);
+                            active_steering_senders.remove(&chat_id);
+                            if let Some(registry) = active_steering_registry.as_ref() {
+                                registry.lock().await.remove(&SteeringSessionKey {
+                                    agent_id: runtime_agent_id.clone(),
+                                    chat_id,
+                                });
+                            }
                         }
                     }
                 }
@@ -7520,6 +7739,13 @@ impl AgentRuntime {
                                 let chat_id = msg.chat_id.clone();
                                 let mut cancelled = false;
                                 if let Some(task_id) = active_chat_tasks.remove(&chat_id) {
+                                    active_steering_senders.remove(&chat_id);
+                                    if let Some(registry) = active_steering_registry.as_ref() {
+                                        registry.lock().await.remove(&SteeringSessionKey {
+                                            agent_id: runtime_agent_id.clone(),
+                                            chat_id: chat_id.clone(),
+                                        });
+                                    }
                                     // Graceful cancellation via AbortToken
                                     if let Some(token) = active_abort_tokens.remove(&task_id) {
                                         token.cancel();
@@ -7586,6 +7812,13 @@ impl AgentRuntime {
                                     };
                                     if let Some(cid) = chat_id_to_remove {
                                         active_chat_tasks.remove(&cid);
+                                        active_steering_senders.remove(&cid);
+                                        if let Some(registry) = active_steering_registry.as_ref() {
+                                            registry.lock().await.remove(&SteeringSessionKey {
+                                                agent_id: runtime_agent_id.clone(),
+                                                chat_id: cid,
+                                            });
+                                        }
                                     }
 
                                     info!(task_id = %task_id, "Task cancellation completed");
@@ -7675,6 +7908,71 @@ impl AgentRuntime {
                                 }
                             }
 
+                            let source = msg.metadata.get("source").and_then(|v| v.as_str());
+                            let may_route_to_steering = msg.media.is_empty()
+                                && !matches!(
+                                    source,
+                                    Some("slash_command") | Some("resume_auto_continue")
+                                );
+                            if may_route_to_steering {
+                                if let Some(sender) = active_steering_senders.get(&msg.chat_id).cloned() {
+                                    let steering_message = SteeringMessage {
+                                        content: msg.content.clone(),
+                                        channel: msg.channel.clone(),
+                                        chat_id: msg.chat_id.clone(),
+                                    };
+                                    match sender.try_send(steering_message) {
+                                        Ok(()) => {
+                                            info!(
+                                                channel = %msg.channel,
+                                                chat_id = %msg.chat_id,
+                                                "Routed inbound message to active steering channel"
+                                            );
+                                            continue;
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(steering_message)) => {
+                                            match sender.send(steering_message).await {
+                                                Ok(()) => {
+                                                    info!(
+                                                        channel = %msg.channel,
+                                                        chat_id = %msg.chat_id,
+                                                        "Routed inbound message to active steering channel after backpressure"
+                                                    );
+                                                    continue;
+                                                }
+                                                Err(err) => {
+                                                    warn!(
+                                                        chat_id = %msg.chat_id,
+                                                        error = %err,
+                                                        "Active steering channel closed while sending; falling back to new message task"
+                                                    );
+                                                    active_steering_senders.remove(&msg.chat_id);
+                                                    if let Some(registry) = active_steering_registry.as_ref() {
+                                                        registry.lock().await.remove(&SteeringSessionKey {
+                                                            agent_id: runtime_agent_id.clone(),
+                                                            chat_id: msg.chat_id.clone(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            warn!(
+                                                chat_id = %msg.chat_id,
+                                                "Active steering channel closed; falling back to new message task"
+                                            );
+                                            active_steering_senders.remove(&msg.chat_id);
+                                            if let Some(registry) = active_steering_registry.as_ref() {
+                                                registry.lock().await.remove(&SteeringSessionKey {
+                                                    agent_id: runtime_agent_id.clone(),
+                                                    chat_id: msg.chat_id.clone(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             self.update_main_session_target(&msg).await;
 
                             // Spawn each message as a background task so the loop
@@ -7719,6 +8017,13 @@ impl AgentRuntime {
                             ).await;
 
                             if let Some(prev_task_id) = active_chat_tasks.remove(&chat_id_for_task) {
+                                active_steering_senders.remove(&chat_id_for_task);
+                                if let Some(registry) = active_steering_registry.as_ref() {
+                                    registry.lock().await.remove(&SteeringSessionKey {
+                                        agent_id: runtime_agent_id.clone(),
+                                        chat_id: chat_id_for_task.clone(),
+                                    });
+                                }
                                 // 清理前一个任务的 AbortToken（防止内存泄漏）
                                 if let Some(prev_token) = active_abort_tokens.remove(&prev_task_id) {
                                     prev_token.cancel();
@@ -7734,7 +8039,19 @@ impl AgentRuntime {
                                 }
                             }
 
-                            active_chat_tasks.insert(chat_id_for_task, task_id.clone());
+                            let (steering, steering_sender) = SteeringChannel::new(16);
+                            active_chat_tasks.insert(chat_id_for_task.clone(), task_id.clone());
+                            active_steering_senders
+                                .insert(chat_id_for_task.clone(), steering_sender.clone());
+                            if let Some(registry) = active_steering_registry.as_ref() {
+                                registry.lock().await.insert(
+                                    SteeringSessionKey {
+                                        agent_id: runtime_agent_id.clone(),
+                                        chat_id: chat_id_for_task.clone(),
+                                    },
+                                    steering_sender.clone(),
+                                );
+                            }
                             // Create AbortToken for this message task (child of runtime's token)
                             let msg_abort_token = self.abort_token.child();
                             active_abort_tokens.insert(task_id.clone(), msg_abort_token.clone());
@@ -7753,6 +8070,8 @@ impl AgentRuntime {
                                     event_tx,
                                     agent_id,
                                     event_emitter,
+                                    steering,
+                                    steering_sender,
                                     msg,
                                     task_id_clone,
                                     msg_abort_token,
@@ -7908,7 +8227,10 @@ impl AgentRuntime {
         }
         abort_active_message_tasks(
             &self.task_manager,
+            &runtime_agent_id,
+            active_steering_registry.as_ref(),
             &mut active_chat_tasks,
+            &mut active_steering_senders,
             &mut active_message_tasks,
             &mut active_abort_tokens,
         )
@@ -8159,6 +8481,8 @@ async fn run_message_task(
     event_tx: Option<broadcast::Sender<String>>,
     agent_id: Option<String>,
     event_emitter: EventEmitterHandle,
+    steering: SteeringChannel,
+    steering_sender: SteeringSender,
     msg: InboundMessage,
     task_id: String,
     abort_token: AbortToken,
@@ -8200,6 +8524,7 @@ async fn run_message_task(
     runtime.set_task_manager(task_manager.clone());
     runtime.set_agent_id(agent_id.clone());
     runtime.set_event_emitter(event_emitter);
+    runtime.set_steering_channel(steering, steering_sender);
     if let Some(store) = memory_store {
         runtime.set_memory_store(store);
     }
@@ -9843,6 +10168,8 @@ mod tests {
         attempts: AtomicUsize,
     }
     struct StreamingCloseProvider;
+    struct ConnectionFailingProvider;
+    struct SuccessfulFallbackProvider;
     struct UnifiedEntryProvider {
         calls: AtomicUsize,
     }
@@ -9933,6 +10260,27 @@ mod tests {
         assert_eq!(
             apply_skill_fallback_response("  ok  ".to_string(), Some("fallback")),
             "ok"
+        );
+    }
+
+    #[test]
+    fn extract_mcp_search_revealed_tools_reads_search_result_names() {
+        let result = serde_json::json!({
+            "tools": [
+                { "name": "postgres__query" },
+                { "name": "github__create_issue" },
+                { "name": "not_mcp" },
+                { "name": "" }
+            ]
+        })
+        .to_string();
+
+        assert_eq!(
+            extract_mcp_search_revealed_tools(&result),
+            vec![
+                "postgres__query".to_string(),
+                "github__create_issue".to_string()
+            ]
         );
     }
 
@@ -10231,6 +10579,70 @@ mod tests {
                         delta: "closed answer".to_string(),
                     })
                     .await;
+            });
+            Ok(rx)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl blockcell_providers::Provider for ConnectionFailingProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<LLMResponse> {
+            Err(blockcell_core::Error::Provider(
+                "connection refused before stream".to_string(),
+            ))
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<mpsc::Receiver<StreamChunk>> {
+            Err(blockcell_core::Error::Provider(
+                "connection refused before stream".to_string(),
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl blockcell_providers::Provider for SuccessfulFallbackProvider {
+        async fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<LLMResponse> {
+            Ok(LLMResponse {
+                content: Some("fallback answer".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> blockcell_core::Result<mpsc::Receiver<StreamChunk>> {
+            let (tx, rx) = mpsc::channel(8);
+            tokio::spawn(async move {
+                let response = LLMResponse {
+                    content: Some("fallback answer".to_string()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    finish_reason: "stop".to_string(),
+                    usage: serde_json::Value::Null,
+                };
+                let _ = tx
+                    .send(StreamChunk::TextDelta {
+                        delta: "fallback answer".to_string(),
+                    })
+                    .await;
+                let _ = tx.send(StreamChunk::Done { response }).await;
             });
             Ok(rx)
         }
@@ -12002,6 +12414,61 @@ description: local demo
         assert_eq!(result, "closed answer");
     }
 
+    #[tokio::test]
+    async fn connection_phase_failure_falls_back_to_next_provider_without_retry_budget() {
+        let mut config = Config::default();
+        config.agents.defaults.model = "test/mock".to_string();
+        config.agents.defaults.provider = Some("test".to_string());
+        config.agents.defaults.llm_max_retries = 0;
+
+        let base = std::env::temp_dir().join(format!(
+            "blockcell-fallback-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp fallback runtime dir");
+        let paths = Paths::with_base(base);
+        let provider_pool = ProviderPool::from_entries(vec![
+            blockcell_providers::ProviderPoolEntry {
+                model: "primary".to_string(),
+                provider_name: "test".to_string(),
+                weight: 1,
+                priority: 1,
+                provider: Arc::new(ConnectionFailingProvider),
+            },
+            blockcell_providers::ProviderPoolEntry {
+                model: "fallback".to_string(),
+                provider_name: "test".to_string(),
+                weight: 1,
+                priority: 2,
+                provider: Arc::new(SuccessfulFallbackProvider),
+            },
+        ]);
+        let mut runtime = AgentRuntime::new(
+            config,
+            paths,
+            provider_pool,
+            blockcell_tools::ToolRegistry::new(),
+        )
+        .expect("create runtime");
+        runtime.set_agent_id(Some("default".to_string()));
+        let msg = test_main_session_inbound("ws", "fallback-chat");
+        let mut saw_rate_limit = false;
+
+        let response = runtime
+            .call_llm_with_retry(
+                &[ChatMessage::user("hello")],
+                &[],
+                &msg,
+                None,
+                &HashMap::new(),
+                &mut saw_rate_limit,
+            )
+            .await
+            .expect("fallback provider should answer");
+
+        assert_eq!(response.content.as_deref(), Some("fallback answer"));
+    }
+
     fn test_runtime() -> AgentRuntime {
         let mut config = Config::default();
         config.agents.defaults.model = "test/mock".to_string();
@@ -12132,6 +12599,42 @@ description: local demo
         .expect("create runtime");
         runtime.set_agent_id(Some("default".to_string()));
         runtime
+    }
+
+    #[test]
+    fn steering_drain_injects_user_messages_into_current_and_history() {
+        let mut runtime = test_runtime();
+        let (steering, sender) = SteeringChannel::new(4);
+        runtime.set_steering_channel(steering, sender.clone());
+        sender
+            .try_send(SteeringMessage {
+                content: "adjust course".to_string(),
+                channel: "ws".to_string(),
+                chat_id: "chat-a".to_string(),
+            })
+            .expect("steering message should fit");
+
+        let inbound = InboundMessage {
+            channel: "ws".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "chat-a".to_string(),
+            content: "start".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let mut current_messages = vec![ChatMessage::user("start")];
+        let mut history = vec![ChatMessage::user("start")];
+
+        let injected =
+            runtime.drain_steering_messages(&mut current_messages, &mut history, &inbound);
+
+        assert_eq!(injected, 1);
+        assert_eq!(chat_message_text(&current_messages[1]), "adjust course");
+        assert_eq!(chat_message_text(&history[1]), "adjust course");
+        assert_eq!(current_messages[1].role, "user");
+        assert_eq!(history[1].role, "user");
     }
 
     fn test_main_session_inbound(channel: &str, chat_id: &str) -> InboundMessage {

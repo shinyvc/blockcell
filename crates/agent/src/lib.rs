@@ -41,6 +41,7 @@ pub mod skill_kernel;
 // WriteGuard 实现了 SkillMutexOps trait，可作为 SkillMutexHandle 传给工具层
 pub mod skill_nudge;
 pub mod skill_summary;
+pub mod steering;
 pub mod summary_queue;
 pub mod system_event_orchestrator;
 pub mod system_event_store;
@@ -110,6 +111,9 @@ pub use memory_system::{
 };
 pub use response_cache::{ResponseCache, ResponseCacheConfig};
 pub use runtime::{create_evolution_deploy_callback, AgentRuntime, ConfirmRequest};
+pub use steering::{
+    SteeringChannel, SteeringMessage, SteeringRegistry, SteeringSender, SteeringSessionKey,
+};
 // Re-export RuntimeHandle trait from tools crate for convenience
 pub use blockcell_tools::RuntimeHandle;
 pub use checkpoint::{CheckpointManager, TaskCheckpoint};
@@ -126,3 +130,37 @@ pub use unified_security_scanner::{
     UnifiedSecurityScanner,
 };
 pub use write_guard::{WriteGuard, WriteGuardError, WriteGuardRAII, WriteTarget};
+
+#[cfg(test)]
+mod steering_tests {
+    #[test]
+    fn steering_channel_drains_pending_messages_in_order() {
+        let (mut channel, sender) = crate::steering::SteeringChannel::new(4);
+
+        sender
+            .try_send(crate::steering::SteeringMessage {
+                content: "first".to_string(),
+                channel: "ws".to_string(),
+                chat_id: "chat-a".to_string(),
+            })
+            .expect("first steering message should fit");
+        sender
+            .try_send(crate::steering::SteeringMessage {
+                content: "second".to_string(),
+                channel: "ws".to_string(),
+                chat_id: "chat-a".to_string(),
+            })
+            .expect("second steering message should fit");
+
+        assert!(channel.has_pending());
+        let drained = channel.drain();
+        assert_eq!(
+            drained
+                .iter()
+                .map(|msg| msg.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert!(!channel.has_pending());
+    }
+}
