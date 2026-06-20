@@ -327,6 +327,7 @@ impl Paths {
         std::fs::create_dir_all(self.audit_dir())?;
         std::fs::create_dir_all(self.cron_dir())?;
         std::fs::create_dir_all(self.workspace().join("media"))?;
+        std::fs::create_dir_all(self.workspace().join("downloads"))?;
         std::fs::create_dir_all(self.update_dir())?;
         std::fs::create_dir_all(self.bridge_dir())?;
         std::fs::create_dir_all(self.whatsapp_auth_dir())?;
@@ -415,6 +416,22 @@ mod tests {
             paths.logs_dir(),
             PathBuf::from("/tmp/blockcell/workspace/logs")
         );
+    }
+
+    #[test]
+    fn test_ensure_dirs_creates_media_cleanup_targets() {
+        let base = std::env::temp_dir().join(format!("blockcell-paths-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::with_base(base.clone());
+
+        paths.ensure_dirs().expect("ensure dirs");
+
+        let media_exists = paths.media_dir().is_dir();
+        let downloads_exists = paths.workspace().join("downloads").is_dir();
+
+        std::fs::remove_dir_all(base).expect("remove temp dirs");
+
+        assert!(media_exists);
+        assert!(downloads_exists);
     }
 
     #[test]
