@@ -1,0 +1,120 @@
+use super::*;
+
+impl MemoryStore {
+    /// Open (or create) the memory database at the given path.
+    pub fn open(db_path: &Path) -> Result<Self> {
+        self::MemoryStore::open_with_options(db_path, MemoryStoreOptions::default())
+    }
+
+    pub fn open_with_options(db_path: &Path, options: MemoryStoreOptions) -> Result<Self> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                blockcell_core::Error::Storage(format!("Failed to create db directory: {}", e))
+            })?;
+        }
+
+        let conn = Connection::open(db_path).map_err(|e| {
+            blockcell_core::Error::Storage(format!("Failed to open memory db: {}", e))
+        })?;
+
+        // Enable WAL mode for better concurrent read performance
+        conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
+
+        let store = Self {
+            inner: Arc::new(Mutex::new(conn)),
+            db_path: db_path.to_path_buf(),
+            vector: options.vector,
+        };
+        store.init_schema()?;
+        Ok(store)
+    }
+
+    pub(crate) fn init_schema(&self) -> Result<()> {
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| blockcell_core::Error::Storage(format!("Lock error: {}", e)))?;
+
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS memory_items (
+                id TEXT PRIMARY KEY,
+                scope TEXT NOT NULL DEFAULT 'short_term',
+                type TEXT NOT NULL DEFAULT 'note',
+                title TEXT,
+                content TEXT NOT NULL,
+                summary TEXT,
+                tags TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'user',
+                channel TEXT,
+                session_key TEXT,
+                importance REAL NOT NULL DEFAULT 0.5,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_accessed_at TEXT,
+                access_count INTEGER NOT NULL DEFAULT 0,
+                expires_at TEXT,
+                deleted_at TEXT,
+                dedup_key TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_items(scope);
+            CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_items(type);
+            CREATE INDEX IF NOT EXISTS idx_memory_deleted ON memory_items(deleted_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_expires ON memory_items(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_dedup ON memory_items(dedup_key);
+            CREATE INDEX IF NOT EXISTS idx_memory_importance ON memory_items(importance);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+                title,
+                summary,
+                content,
+                tags,
+                content='memory_items',
+                content_rowid='rowid'
+            );
+
+            -- Triggers to keep FTS in sync
+            CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory_items BEGIN
+                INSERT INTO memory_fts(rowid, title, summary, content, tags)
+                VALUES (new.rowid, new.title, new.summary, new.content, new.tags);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory_items BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, title, summary, content, tags)
+                VALUES ('delete', old.rowid, old.title, old.summary, old.content, old.tags);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory_items BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, title, summary, content, tags)
+                VALUES ('delete', old.rowid, old.title, old.summary, old.content, old.tags);
+                INSERT INTO memory_fts(rowid, title, summary, content, tags)
+                VALUES (new.rowid, new.title, new.summary, new.content, new.tags);
+            END;
+
+            -- Migration tracking
+            CREATE TABLE IF NOT EXISTS memory_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_vector_queue (
+                id TEXT PRIMARY KEY,
+                operation TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_vector_queue_operation
+            ON memory_vector_queue(operation);
+            ",
+        )
+        .map_err(|e| {
+            blockcell_core::Error::Storage(format!("Failed to init memory schema: {}", e))
+        })?;
+
+        debug!("Memory store schema initialized");
+        Ok(())
+    }
+}
