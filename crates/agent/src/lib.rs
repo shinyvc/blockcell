@@ -19,6 +19,7 @@ pub mod ghost_metrics;
 pub mod ghost_recall;
 pub mod health;
 pub mod history_projector;
+pub mod hooks;
 pub mod intent;
 pub mod learning_coordinator;
 pub mod learning_dedup;

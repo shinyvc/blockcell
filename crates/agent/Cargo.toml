@@ -25,6 +25,7 @@ regex = { workspace = true }
 once_cell = { workspace = true }
 thiserror = { workspace = true }
 tiktoken-rs = { workspace = true }
+glob = { workspace = true }
 
 [features]
 default = ["napcat"]

@@ -102,6 +102,15 @@ BlockCell 可以在真实使用中沉淀长期有效的经验：
 
 主对话 LLM 调用还支持**连接阶段自动降级**：如果首选 Provider 在建立流之前出现连接、超时、DNS 等错误，会立即尝试下一个可用 Provider；一旦流式输出已经开始，中途错误不会切换模型，避免把部分输出和另一个模型的结果混在一起。
 
+### 🪝 Hook 生命周期事件
+
+BlockCell 可以通过 `~/.blockcell/hooks.yaml` 在关键生命周期事件上执行本机命令：
+
+- `pre_tool_use` / `post_tool_use`：工具实际执行前后触发，支持按工具名 glob 匹配
+- `session_start` / `user_prompt` / `agent_stop`：会话和消息级事件
+- 支持 `{tool_name}`、`{session_id}`、`{cwd}`、`{command}`、`{file_path}`、`{result}` 等模板变量
+- Hook 失败或超时不会阻断 agent 主流程，适合审计、格式化、通知和外部日志接入
+
 ### 🤖 多智能体与自定义 Agent
 
 - 支持 typed agent、forked subagent、checkpoint 和链式取消
@@ -413,6 +422,7 @@ blockcell gateway
 - [记忆系统](docs/05_memory_system.md)
 - [Ghost Native 学习闭环](docs/27_ghost_learning_design.md)
 - [ModelRouter 智能路由与自动降级](docs/28_model_router.md)
+- [Hook 生命周期事件系统](docs/29_hook_system.md)
 - [渠道配置](docs/06_channels.md)
 - [浏览器自动化](docs/07_browser_automation.md)
 - [Gateway 模式](docs/08_gateway_mode.md)

@@ -38,6 +38,7 @@ use crate::ghost_learning::{
 };
 use crate::ghost_recall::should_inject_ghost_recall;
 use crate::history_projector::{HistoryProjector, TimeBasedMCConfig};
+use crate::hooks::{HookContext, HookEvent, HookManager};
 use crate::intent::{IntentCategory, IntentToolResolver};
 use crate::memory_event;
 use crate::memory_file_store::MemoryFileStore;
@@ -2099,6 +2100,8 @@ pub struct AgentRuntime {
     path_policy: PathPolicy,
     /// Loaded tool-call policy engine (from `~/.blockcell/tool_policy.yaml`).
     tool_policy: ToolPolicy,
+    /// User-configured lifecycle hooks (from `~/.blockcell/hooks.yaml`).
+    hook_manager: HookManager,
     /// Per-session cache for large list/table responses (prevents history token explosion).
     response_cache: crate::response_cache::ResponseCache,
     /// 7-Layer Memory System integration.
@@ -2154,6 +2157,7 @@ impl AgentRuntime {
         let channel_contacts = blockcell_storage::ChannelContacts::new(paths.clone());
         let path_policy = load_path_policy(&config, &paths);
         let tool_policy = ToolPolicy::load(&paths.base.join("tool_policy.yaml"));
+        let hook_manager = HookManager::load(&paths.base.join("hooks.yaml"));
         let system_event_store = InMemorySystemEventStore::default();
         let summary_queue = MainSessionSummaryQueue::with_policy(
             5,
@@ -2241,6 +2245,7 @@ impl AgentRuntime {
             channel_contacts,
             path_policy,
             tool_policy,
+            hook_manager,
             response_cache: crate::response_cache::ResponseCache::with_config(
                 response_cache_config,
             ),
@@ -3906,6 +3911,19 @@ impl AgentRuntime {
             overwrite_last_assistant_message(history, &stub);
         }
 
+        if !self.hook_manager.is_empty() {
+            let _ = self
+                .hook_manager
+                .fire(&HookContext {
+                    event: HookEvent::AgentStop,
+                    result: Some(final_response.clone()),
+                    session_id: persist_session_key.to_string(),
+                    cwd: self.paths.workspace().display().to_string(),
+                    ..HookContext::default()
+                })
+                .await;
+        }
+
         self.session_store
             .save_with_metadata(persist_session_key, history, session_metadata)?;
 
@@ -4634,6 +4652,31 @@ impl AgentRuntime {
         // session_key 是来源会话。历史应从目标会话加载，避免源会话历史覆盖目标会话。
         let mut history = self.session_store.load(&persist_session_key)?;
         let mut session_metadata = self.session_store.load_metadata(&persist_session_key)?;
+        let is_new_session = history.is_empty();
+
+        if !self.hook_manager.is_empty() {
+            if is_new_session {
+                let _ = self
+                    .hook_manager
+                    .fire(&HookContext {
+                        event: HookEvent::SessionStart,
+                        session_id: persist_session_key.clone(),
+                        cwd: self.paths.workspace().display().to_string(),
+                        ..HookContext::default()
+                    })
+                    .await;
+            }
+            let _ = self
+                .hook_manager
+                .fire(&HookContext {
+                    event: HookEvent::UserPrompt,
+                    result: Some(msg.content.clone()),
+                    session_id: persist_session_key.clone(),
+                    cwd: self.paths.workspace().display().to_string(),
+                    ..HookContext::default()
+                })
+                .await;
+        }
 
         // Dream session count：使用独立 marker 文件 + create_new 实现原子计数
         // 解决 metadata save 的 TOCTOU 竞态：两个 runtime 可能同时读到 dream_counted=false，
@@ -6982,6 +7025,21 @@ impl AgentRuntime {
             }),
         };
 
+        if !self.hook_manager.is_empty() {
+            let _ = self
+                .hook_manager
+                .fire(&HookContext {
+                    event: HookEvent::PreToolUse,
+                    tool_name: Some(tool_call.name.clone()),
+                    tool_args: tool_call.arguments.clone(),
+                    result: None,
+                    is_error: false,
+                    session_id: msg.session_key(),
+                    cwd: self.paths.workspace().display().to_string(),
+                })
+                .await;
+        }
+
         // Emit tool_call_start event to WebSocket clients
         if let Some(ref event_tx) = self.event_tx {
             let event = serde_json::json!({
@@ -7011,6 +7069,21 @@ impl AgentRuntime {
                 (err_str.clone(), serde_json::json!({"error": err_str}))
             }
         };
+
+        if !self.hook_manager.is_empty() {
+            let _ = self
+                .hook_manager
+                .fire(&HookContext {
+                    event: HookEvent::PostToolUse,
+                    tool_name: Some(tool_call.name.clone()),
+                    tool_args: tool_call.arguments.clone(),
+                    result: Some(result_str.clone()),
+                    is_error,
+                    session_id: msg.session_key(),
+                    cwd: self.paths.workspace().display().to_string(),
+                })
+                .await;
+        }
 
         // Detect writes to the skills directory and trigger hot-reload + Dashboard refresh
         if !is_error
