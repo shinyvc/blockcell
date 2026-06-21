@@ -1,0 +1,4247 @@
+//! Unit and integration tests for the agent runtime.
+//! Extracted from runtime.rs (mechanical move; logic unchanged).
+
+use super::*;
+use blockcell_core::types::LLMResponse;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+
+struct TestProvider;
+struct StreamingRetryProvider {
+    attempts: AtomicUsize,
+}
+struct StreamingCloseProvider;
+struct ConnectionFailingProvider;
+struct SuccessfulFallbackProvider;
+struct UnifiedEntryProvider {
+    calls: AtomicUsize,
+}
+struct RecallCaptureProvider {
+    calls: Mutex<Vec<Vec<ChatMessage>>>,
+}
+struct SequencedGhostProvider;
+struct ReviewAndCaptureProvider {
+    calls: Mutex<Vec<Vec<ChatMessage>>>,
+    review_calls: AtomicUsize,
+}
+struct BoundaryFlushProvider {
+    calls: Mutex<Vec<Vec<ChatMessage>>>,
+    flush_calls: AtomicUsize,
+}
+struct BoundaryMemoryProvider;
+struct ProviderToolCaptureProvider {
+    seen_tools: Mutex<Vec<Vec<serde_json::Value>>>,
+}
+struct RuntimeProviderTool {
+    calls: Mutex<Vec<serde_json::Value>>,
+}
+
+fn extract_active_skill_name(system_text: &str) -> Option<String> {
+    let marker = "## Active Skill: ";
+    let start = system_text.find(marker)?;
+    let rest = &system_text[start + marker.len()..];
+    let skill_name = rest.lines().next()?.trim();
+    if skill_name.is_empty() {
+        None
+    } else {
+        Some(skill_name.to_string())
+    }
+}
+
+fn drain_ws_events(event_rx: &mut broadcast::Receiver<String>) -> Vec<serde_json::Value> {
+    let mut events = Vec::new();
+    loop {
+        match event_rx.try_recv() {
+            Ok(payload) => {
+                events.push(
+                    serde_json::from_str::<serde_json::Value>(&payload).expect("parse ws event"),
+                );
+            }
+            Err(broadcast::error::TryRecvError::Empty)
+            | Err(broadcast::error::TryRecvError::Closed) => break,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+        }
+    }
+    events
+}
+
+fn collect_event_types(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| event.get("type").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
+fn contains_event_subsequence(events: &[String], expected: &[&str]) -> bool {
+    let mut cursor = 0usize;
+    for event in events {
+        if cursor < expected.len() && event == expected[cursor] {
+            cursor += 1;
+        }
+    }
+    cursor == expected.len()
+}
+
+#[test]
+fn apply_skill_fallback_response_uses_fallback_for_empty_output() {
+    let fallback = "当前无法获取腾讯新闻数据，请先检查 CLI 安装、API Key 配置或网络环境。";
+
+    assert_eq!(
+        apply_skill_fallback_response(String::new(), Some(fallback)),
+        fallback
+    );
+    assert_eq!(
+        apply_skill_fallback_response("   \n\t".to_string(), Some(fallback)),
+        fallback
+    );
+}
+
+#[test]
+fn apply_skill_fallback_response_keeps_non_empty_output() {
+    assert_eq!(
+        apply_skill_fallback_response("  ok  ".to_string(), Some("fallback")),
+        "ok"
+    );
+}
+
+#[test]
+fn extract_mcp_search_revealed_tools_reads_search_result_names() {
+    let result = serde_json::json!({
+        "tools": [
+            { "name": "postgres__query" },
+            { "name": "github__create_issue" },
+            { "name": "not_mcp" },
+            { "name": "" }
+        ]
+    })
+    .to_string();
+
+    assert_eq!(
+        extract_mcp_search_revealed_tools(&result),
+        vec![
+            "postgres__query".to_string(),
+            "github__create_issue".to_string()
+        ]
+    );
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for TestProvider {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<LLMResponse> {
+        let system_text = messages.first().map(chat_message_text).unwrap_or_default();
+        let user_text = messages
+            .iter()
+            .rev()
+            .find(|msg| msg.role == "user")
+            .map(chat_message_text)
+            .unwrap_or_default();
+        let latest_tool_text = messages
+            .iter()
+            .rev()
+            .find(|msg| msg.role == "tool")
+            .map(chat_message_text);
+        let active_skill_name = extract_active_skill_name(&system_text);
+
+        let response = if matches!(active_skill_name.as_deref(), Some("compat_local_demo"))
+            && latest_tool_text.is_none()
+        {
+            LLMResponse {
+                content: Some("准备调用兼容本地脚本".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![ToolCallRequest {
+                    id: "test-exec-local-compat".to_string(),
+                    name: "exec_local".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "scripts/hello.sh",
+                        "runner": "sh",
+                        "args": ["skill"],
+                        "cwd_mode": "skill"
+                    }),
+                    thought_signature: None,
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        } else if matches!(active_skill_name.as_deref(), Some("compat_local_demo")) {
+            let stdout = latest_tool_text
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|value| {
+                    value
+                        .get("stdout")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            LLMResponse {
+                content: Some(format!("local exec result: {}", stdout)),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        } else if matches!(
+            active_skill_name.as_deref(),
+            Some("local_demo" | "legacy_script_demo" | "cli_demo")
+        ) && latest_tool_text.is_none()
+        {
+            let (path, args) = match active_skill_name.as_deref() {
+                Some("cli_demo") => ("bin/cli.sh", vec!["demo"]),
+                _ => ("scripts/hello.sh", vec!["skill"]),
+            };
+            LLMResponse {
+                content: Some("准备调用本地脚本".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![ToolCallRequest {
+                    id: "test-exec-skill-script".to_string(),
+                    name: "exec_skill_script".to_string(),
+                    arguments: serde_json::json!({
+                        "path": path,
+                        "runner": "sh",
+                        "args": args,
+                        "cwd_mode": "skill"
+                    }),
+                    thought_signature: None,
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        } else if matches!(
+            active_skill_name.as_deref(),
+            Some("local_demo" | "legacy_script_demo" | "cli_demo")
+        ) {
+            let stdout = latest_tool_text
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|value| {
+                    value
+                        .get("stdout")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            LLMResponse {
+                content: Some(format!("local exec result: {}", stdout)),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        } else if user_text.contains("技能说明摘要") && user_text.contains("执行结果") {
+            let execution_result = user_text
+                .split("执行结果：")
+                .nth(1)
+                .or_else(|| user_text.split("执行结果:").nth(1))
+                .unwrap_or_default()
+                .trim();
+            LLMResponse {
+                content: Some(format!("summary: {}", execution_result)),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        } else {
+            LLMResponse {
+                content: Some(format!("mock answer: {}", user_text)),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        };
+
+        Ok(response)
+    }
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for ProviderToolCaptureProvider {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<LLMResponse> {
+        self.seen_tools.lock().unwrap().push(tools.to_vec());
+        let latest_tool_text = messages
+            .iter()
+            .rev()
+            .find(|msg| msg.role == "tool")
+            .map(chat_message_text);
+
+        if let Some(tool_text) = latest_tool_text {
+            return Ok(LLMResponse {
+                content: Some(format!("provider result: {}", tool_text)),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            });
+        }
+
+        Ok(LLMResponse {
+            content: Some("checking external memory".to_string()),
+            reasoning_content: None,
+            tool_calls: vec![ToolCallRequest {
+                id: "provider-tool-call".to_string(),
+                name: "external_memory_lookup".to_string(),
+                arguments: serde_json::json!({"query": "canary rollout"}),
+                thought_signature: None,
+            }],
+            finish_reason: "tool_calls".to_string(),
+            usage: serde_json::Value::Null,
+        })
+    }
+}
+
+impl crate::ghost_memory_provider::GhostMemoryProvider for RuntimeProviderTool {
+    fn name(&self) -> &'static str {
+        "runtime_provider_tool"
+    }
+
+    fn get_tool_schemas(&self) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({
+            "name": "external_memory_lookup",
+            "description": "Lookup provider-backed external memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }
+        })]
+    }
+
+    fn handle_tool_call(
+        &self,
+        tool_name: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        assert_eq!(tool_name, "external_memory_lookup");
+        self.calls.lock().unwrap().push(args.clone());
+        Ok(serde_json::json!({
+            "success": true,
+            "provider": self.name(),
+            "query": args.get("query").cloned().unwrap_or(serde_json::Value::Null),
+            "memory": "Prefer canary rollout before broad release."
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for StreamingRetryProvider {
+    async fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<LLMResponse> {
+        Ok(LLMResponse {
+            content: Some("unexpected non-stream call".to_string()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            finish_reason: "stop".to_string(),
+            usage: serde_json::Value::Null,
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<mpsc::Receiver<StreamChunk>> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel(8);
+
+        tokio::spawn(async move {
+            if attempt == 0 {
+                let _ = tx
+                    .send(StreamChunk::TextDelta {
+                        delta: "partial".to_string(),
+                    })
+                    .await;
+                let _ = tx
+                    .send(StreamChunk::Error {
+                        message: "temporary stream failure".to_string(),
+                    })
+                    .await;
+                return;
+            }
+
+            let response = LLMResponse {
+                content: Some("final answer".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            };
+            let _ = tx
+                .send(StreamChunk::TextDelta {
+                    delta: "final answer".to_string(),
+                })
+                .await;
+            let _ = tx.send(StreamChunk::Done { response }).await;
+        });
+
+        Ok(rx)
+    }
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for StreamingCloseProvider {
+    async fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<LLMResponse> {
+        Ok(LLMResponse {
+            content: Some("unexpected non-stream call".to_string()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            finish_reason: "stop".to_string(),
+            usage: serde_json::Value::Null,
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<mpsc::Receiver<StreamChunk>> {
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(StreamChunk::TextDelta {
+                    delta: "closed answer".to_string(),
+                })
+                .await;
+        });
+        Ok(rx)
+    }
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for ConnectionFailingProvider {
+    async fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<LLMResponse> {
+        Err(blockcell_core::Error::Provider(
+            "connection refused before stream".to_string(),
+        ))
+    }
+
+    async fn chat_stream(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<mpsc::Receiver<StreamChunk>> {
+        Err(blockcell_core::Error::Provider(
+            "connection refused before stream".to_string(),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for SuccessfulFallbackProvider {
+    async fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<LLMResponse> {
+        Ok(LLMResponse {
+            content: Some("fallback answer".to_string()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            finish_reason: "stop".to_string(),
+            usage: serde_json::Value::Null,
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<mpsc::Receiver<StreamChunk>> {
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            let response = LLMResponse {
+                content: Some("fallback answer".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            };
+            let _ = tx
+                .send(StreamChunk::TextDelta {
+                    delta: "fallback answer".to_string(),
+                })
+                .await;
+            let _ = tx.send(StreamChunk::Done { response }).await;
+        });
+        Ok(rx)
+    }
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for UnifiedEntryProvider {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<LLMResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+
+        let system_text = messages.first().map(chat_message_text).unwrap_or_default();
+        let user_text = messages
+            .iter()
+            .rev()
+            .find(|msg| msg.role == "user")
+            .map(chat_message_text)
+            .unwrap_or_default();
+        let latest_tool_msg = messages.iter().rev().find(|msg| msg.role == "tool");
+        let latest_tool_name = latest_tool_msg
+            .and_then(|msg| msg.name.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        let latest_tool_text = latest_tool_msg.map(chat_message_text);
+        let active_skill_name = extract_active_skill_name(&system_text);
+
+        let response = if matches!(active_skill_name.as_deref(), Some("compat_local_demo"))
+            && latest_tool_name != "exec_local"
+        {
+            LLMResponse {
+                content: Some("进入 compat_local_demo".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![ToolCallRequest {
+                    id: "skill-exec-local-compat".to_string(),
+                    name: "exec_local".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "scripts/hello.sh",
+                        "runner": "sh",
+                        "args": ["skill"],
+                        "cwd_mode": "skill"
+                    }),
+                    thought_signature: None,
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        } else if matches!(active_skill_name.as_deref(), Some("compat_local_demo")) {
+            let stdout = latest_tool_text
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|value| {
+                    value
+                        .get("stdout")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            LLMResponse {
+                content: Some(format!("local exec result: {}", stdout)),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        } else if matches!(active_skill_name.as_deref(), Some("local_demo"))
+            && latest_tool_name != "exec_skill_script"
+        {
+            LLMResponse {
+                content: Some("进入 local_demo".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![ToolCallRequest {
+                    id: "skill-exec-skill-script".to_string(),
+                    name: "exec_skill_script".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "scripts/hello.sh",
+                        "runner": "sh",
+                        "args": ["skill"],
+                        "cwd_mode": "skill"
+                    }),
+                    thought_signature: None,
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        } else if matches!(active_skill_name.as_deref(), Some("local_demo")) {
+            let stdout = latest_tool_text
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|value| {
+                    value
+                        .get("stdout")
+                        .and_then(|value| value.as_str())
+                        .map(str::trim)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            LLMResponse {
+                content: Some(format!("local exec result: {}", stdout)),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        } else if user_text.contains("技能说明摘要") && user_text.contains("执行结果") {
+            let execution_result = user_text
+                .split("执行结果：")
+                .nth(1)
+                .or_else(|| user_text.split("执行结果:").nth(1))
+                .unwrap_or_default()
+                .trim();
+            LLMResponse {
+                content: Some(format!("summary: {}", execution_result)),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        } else if latest_tool_name == "list_dir" {
+            let path = latest_tool_text
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|value| {
+                    value
+                        .get("path")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| ".".to_string());
+            LLMResponse {
+                content: Some(format!("目录内容：{}", path)),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        } else if user_text.contains("查看当前目录下文件") {
+            LLMResponse {
+                content: Some("先列目录".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![ToolCallRequest {
+                    id: "general-list-dir".to_string(),
+                    name: "list_dir".to_string(),
+                    arguments: serde_json::json!({ "path": "." }),
+                    thought_signature: None,
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        } else if user_text.contains("运行本地脚本") {
+            LLMResponse {
+                content: Some("改用 skill".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![ToolCallRequest {
+                    id: "activate-skill-local-demo".to_string(),
+                    name: ACTIVATE_SKILL_TOOL_NAME.to_string(),
+                    arguments: serde_json::json!({
+                        "skill_name": "local_demo",
+                        "goal": "运行本地脚本"
+                    }),
+                    thought_signature: None,
+                }],
+                finish_reason: "tool_calls".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        } else {
+            LLMResponse {
+                content: Some(format!("mock answer: {}", user_text)),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            }
+        };
+
+        Ok(response)
+    }
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for RecallCaptureProvider {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<LLMResponse> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+
+        let system_text = messages.first().map(chat_message_text).unwrap_or_default();
+        if system_text.contains("quiet Ghost learning reviewer") && !tools.is_empty() {
+            return Ok(LLMResponse {
+                content: Some("no durable learning".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            });
+        }
+
+        Ok(LLMResponse {
+            content: Some("mock answer: recall applied".to_string()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            finish_reason: "stop".to_string(),
+            usage: serde_json::Value::Null,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for SequencedGhostProvider {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<LLMResponse> {
+        let system_text = messages.first().map(chat_message_text).unwrap_or_default();
+        let user_text = messages
+            .iter()
+            .rev()
+            .find(|msg| msg.role == "user")
+            .map(chat_message_text)
+            .unwrap_or_default();
+
+        if system_text.contains("quiet Ghost learning reviewer") && !tools.is_empty() {
+            return Ok(LLMResponse {
+                content: Some("no durable learning".to_string()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "stop".to_string(),
+                usage: serde_json::Value::Null,
+            });
+        }
+
+        Ok(LLMResponse {
+            content: Some(format!("mock answer: {}", user_text)),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            finish_reason: "stop".to_string(),
+            usage: serde_json::Value::Null,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for ReviewAndCaptureProvider {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<LLMResponse> {
+        let system_text = messages.first().map(chat_message_text).unwrap_or_default();
+        if system_text.contains("quiet Ghost learning reviewer") && !tools.is_empty() {
+            let review_index = self.review_calls.fetch_add(1, Ordering::SeqCst);
+            let tool_calls = if review_index == 0 {
+                vec![
+                    ToolCallRequest {
+                        id: "review-user-memory".to_string(),
+                        name: "memory_manage".to_string(),
+                        arguments: serde_json::json!({
+                            "action": "add",
+                            "target": "user",
+                            "content": "User prefers canary-first rollout."
+                        }),
+                        thought_signature: None,
+                    },
+                    ToolCallRequest {
+                        id: "review-project-memory".to_string(),
+                        name: "memory_manage".to_string(),
+                        arguments: serde_json::json!({
+                            "action": "add",
+                            "target": "memory",
+                            "content": "Confirm rollback plan before release verification."
+                        }),
+                        thought_signature: None,
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            return Ok(LLMResponse {
+                content: None,
+                reasoning_content: None,
+                finish_reason: if tool_calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                }
+                .to_string(),
+                tool_calls,
+                usage: serde_json::Value::Null,
+            });
+        }
+
+        self.calls.lock().unwrap().push(messages.to_vec());
+        let user_text = messages
+            .iter()
+            .rev()
+            .find(|msg| msg.role == "user")
+            .map(chat_message_text)
+            .unwrap_or_default();
+        Ok(LLMResponse {
+            content: Some(format!("mock answer: {}", user_text)),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            finish_reason: "stop".to_string(),
+            usage: serde_json::Value::Null,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for BoundaryFlushProvider {
+    async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<LLMResponse> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        let latest_user_text = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(chat_message_text)
+            .unwrap_or_default();
+        if latest_user_text.contains("__ghost_memory_flush_sentinel") && !tools.is_empty() {
+            let call_idx = self.flush_calls.fetch_add(1, Ordering::SeqCst);
+            let tool_calls = if call_idx == 0 {
+                vec![ToolCallRequest {
+                    id: "flush-memory".to_string(),
+                    name: "memory_manage".to_string(),
+                    arguments: serde_json::json!({
+                        "action": "add",
+                        "target": "user",
+                        "content": "User prefers checking rollback order before deploy compression."
+                    }),
+                    thought_signature: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            return Ok(LLMResponse {
+                content: None,
+                reasoning_content: None,
+                finish_reason: if tool_calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                }
+                .to_string(),
+                tool_calls,
+                usage: serde_json::Value::Null,
+            });
+        }
+
+        Ok(LLMResponse {
+            content: Some("mock answer".to_string()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            finish_reason: "stop".to_string(),
+            usage: serde_json::Value::Null,
+        })
+    }
+}
+
+impl crate::ghost_memory_provider::GhostMemoryProvider for BoundaryMemoryProvider {
+    fn name(&self) -> &'static str {
+        "boundary_test"
+    }
+
+    fn on_pre_compress(&self, _messages: &[String], _session_id: &str) -> Result<String> {
+        Ok("preserve provider-derived rollback preference before compression".to_string())
+    }
+
+    fn on_session_end(&self, _messages: &[String], _session_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_session_boundary_context(
+        &self,
+        _messages: &[String],
+        _session_id: &str,
+    ) -> Result<String> {
+        Ok("preserve provider-derived session-end deploy preference".to_string())
+    }
+}
+
+#[test]
+fn test_core_tools_contains_toggle_manage() {
+    assert!(global_core_tool_names()
+        .iter()
+        .any(|name| name == "toggle_manage"));
+}
+
+#[test]
+fn test_path_within_base_allows_normal_child_path() {
+    let base = PathBuf::from("/tmp/workspace");
+    let candidate = base.join("skills/new/SKILL.py");
+    assert!(is_path_within_base(&base, &candidate));
+}
+
+#[test]
+fn test_path_within_base_blocks_nonexistent_traversal() {
+    let base = PathBuf::from("/tmp/workspace");
+    let candidate = base.join("../../etc/passwd");
+    assert!(!is_path_within_base(&base, &candidate));
+}
+
+#[test]
+fn test_tool_result_indicates_error_for_json_error_field() {
+    let result = r#"{"error":"Permission denied: blocked"}"#;
+    assert!(tool_result_indicates_error(result));
+}
+
+#[test]
+fn test_tool_result_indicates_error_does_not_use_failed_substring() {
+    let result = "Task succeeded, previous attempt failed but recovered.";
+    assert!(!tool_result_indicates_error(result));
+}
+
+#[test]
+fn test_should_supplement_tool_schema_for_validation_error() {
+    let result = "Error: Validation error: Missing required parameter: path";
+    assert!(should_supplement_tool_schema(result));
+}
+
+#[test]
+fn test_should_supplement_tool_schema_for_config_error() {
+    let result = "Error: Config error: 'enabled' (boolean) is required for 'set' action";
+    assert!(should_supplement_tool_schema(result));
+}
+
+#[test]
+fn test_should_supplement_tool_schema_ignores_permission_denied() {
+    let result = "Error: Tool error: Permission denied: path blocked";
+    assert!(!should_supplement_tool_schema(result));
+}
+
+#[test]
+fn test_resolve_routed_agent_id_from_metadata() {
+    let metadata = serde_json::json!({
+        "route_agent_id": "ops"
+    });
+
+    assert_eq!(resolve_routed_agent_id(&metadata).as_deref(), Some("ops"));
+    assert_eq!(resolve_routed_agent_id(&serde_json::Value::Null), None);
+}
+
+#[test]
+fn test_build_subagent_inbound_for_structured_skill_task_uses_forced_skill_name() {
+    let inbound = build_subagent_inbound_message(
+        "__SKILL_EXEC__:weather:北京天气",
+        "cli",
+        "chat-1",
+        &serde_json::json!({
+            "route_agent_id": "ops"
+        }),
+        "subagent:test",
+    );
+
+    assert_eq!(inbound.content, "北京天气");
+    assert_eq!(
+        inbound
+            .metadata
+            .get("forced_skill_name")
+            .and_then(|value| value.as_str()),
+        Some("weather")
+    );
+    assert_eq!(
+        inbound
+            .metadata
+            .get("subagent_session_key")
+            .and_then(|value| value.as_str()),
+        Some("subagent:test")
+    );
+    assert!(inbound.metadata.get("skill_script").is_none());
+    assert!(inbound.metadata.get("skill_script_kind").is_none());
+    assert!(inbound.metadata.get("skill_python").is_none());
+    assert!(inbound.metadata.get("skill_rhai").is_none());
+    assert!(inbound.metadata.get("skill_markdown").is_none());
+}
+
+#[test]
+fn test_parse_spawn_task_forces_explicit_skill_request() {
+    let parsed = parse_spawn_task_forced_skill_request(
+        "使用已安装的 xiaohongshu 技能：先获取推荐流 feeds，然后定位第15条笔记",
+    );
+
+    assert_eq!(
+        parsed,
+        Some((
+            "xiaohongshu".to_string(),
+            "先获取推荐流 feeds，然后定位第15条笔记".to_string()
+        ))
+    );
+}
+
+#[test]
+fn test_subagent_metadata_preserves_route_agent_id() {
+    let metadata = build_subagent_metadata(Some("ops"));
+
+    assert_eq!(
+        metadata.get("route_agent_id").and_then(|v| v.as_str()),
+        Some("ops")
+    );
+}
+
+#[test]
+fn test_global_core_tool_names_excludes_email() {
+    let names = global_core_tool_names();
+
+    assert!(names.iter().any(|name| name == "toggle_manage"));
+    assert!(names.iter().any(|name| name == "memory_query"));
+    assert!(names.iter().any(|name| name == "list_skills"));
+    assert!(!names.iter().any(|name| name == "email"));
+    assert!(!names.iter().any(|name| name == "finance_api"));
+    assert!(!names.iter().any(|name| name == "read_file"));
+}
+
+#[test]
+fn test_active_tool_names_for_skill_include_kernel_and_declared_tools() {
+    use crate::context::ActiveSkillContext;
+
+    let available: HashSet<String> = [
+        "memory_query",
+        "memory_upsert",
+        "memory_forget",
+        "spawn",
+        "list_tasks",
+        "list_skills",
+        "toggle_manage",
+        "finance_api",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    let skill = ActiveSkillContext {
+        name: "stock_analysis".to_string(),
+        prompt_md: String::new(),
+        inject_prompt_md: true,
+        tools: vec!["finance_api".to_string()],
+        fallback_message: None,
+        source: blockcell_skills::manager::SkillSource::BlockCell,
+    };
+
+    let tool_names = resolve_effective_tool_names(
+        &Config::default(),
+        InteractionMode::Skill,
+        None,
+        Some(&skill),
+        &[IntentCategory::Unknown],
+        &available,
+    );
+
+    assert!(tool_names.contains(&"finance_api".to_string()));
+    assert!(tool_names.contains(&"memory_query".to_string()));
+    assert!(tool_names.contains(&"toggle_manage".to_string()));
+    assert_eq!(
+        tool_names
+            .iter()
+            .filter(|name| name.as_str() == "finance_api")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn test_tool_context_supports_optional_event_emitter() {
+    use blockcell_core::system_event::{EventPriority, SystemEvent};
+    use blockcell_tools::{SystemEventEmitter, ToolContext};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    struct NoopEmitter;
+
+    impl SystemEventEmitter for NoopEmitter {
+        fn emit(&self, _event: SystemEvent) {}
+
+        fn emit_simple(
+            &self,
+            kind: &str,
+            source: &str,
+            priority: EventPriority,
+            title: &str,
+            summary: &str,
+        ) {
+            let _ = SystemEvent::new_main_session(kind, source, priority, title, summary);
+        }
+    }
+
+    let ctx = ToolContext {
+        workspace: PathBuf::from("/tmp/workspace"),
+        base: PathBuf::from("/tmp/blockcell"),
+        builtin_skills_dir: None,
+        active_skill_dir: None,
+        session_key: "cli:test".to_string(),
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: None,
+        chat_id: "chat-1".to_string(),
+        config: Config::default(),
+        permissions: blockcell_core::types::PermissionSet::new(),
+        task_manager: None,
+        memory_store: None,
+        memory_file_store: None,
+        ghost_memory_lifecycle: None,
+        skill_file_store: None,
+        session_search: None,
+        outbound_tx: None,
+        spawn_handle: None,
+        capability_registry: None,
+        core_evolution: None,
+        event_emitter: Some(Arc::new(NoopEmitter)),
+        channel_contacts_file: None,
+        response_cache: None,
+        runtime_handle: None,
+        agent_identity: None,
+        skill_mutex: Some(Arc::new(crate::write_guard::WriteGuard::default())
+            as blockcell_tools::SkillMutexHandle),
+        agent_type_registry: None,
+        evolution_workflow_store: None,
+    };
+
+    assert!(ctx.event_emitter.is_some());
+}
+
+#[test]
+fn test_skill_decision_engine_normalizes_selected_skill_name() {
+    use crate::skill_decision::SkillDecisionEngine;
+
+    let candidates = vec![
+        ("xiaohongshu".to_string(), "小红书相关能力".to_string()),
+        ("weather".to_string(), "天气查询".to_string()),
+    ];
+
+    let exact = SkillDecisionEngine::normalize_selected_skill_name("xiaohongshu", &candidates);
+    let partial =
+        SkillDecisionEngine::normalize_selected_skill_name("最合适的是 xiaohongshu。", &candidates);
+    let missing = SkillDecisionEngine::normalize_selected_skill_name("finance", &candidates);
+
+    assert_eq!(exact.as_deref(), Some("xiaohongshu"));
+    assert_eq!(partial.as_deref(), Some("xiaohongshu"));
+    assert_eq!(missing, None);
+}
+
+#[test]
+fn test_expand_history_stubs_with_cache_restores_cached_content() {
+    let cache = crate::response_cache::ResponseCache::new();
+    let session_key = "ws:chat-1";
+    let cached_list = (1..=18)
+            .map(|i| {
+                format!(
+                    "{}. 第{}条推荐，包含足够长的标题、作者信息、摘要说明以及若干补充字段，用来模拟小红书推荐流里带隐藏定位字段的大列表返回结果。",
+                    i, i
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    let stub = cache
+        .maybe_cache_and_stub(session_key, &cached_list, true)
+        .expect("content should be cached");
+    let history = vec![ChatMessage::assistant(&stub)];
+
+    let expanded = expand_history_stubs_with_cache(&cache, session_key, &history);
+
+    assert_eq!(expanded.len(), 1);
+    assert_eq!(expanded[0].content.as_str(), Some(cached_list.as_str()));
+}
+
+#[test]
+fn test_resolve_skill_run_mode_prefers_explicit_metadata() {
+    let msg = InboundMessage {
+        channel: "cron".to_string(),
+        account_id: None,
+        sender_id: "system".to_string(),
+        chat_id: "chat-1".to_string(),
+        content: "hello".to_string(),
+        media: vec![],
+        metadata: serde_json::json!({
+            "skill_run_mode": "test",
+        }),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    assert_eq!(resolve_skill_run_mode(&msg), SkillRunMode::Test);
+}
+
+#[test]
+fn test_resolve_cron_deliver_target_requires_cron_mode_and_delivery_fields() {
+    let msg = InboundMessage {
+        channel: "cron".to_string(),
+        account_id: None,
+        sender_id: "system".to_string(),
+        chat_id: "chat-1".to_string(),
+        content: "hello".to_string(),
+        media: vec![],
+        metadata: serde_json::json!({
+            "skill_run_mode": "cron",
+            "deliver": true,
+            "deliver_channel": "ws",
+            "deliver_to": "chat-2",
+        }),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    assert_eq!(
+        resolve_cron_deliver_target(&msg),
+        Some(("ws".to_string(), "chat-2".to_string()))
+    );
+}
+
+#[test]
+fn test_build_script_skill_summary_prompt_includes_skill_md_brief() {
+    let prompt = build_script_skill_summary_prompt(
+        "帮我搜一下小红书露营装备",
+        "xiaohongshu",
+        "search",
+        "请优先提炼结果，不要冗长输出。",
+        "找到 3 条高互动笔记",
+    );
+
+    assert!(prompt.contains("帮我搜一下小红书露营装备"));
+    assert!(prompt.contains("xiaohongshu"));
+    assert!(prompt.contains("search"));
+    assert!(prompt.contains("请优先提炼结果"));
+    assert!(prompt.contains("找到 3 条高互动笔记"));
+}
+
+#[test]
+fn test_skill_prompt_injection_keeps_activate_skill_mainline() {
+    let mut messages = vec![ChatMessage::system("You are BlockCell.")];
+    let skill_cards = vec![SkillCard {
+        name: "local_demo".to_string(),
+        description: "Local demo skill".to_string(),
+        execution_layout: "PromptTool + LocalScript".to_string(),
+        when_to_use: "Run local demo scripts".to_string(),
+        outputs: "Local exec output".to_string(),
+        allowed_tools: vec!["exec_local".to_string()],
+        local_exec_entrypoints: vec!["scripts/hello.sh".to_string()],
+        supports_local_exec: true,
+    }];
+
+    inject_skill_cards_into_system_prompt(&mut messages, &skill_cards, Some("local_demo"));
+
+    let prompt = messages[0].content.as_str().unwrap_or_default();
+    assert!(prompt.contains("## Installed Skills"));
+    assert!(prompt.contains(
+        "Use `activate_skill` when one installed skill is a better fit than general tools."
+    ));
+    assert!(prompt.contains("inspect it with `skill_view`"));
+    assert!(prompt.contains("patch it with `skill_manage(action=\"patch\")`"));
+    assert!(prompt.contains("If a skill card shows local execution entries, you may use `exec_local` only for those relative paths and only inside the active skill scope."));
+    assert!(prompt.contains("Recent active skill: `local_demo`"));
+    assert!(prompt.contains("布局: PromptTool + LocalScript"));
+    assert!(prompt.contains("本地入口: scripts/hello.sh"));
+}
+
+#[test]
+fn test_markdown_skill_executor_limits_tools_to_skill_scope() {
+    let available: HashSet<String> = ["web_search", "read_file", "spawn", "memory_query"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    let tool_names = crate::prompt_skill_executor::PromptSkillExecutor::resolve_allowed_tool_names(
+        &[
+            "web_search".to_string(),
+            "spawn".to_string(),
+            "unknown_tool".to_string(),
+        ],
+        &available,
+    );
+
+    assert_eq!(tool_names, vec!["web_search".to_string()]);
+}
+
+#[test]
+fn test_markdown_skill_executor_does_not_fallback_to_global_tools() {
+    let available: HashSet<String> = ["web_search", "read_file", "memory_query"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    let tool_names = crate::prompt_skill_executor::PromptSkillExecutor::resolve_allowed_tool_names(
+        &[],
+        &available,
+    );
+
+    assert!(tool_names.is_empty());
+}
+
+#[tokio::test]
+async fn test_prompt_skill_executes_through_unified_skill_executor() {
+    let mut runtime = test_runtime();
+    let skill_dir = runtime.paths.skills_dir().join("prompt_demo");
+    std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+    std::fs::write(
+        skill_dir.join("meta.yaml"),
+        r#"
+name: prompt_demo
+description: prompt demo
+"#,
+    )
+    .expect("write meta");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"# Prompt Demo
+
+## Shared {#shared}
+你是一个简洁的整理助手。
+
+## Prompt {#prompt}
+直接整理用户输入，不需要调用工具。
+"#,
+    )
+    .expect("write skill md");
+    runtime.context_builder.reload_skills();
+
+    let msg = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "chat-1".to_string(),
+        content: "请帮我整理这句话".to_string(),
+        media: vec![],
+        metadata: serde_json::json!({
+            "forced_skill_name": "prompt_demo",
+        }),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    let result = runtime.process_message(msg).await.expect("process message");
+    assert!(result.contains("请帮我整理这句话"));
+
+    let session_key = blockcell_core::build_session_key("cli", "chat-1");
+    let history = runtime
+        .session_store
+        .load(&session_key)
+        .expect("load session history");
+    assert!(history.iter().any(|message| {
+        message
+            .tool_calls
+            .as_ref()
+            .map(|calls| {
+                calls.iter().any(|call| {
+                    call.name == "skill_enter"
+                        && call.arguments["skill_name"].as_str() == Some("prompt_demo")
+                })
+            })
+            .unwrap_or(false)
+    }));
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn test_prompt_skill_can_use_exec_skill_script_inside_skill_scope() {
+    let mut runtime = test_runtime();
+    runtime.tool_registry.register(Arc::new(
+        blockcell_tools::exec_skill_script::ExecSkillScriptTool,
+    ));
+    let skill_dir = runtime.paths.skills_dir().join("local_demo");
+    let scripts_dir = skill_dir.join("scripts");
+    std::fs::create_dir_all(&scripts_dir).expect("create scripts dir");
+    std::fs::write(
+        skill_dir.join("meta.yaml"),
+        r#"
+name: local_demo
+description: local demo
+"#,
+    )
+    .expect("write meta");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"# Local Demo
+
+## Shared {#shared}
+适合执行 skill 目录内的本地脚本。
+
+## Prompt {#prompt}
+如果要运行本地脚本，使用 exec_skill_script 调用 `scripts/hello.sh`。
+"#,
+    )
+    .expect("write skill md");
+    std::fs::write(
+        scripts_dir.join("hello.sh"),
+        "#!/bin/sh\necho local-skill-$1\n",
+    )
+    .expect("write script");
+    runtime.context_builder.reload_skills();
+
+    let msg = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "chat-local".to_string(),
+        content: "运行本地脚本".to_string(),
+        media: vec![],
+        metadata: serde_json::json!({
+            "forced_skill_name": "local_demo",
+        }),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    let result = runtime.process_message(msg).await.expect("process message");
+    let session_key = blockcell_core::build_session_key("cli", "chat-local");
+    let history = runtime
+        .session_store
+        .load(&session_key)
+        .expect("load session history");
+    assert!(
+        result.starts_with("summary:"),
+        "unexpected skill result: {}",
+        result
+    );
+    assert!(
+        result.contains("local-skill-skill"),
+        "unexpected skill result: {}; history: {:?}",
+        result,
+        history
+    );
+    assert!(history.iter().any(|message| {
+        message
+            .tool_calls
+            .as_ref()
+            .map(|calls| calls.iter().any(|call| call.name == "exec_skill_script"))
+            .unwrap_or(false)
+    }));
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn test_resolved_skill_tool_names_include_exec_skill_script_for_script_capable_skill() {
+    let mut runtime = test_runtime();
+    runtime.tool_registry.register(Arc::new(
+        blockcell_tools::exec_skill_script::ExecSkillScriptTool,
+    ));
+    runtime
+        .tool_registry
+        .register(Arc::new(blockcell_tools::exec_local::ExecLocalTool));
+    let skill_dir = runtime.paths.skills_dir().join("script_demo");
+    std::fs::create_dir_all(skill_dir.join("scripts")).expect("create scripts dir");
+    std::fs::write(
+        skill_dir.join("meta.yaml"),
+        r#"
+name: script_demo
+description: script demo
+"#,
+    )
+    .expect("write meta");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"# Script Demo
+
+## Shared {#shared}
+适合执行 skill 目录内的脚本资产。
+
+## Prompt {#prompt}
+如果需要运行本地脚本，使用 exec_skill_script 调用 `scripts/hello.sh`。
+"#,
+    )
+    .expect("write skill md");
+    std::fs::write(skill_dir.join("scripts/hello.sh"), "#!/bin/sh\necho ok\n")
+        .expect("write script");
+    runtime.context_builder.reload_skills();
+
+    let active_skill = crate::context::ActiveSkillContext {
+        name: "script_demo".to_string(),
+        prompt_md: String::new(),
+        inject_prompt_md: true,
+        tools: vec![],
+        fallback_message: None,
+        source: blockcell_skills::manager::SkillSource::BlockCell,
+    };
+
+    let tool_names = runtime.resolved_skill_tool_names(&active_skill);
+    assert!(tool_names.contains(&"exec_skill_script".to_string()));
+    assert!(tool_names.contains(&"exec_local".to_string()));
+}
+
+#[tokio::test]
+async fn test_check_path_permission_allows_exec_skill_script_skill_paths() {
+    let mut runtime = test_runtime();
+    let msg = test_main_session_inbound("cli", "chat-script-path");
+
+    assert!(
+        runtime
+            .check_path_permission(
+                "exec_skill_script",
+                &serde_json::json!({"path": "scripts/hello.sh"}),
+                &msg,
+            )
+            .await
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn test_skill_executor_uses_manual_not_file_type_to_choose_skill_script() {
+    let mut runtime = test_runtime();
+    runtime.tool_registry.register(Arc::new(
+        blockcell_tools::exec_skill_script::ExecSkillScriptTool,
+    ));
+    let skill_dir = runtime.paths.skills_dir().join("legacy_script_demo");
+    let scripts_dir = skill_dir.join("scripts");
+    std::fs::create_dir_all(&scripts_dir).expect("create scripts dir");
+    std::fs::write(
+        skill_dir.join("meta.yaml"),
+        r#"
+name: legacy_script_demo
+description: legacy script demo
+"#,
+    )
+    .expect("write meta");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"# Legacy Script Demo
+
+## Shared {#shared}
+适合执行 skill 目录内的本地脚本。
+
+## Prompt {#prompt}
+如果需要运行本地脚本，使用 exec_skill_script 调用 `scripts/hello.sh`。
+"#,
+    )
+    .expect("write skill md");
+    std::fs::write(
+        skill_dir.join("SKILL.py"),
+        "print('legacy path should not run')\n",
+    )
+    .expect("write legacy py");
+    std::fs::write(
+        scripts_dir.join("hello.sh"),
+        "#!/bin/sh\necho local-skill-$1\n",
+    )
+    .expect("write script");
+    runtime.context_builder.reload_skills();
+
+    let msg = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "chat-legacy".to_string(),
+        content: "运行这个技能".to_string(),
+        media: vec![],
+        metadata: serde_json::json!({
+            "forced_skill_name": "legacy_script_demo",
+        }),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    let result = runtime.process_message(msg).await.expect("process message");
+    let session_key = blockcell_core::build_session_key("cli", "chat-legacy");
+    let history = runtime
+        .session_store
+        .load(&session_key)
+        .expect("load session history");
+    assert!(
+        result.contains("local-skill-skill"),
+        "unexpected skill result: {}; history: {:?}",
+        result,
+        history
+    );
+    assert!(history.iter().any(|message| {
+        message
+            .tool_calls
+            .as_ref()
+            .map(|calls| calls.iter().any(|call| call.name == "exec_skill_script"))
+            .unwrap_or(false)
+    }));
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn test_cli_style_skill_runs_via_exec_skill_script() {
+    let mut runtime = test_runtime();
+    runtime.tool_registry.register(Arc::new(
+        blockcell_tools::exec_skill_script::ExecSkillScriptTool,
+    ));
+    let skill_dir = runtime.paths.skills_dir().join("cli_demo");
+    let bin_dir = skill_dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+    std::fs::write(
+        skill_dir.join("meta.yaml"),
+        r#"
+name: cli_demo
+description: cli demo
+"#,
+    )
+    .expect("write meta");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"# CLI Demo
+
+## Shared {#shared}
+适合执行 skill 目录中的 CLI 脚本。
+
+## Prompt {#prompt}
+当用户要求执行 CLI 时，使用 exec_skill_script 调用 `bin/cli.sh`。
+"#,
+    )
+    .expect("write skill md");
+    std::fs::write(bin_dir.join("cli.sh"), "#!/bin/sh\necho local-cli-$1\n")
+        .expect("write cli script");
+    runtime.context_builder.reload_skills();
+
+    let msg = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "chat-cli".to_string(),
+        content: "执行 CLI".to_string(),
+        media: vec![],
+        metadata: serde_json::json!({
+            "forced_skill_name": "cli_demo",
+        }),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    let result = runtime.process_message(msg).await.expect("process message");
+    assert!(
+        result.contains("local-cli-demo"),
+        "unexpected cli result: {}",
+        result
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn test_prompt_skill_can_still_use_exec_local_inside_skill_scope_for_compat() {
+    let mut runtime = test_runtime();
+    runtime
+        .tool_registry
+        .register(Arc::new(blockcell_tools::exec_local::ExecLocalTool));
+    let skill_dir = runtime.paths.skills_dir().join("compat_local_demo");
+    let scripts_dir = skill_dir.join("scripts");
+    std::fs::create_dir_all(&scripts_dir).expect("create scripts dir");
+    std::fs::write(
+        skill_dir.join("meta.yaml"),
+        r#"
+name: compat_local_demo
+description: compat local demo
+"#,
+    )
+    .expect("write meta");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"# Compat Local Demo
+
+## Shared {#shared}
+适合执行 skill 目录内的本地脚本。
+
+## Prompt {#prompt}
+如果要运行本地脚本，使用 exec_local。
+"#,
+    )
+    .expect("write skill md");
+    std::fs::write(
+        scripts_dir.join("hello.sh"),
+        "#!/bin/sh\necho local-skill-$1\n",
+    )
+    .expect("write script");
+    runtime.context_builder.reload_skills();
+
+    let msg = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "chat-local-compat".to_string(),
+        content: "运行兼容本地脚本".to_string(),
+        media: vec![],
+        metadata: serde_json::json!({
+            "forced_skill_name": "compat_local_demo",
+        }),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    let result = runtime.process_message(msg).await.expect("process message");
+    let session_key = blockcell_core::build_session_key("cli", "chat-local-compat");
+    let history = runtime
+        .session_store
+        .load(&session_key)
+        .expect("load session history");
+    assert!(
+        result.starts_with("summary:"),
+        "unexpected skill result: {}",
+        result
+    );
+    assert!(
+        result.contains("local-skill-skill"),
+        "unexpected skill result: {}; history: {:?}",
+        result,
+        history
+    );
+    assert!(history.iter().any(|message| {
+        message
+            .tool_calls
+            .as_ref()
+            .map(|calls| calls.iter().any(|call| call.name == "exec_local"))
+            .unwrap_or(false)
+    }));
+}
+
+#[tokio::test]
+async fn test_unified_entry_calls_general_tool_without_extra_planning_roundtrip() {
+    let provider = Arc::new(UnifiedEntryProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let mut runtime = test_runtime_with_provider(provider.clone());
+
+    let msg = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "chat-general-tool".to_string(),
+        content: "查看当前目录下文件".to_string(),
+        media: vec![],
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    let result = runtime.process_message(msg).await.expect("process message");
+    assert!(result.contains("目录内容"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tokio::test]
+async fn test_unified_entry_can_activate_skill_without_forced_skill_metadata() {
+    let provider = Arc::new(UnifiedEntryProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let mut runtime = test_runtime_with_provider(provider.clone());
+    runtime.tool_registry.register(Arc::new(
+        blockcell_tools::exec_skill_script::ExecSkillScriptTool,
+    ));
+    let skill_dir = runtime.paths.skills_dir().join("local_demo");
+    let scripts_dir = skill_dir.join("scripts");
+    std::fs::create_dir_all(&scripts_dir).expect("create scripts dir");
+    std::fs::write(
+        skill_dir.join("meta.yaml"),
+        r#"
+name: local_demo
+description: local demo
+"#,
+    )
+    .expect("write meta");
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"# Local Demo
+
+## Shared {#shared}
+适合执行 skill 目录内的本地脚本。
+
+## Prompt {#prompt}
+如果需要运行本地脚本，使用 exec_skill_script 调用 `scripts/hello.sh`。
+"#,
+    )
+    .expect("write skill md");
+    std::fs::write(
+        scripts_dir.join("hello.sh"),
+        "#!/bin/sh\necho local-skill-$1\n",
+    )
+    .expect("write script");
+    runtime.context_builder.reload_skills();
+
+    let msg = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "chat-activate-skill".to_string(),
+        content: "运行本地脚本".to_string(),
+        media: vec![],
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    let result = runtime.process_message(msg).await.expect("process message");
+    let session_key = blockcell_core::build_session_key("cli", "chat-activate-skill");
+    let history = runtime
+        .session_store
+        .load(&session_key)
+        .expect("load session history");
+
+    assert!(
+        result.starts_with("summary:"),
+        "unexpected result: {}",
+        result
+    );
+    assert!(history.iter().any(|message| {
+        message
+            .tool_calls
+            .as_ref()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .any(|call| call.name == ACTIVATE_SKILL_TOOL_NAME)
+            })
+            .unwrap_or(false)
+    }));
+    assert!(history.iter().any(|message| {
+        message
+            .tool_calls
+            .as_ref()
+            .map(|calls| calls.iter().any(|call| call.name == "skill_enter"))
+            .unwrap_or(false)
+    }));
+}
+
+#[test]
+fn test_determine_interaction_mode_prefers_skill() {
+    let mode = determine_interaction_mode(true, &[IntentCategory::Chat]);
+    assert_eq!(mode, InteractionMode::Skill);
+}
+
+#[test]
+fn test_determine_interaction_mode_uses_chat_for_single_chat_intent() {
+    let mode = determine_interaction_mode(false, &[IntentCategory::Chat]);
+    assert_eq!(mode, InteractionMode::Chat);
+}
+
+#[test]
+fn test_determine_interaction_mode_falls_back_to_general_without_skill() {
+    let mode = determine_interaction_mode(false, &[IntentCategory::Unknown]);
+    assert_eq!(mode, InteractionMode::General);
+}
+
+#[test]
+fn test_skill_summary_formatter_uses_brief_md_and_result() {
+    let prompt = crate::skill_summary::SkillSummaryFormatter::build_prompt(
+        "帮我搜一下 AI 新闻",
+        "ai_news",
+        Some("search"),
+        "请优先提炼要点，不要重复脚本原文。",
+        "找到 5 条相关新闻",
+    );
+
+    assert!(prompt.contains("帮我搜一下 AI 新闻"));
+    assert!(prompt.contains("ai_news"));
+    assert!(prompt.contains("search"));
+    assert!(prompt.contains("请优先提炼要点"));
+    assert!(prompt.contains("找到 5 条相关新闻"));
+}
+
+#[test]
+fn test_prompt_and_script_skills_share_summary_formatter() {
+    let prompt_skill_prompt = crate::skill_summary::SkillSummaryFormatter::build_prompt(
+        "帮我深度分析 BTC",
+        "deep_analysis",
+        None,
+        "请按结构化方式输出。",
+        "这是最终分析结果。",
+    );
+    let script_skill_prompt = crate::skill_summary::SkillSummaryFormatter::build_prompt(
+        "北京天气",
+        "weather",
+        Some("forecast"),
+        "优先给出天气摘要。",
+        "今天晴，最高 18 度。",
+    );
+
+    assert!(prompt_skill_prompt.contains("技能说明摘要"));
+    assert!(script_skill_prompt.contains("技能说明摘要"));
+    assert!(prompt_skill_prompt.contains("执行结果"));
+    assert!(script_skill_prompt.contains("执行结果"));
+}
+
+#[test]
+fn test_prompt_skill_persists_internal_skill_enter_and_real_tool_chain() {
+    let mut history = Vec::new();
+    let real_tool_call = ToolCallRequest {
+        id: "call-web-search".to_string(),
+        name: "web_search".to_string(),
+        arguments: serde_json::json!({ "query": "BTC" }),
+        thought_signature: None,
+    };
+    let mut real_tool_result =
+        ChatMessage::tool_result("call-web-search", r#"{"items":[{"title":"BTC news"}]}"#);
+    real_tool_result.name = Some("web_search".to_string());
+
+    persist_prompt_skill_history(
+        &mut history,
+        "帮我深度分析 BTC",
+        "deep_analysis",
+        &["web_search".to_string()],
+        &[
+            ChatMessage {
+                id: None,
+                role: "assistant".to_string(),
+                content: serde_json::Value::String("搜索 BTC 新闻".to_string()),
+                reasoning_content: None,
+                tool_calls: Some(vec![real_tool_call]),
+                tool_call_id: None,
+                name: None,
+            },
+            real_tool_result,
+        ],
+        "整理后的最终回答",
+    );
+
+    assert_eq!(history.len(), 6);
+    assert_eq!(history[0].role, "user");
+    assert_eq!(
+        history[1].tool_calls.as_ref().unwrap()[0].name,
+        "skill_enter"
+    );
+    assert_eq!(history[2].role, "tool");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(history[2].content.as_str().unwrap()).unwrap()
+            ["skill_name"],
+        "deep_analysis"
+    );
+    assert_eq!(
+        history[3].tool_calls.as_ref().unwrap()[0].name,
+        "web_search"
+    );
+    assert_eq!(history[4].role, "tool");
+    assert_eq!(history[4].name.as_deref(), Some("web_search"));
+    assert_eq!(history[5].content.as_str(), Some("整理后的最终回答"));
+}
+
+#[test]
+fn test_script_skill_persists_internal_skill_invoke_and_raw_result() {
+    let mut history = Vec::new();
+
+    persist_script_skill_history(
+        &mut history,
+        "北京天气",
+        "weather",
+        "skill_invoke_python",
+        &[
+            "forecast".to_string(),
+            "--city".to_string(),
+            "beijing".to_string(),
+        ],
+        r#"{"temp":18,"condition":"sunny"}"#,
+        "今天晴，最高 18 度。",
+    );
+
+    assert_eq!(history.len(), 4);
+    assert_eq!(history[0].role, "user");
+    assert_eq!(
+        history[1].tool_calls.as_ref().unwrap()[0].name,
+        "skill_invoke_python"
+    );
+    assert_eq!(
+        history[1].tool_calls.as_ref().unwrap()[0].arguments["argv"],
+        serde_json::json!(["forecast", "--city", "beijing"])
+    );
+    assert_eq!(history[2].role, "tool");
+    assert_eq!(
+        history[2].content.as_str(),
+        Some(r#"{"temp":18,"condition":"sunny"}"#)
+    );
+    assert_eq!(history[3].content.as_str(), Some("今天晴，最高 18 度。"));
+}
+
+#[test]
+fn test_find_recent_skill_name_from_history_reads_internal_skill_trace() {
+    let mut history = Vec::new();
+    persist_prompt_skill_history(
+        &mut history,
+        "帮我深度分析 BTC",
+        "deep_analysis",
+        &["web_search".to_string()],
+        &[],
+        "整理后的最终回答",
+    );
+
+    assert_eq!(
+        find_recent_skill_name_from_history(&history).as_deref(),
+        Some("deep_analysis")
+    );
+}
+
+#[test]
+fn test_active_skill_name_metadata_roundtrip() {
+    let mut metadata = serde_json::Value::Null;
+    record_active_skill_name(&mut metadata, "ppt-generator");
+
+    assert_eq!(
+        active_skill_name_from_metadata(&metadata).as_deref(),
+        Some("ppt-generator")
+    );
+    assert_eq!(
+        metadata
+            .get(SESSION_ACTIVE_SKILL_CORRECTIONS_KEY)
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+}
+
+#[test]
+fn repeated_learned_skill_corrections_disable_skill_toggle() {
+    let paths = Paths::with_base(
+        std::env::temp_dir().join(format!("blockcell-disable-skill-{}", uuid::Uuid::new_v4())),
+    );
+    let provider_pool = blockcell_providers::ProviderPool::from_single_provider(
+        "test/mock",
+        "test",
+        Arc::new(TestProvider),
+    );
+    let runtime = AgentRuntime::new(
+        Config::default(),
+        paths.clone(),
+        provider_pool,
+        blockcell_tools::ToolRegistry::new(),
+    )
+    .expect("create runtime");
+    let mut metadata = serde_json::Value::Null;
+    record_active_skill_name(&mut metadata, "release_checklist");
+    let msg = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "disable-skill".to_string(),
+        content: "不要这样做，以后先检查 rollback plan".to_string(),
+        media: vec![],
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    runtime
+        .apply_learned_skill_negative_feedback(&mut metadata, &msg)
+        .unwrap();
+    assert!(load_disabled_toggles(&paths, "skills").is_empty());
+    runtime
+        .apply_learned_skill_negative_feedback(&mut metadata, &msg)
+        .unwrap();
+
+    assert!(load_disabled_toggles(&paths, "skills").contains("release_checklist"));
+    assert!(active_skill_name_from_metadata(&metadata).is_none());
+}
+
+#[test]
+fn test_continued_skill_name_prefers_metadata_and_falls_back_to_history() {
+    let mut history = Vec::new();
+    persist_prompt_skill_history(
+        &mut history,
+        "帮我深度分析 BTC",
+        "deep_analysis",
+        &["web_search".to_string()],
+        &[],
+        "整理后的最终回答",
+    );
+
+    assert_eq!(
+        continued_skill_name(
+            &serde_json::json!({"active_skill_name":"ppt-generator"}),
+            &history
+        )
+        .as_deref(),
+        Some("ppt-generator")
+    );
+    assert_eq!(
+        continued_skill_name(&serde_json::Value::Null, &history).as_deref(),
+        Some("deep_analysis")
+    );
+}
+
+#[test]
+fn test_continued_skill_suppresses_prompt_reinjection_for_same_skill() {
+    let active_skill = crate::context::ActiveSkillContext {
+        name: "ppt-generator".to_string(),
+        prompt_md: "manual".to_string(),
+        inject_prompt_md: true,
+        tools: vec!["write_file".to_string()],
+        fallback_message: None,
+        source: blockcell_skills::manager::SkillSource::BlockCell,
+    };
+
+    let continued = suppress_prompt_reinjection_for_continued_skill(
+        active_skill.clone(),
+        Some("ppt-generator"),
+    );
+    assert!(!continued.inject_prompt_md);
+
+    let other = suppress_prompt_reinjection_for_continued_skill(active_skill, Some("weather"));
+    assert!(other.inject_prompt_md);
+}
+
+#[test]
+fn test_tool_round_throttle_delay_uses_base_delay_without_rate_limit() {
+    assert_eq!(
+        tool_round_throttle_delay(false),
+        std::time::Duration::from_millis(600)
+    );
+}
+
+#[test]
+fn test_tool_round_throttle_delay_uses_longer_delay_after_rate_limit() {
+    assert_eq!(
+        tool_round_throttle_delay(true),
+        std::time::Duration::from_millis(2500)
+    );
+}
+
+#[test]
+fn test_extract_json_from_text_handles_markdown_fence() {
+    let text = "```json\n{\"argv\":[\"search\",\"btc\"]}\n```";
+    assert_eq!(
+        extract_json_from_text(text),
+        "{\"argv\":[\"search\",\"btc\"]}"
+    );
+}
+
+#[tokio::test]
+async fn init_memory_system_uses_runtime_memory_config() {
+    let mut config = Config::default();
+    config.memory.memory_system.token_budget = 1_000;
+    config.memory.memory_system.layer1.preview_size_chars = 123;
+    config.memory.memory_system.layer2.gap_threshold_minutes = 7;
+    config
+        .memory
+        .memory_system
+        .layer3
+        .minimum_message_tokens_to_init = 111;
+    config.memory.memory_system.layer3.max_section_length = 222;
+    config.memory.memory_system.layer4.compact_threshold_ratio = 0.5;
+    config.memory.memory_system.layer4.keep_recent_messages = 3;
+    config
+        .memory
+        .memory_system
+        .layer5
+        .min_messages_for_extraction = 2;
+
+    let mut runtime = test_runtime_with_provider_and_paths(
+        Paths::with_base(std::env::temp_dir().join(format!(
+            "blockcell-memory-config-runtime-{}",
+            uuid::Uuid::new_v4()
+        ))),
+        Arc::new(TestProvider),
+        config,
+    );
+
+    runtime
+        .init_memory_system("cli:configured-session".to_string())
+        .await
+        .unwrap();
+
+    let memory_system = runtime.memory_system().expect("memory system initialized");
+    assert_eq!(memory_system.session_id(), "cli:configured-session");
+    assert_eq!(memory_system.config().token_budget, 1_000);
+    assert_eq!(memory_system.config().layer1.preview_size_chars, 123);
+    assert_eq!(memory_system.config().layer2.gap_threshold_minutes, 7);
+    assert_eq!(
+        memory_system
+            .session_memory_state()
+            .config
+            .minimum_message_tokens_to_init,
+        111
+    );
+    assert_eq!(
+        memory_system
+            .session_memory_state()
+            .config
+            .max_section_length,
+        222
+    );
+    assert!(memory_system.should_compact(500));
+    assert!(!memory_system.should_compact(499));
+    assert_eq!(memory_system.config().layer4.keep_recent_messages, 3);
+    assert_eq!(memory_system.config().layer5.min_messages_for_extraction, 2);
+}
+
+#[tokio::test]
+async fn process_message_reinitializes_memory_system_for_new_session() {
+    let mut runtime = test_runtime_with_provider(Arc::new(TestProvider));
+
+    let first = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "memory-session-a".to_string(),
+        content: "hello a".to_string(),
+        media: vec![],
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    let first_session = first.session_key();
+    runtime.process_message(first).await.unwrap();
+    assert_eq!(
+        runtime.memory_system().map(|system| system.session_id()),
+        Some(first_session.as_str())
+    );
+
+    let second = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "memory-session-b".to_string(),
+        content: "hello b".to_string(),
+        media: vec![],
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    let second_session = second.session_key();
+    runtime.process_message(second).await.unwrap();
+    assert_eq!(
+        runtime.memory_system().map(|system| system.session_id()),
+        Some(second_session.as_str())
+    );
+}
+
+#[tokio::test]
+async fn test_stream_retry_emits_reset_before_retrying_ws_response() {
+    let mut runtime = test_runtime_with_provider(Arc::new(StreamingRetryProvider {
+        attempts: AtomicUsize::new(0),
+    }));
+    let (event_tx, mut event_rx) = broadcast::channel(32);
+    runtime.set_event_tx(event_tx);
+
+    let msg = InboundMessage {
+        channel: "ws".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "stream-retry".to_string(),
+        content: "hello retry".to_string(),
+        media: vec![],
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    let result = runtime.process_message(msg).await.expect("process message");
+    assert_eq!(result, "final answer");
+
+    let events = drain_ws_events(&mut event_rx);
+    let event_types = collect_event_types(&events);
+    assert!(
+        contains_event_subsequence(
+            &event_types,
+            &["token", "stream_reset", "token", "message_done"]
+        ),
+        "unexpected event order: {:?}",
+        event_types
+    );
+    let final_event = events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "message_done")
+        .expect("message_done event missing");
+    assert_eq!(final_event["content"], "final answer");
+}
+
+#[tokio::test]
+async fn test_stream_close_without_done_returns_accumulated_response() {
+    let mut runtime = test_runtime_with_provider(Arc::new(StreamingCloseProvider));
+
+    let msg = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "stream-close".to_string(),
+        content: "hello close".to_string(),
+        media: vec![],
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    let result = runtime.process_message(msg).await.expect("process message");
+    assert_eq!(result, "closed answer");
+}
+
+#[tokio::test]
+async fn connection_phase_failure_falls_back_to_next_provider_without_retry_budget() {
+    let mut config = Config::default();
+    config.agents.defaults.model = "test/mock".to_string();
+    config.agents.defaults.provider = Some("test".to_string());
+    config.agents.defaults.llm_max_retries = 0;
+
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-fallback-runtime-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&base).expect("create temp fallback runtime dir");
+    let paths = Paths::with_base(base);
+    let provider_pool = ProviderPool::from_entries(vec![
+        blockcell_providers::ProviderPoolEntry {
+            model: "primary".to_string(),
+            provider_name: "test".to_string(),
+            weight: 1,
+            priority: 1,
+            provider: Arc::new(ConnectionFailingProvider),
+        },
+        blockcell_providers::ProviderPoolEntry {
+            model: "fallback".to_string(),
+            provider_name: "test".to_string(),
+            weight: 1,
+            priority: 2,
+            provider: Arc::new(SuccessfulFallbackProvider),
+        },
+    ]);
+    let mut runtime = AgentRuntime::new(
+        config,
+        paths,
+        provider_pool,
+        blockcell_tools::ToolRegistry::new(),
+    )
+    .expect("create runtime");
+    runtime.set_agent_id(Some("default".to_string()));
+    let msg = test_main_session_inbound("ws", "fallback-chat");
+    let mut saw_rate_limit = false;
+
+    let response = runtime
+        .call_llm_with_retry(
+            &[ChatMessage::user("hello")],
+            &[],
+            &msg,
+            None,
+            &HashMap::new(),
+            &mut saw_rate_limit,
+        )
+        .await
+        .expect("fallback provider should answer");
+
+    assert_eq!(response.content.as_deref(), Some("fallback answer"));
+}
+
+fn test_runtime() -> AgentRuntime {
+    let mut config = Config::default();
+    config.agents.defaults.model = "test/mock".to_string();
+    config.agents.defaults.provider = Some("test".to_string());
+
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-system-event-runtime-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&base).expect("create temp runtime dir");
+    let paths = Paths::with_base(base);
+    test_runtime_with_provider_and_paths(paths, Arc::new(TestProvider), config)
+}
+
+fn test_runtime_with_provider(provider: Arc<dyn Provider>) -> AgentRuntime {
+    let mut config = Config::default();
+    config.agents.defaults.model = "test/mock".to_string();
+    config.agents.defaults.provider = Some("test".to_string());
+
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-system-event-runtime-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&base).expect("create temp runtime dir");
+    let paths = Paths::with_base(base);
+    test_runtime_with_provider_and_paths(paths, provider, config)
+}
+
+fn test_runtime_with_embedded_ghost_learning() -> AgentRuntime {
+    let mut config = Config::default();
+    config.agents.defaults.model = "test/mock".to_string();
+    config.agents.defaults.provider = Some("test".to_string());
+    config.agents.ghost.learning.enabled = true;
+    config.agents.ghost.learning.shadow_mode = true;
+
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-ghost-learning-runtime-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&base).expect("create temp ghost runtime dir");
+    let paths = Paths::with_base(base);
+    test_runtime_with_provider_and_paths(paths, Arc::new(TestProvider), config)
+}
+
+fn test_runtime_with_boundary_flush_provider(provider: Arc<BoundaryFlushProvider>) -> AgentRuntime {
+    let mut config = Config::default();
+    config.agents.defaults.model = "test/mock".to_string();
+    config.agents.defaults.provider = Some("test".to_string());
+    config.agents.ghost.learning.enabled = true;
+    config.agents.ghost.learning.shadow_mode = true;
+
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-boundary-flush-runtime-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&base).expect("create temp boundary flush runtime dir");
+    let paths = Paths::with_base(base);
+    test_runtime_with_provider_and_paths(paths, provider, config)
+}
+
+fn test_runtime_with_ghost_review_provider(
+    provider: Arc<dyn Provider>,
+    shadow_mode: bool,
+) -> (AgentRuntime, Paths) {
+    let mut config = Config::default();
+    config.agents.defaults.model = "test/mock".to_string();
+    config.agents.defaults.provider = Some("test".to_string());
+    config.agents.ghost.learning.enabled = true;
+    config.agents.ghost.learning.shadow_mode = shadow_mode;
+
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-ghost-review-runtime-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&base).expect("create temp ghost review runtime dir");
+    let paths = Paths::with_base(base);
+
+    (
+        test_runtime_with_provider_and_paths(paths.clone(), provider, config),
+        paths,
+    )
+}
+
+fn test_runtime_with_file_memory_recall(provider: Arc<dyn Provider>) -> (AgentRuntime, Paths) {
+    let mut config = Config::default();
+    config.agents.defaults.model = "test/mock".to_string();
+    config.agents.defaults.provider = Some("test".to_string());
+    config.agents.ghost.learning.enabled = true;
+    config.agents.ghost.learning.shadow_mode = false;
+    config.agents.ghost.learning.recall_max_items = 4;
+    config.agents.ghost.learning.recall_token_budget = 240;
+
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-file-memory-recall-runtime-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&base).expect("create temp file memory recall runtime dir");
+    let paths = Paths::with_base(base);
+    paths.ensure_dirs().expect("ensure dirs");
+    std::fs::write(
+            paths.memory_md(),
+            "Project fact: write deploy docs as concise step-by-step instructions with a rollback checklist.",
+        )
+        .expect("write memory md");
+
+    (
+        test_runtime_with_provider_and_paths(paths.clone(), provider, config),
+        paths,
+    )
+}
+
+fn test_runtime_with_provider_and_paths(
+    paths: Paths,
+    provider: Arc<dyn Provider>,
+    config: Config,
+) -> AgentRuntime {
+    let provider_pool =
+        blockcell_providers::ProviderPool::from_single_provider("test/mock", "test", provider);
+
+    let mut runtime = AgentRuntime::new(
+        config,
+        paths,
+        provider_pool,
+        blockcell_tools::ToolRegistry::new(),
+    )
+    .expect("create runtime");
+    runtime.set_agent_id(Some("default".to_string()));
+    runtime
+}
+
+#[test]
+fn steering_drain_injects_user_messages_into_current_and_history() {
+    let mut runtime = test_runtime();
+    let (steering, sender) = SteeringChannel::new(4);
+    runtime.set_steering_channel(steering, sender.clone());
+    sender
+        .try_send(SteeringMessage {
+            content: "adjust course".to_string(),
+            channel: "ws".to_string(),
+            chat_id: "chat-a".to_string(),
+        })
+        .expect("steering message should fit");
+
+    let inbound = InboundMessage {
+        channel: "ws".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "chat-a".to_string(),
+        content: "start".to_string(),
+        media: vec![],
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    let mut current_messages = vec![ChatMessage::user("start")];
+    let mut history = vec![ChatMessage::user("start")];
+
+    let injected = runtime.drain_steering_messages(&mut current_messages, &mut history, &inbound);
+
+    assert_eq!(injected, 1);
+    assert_eq!(chat_message_text(&current_messages[1]), "adjust course");
+    assert_eq!(chat_message_text(&history[1]), "adjust course");
+    assert_eq!(current_messages[1].role, "user");
+    assert_eq!(history[1].role, "user");
+}
+
+fn test_main_session_inbound(channel: &str, chat_id: &str) -> InboundMessage {
+    InboundMessage {
+        channel: channel.to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: chat_id.to_string(),
+        content: "hello".to_string(),
+        media: vec![],
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    }
+}
+
+async fn wait_for_runtime_review_runs(paths: &Paths, expected: usize) {
+    for _ in 0..50 {
+        let ledger = GhostLedger::open(&paths.ghost_ledger_db()).expect("open ghost ledger");
+        if ledger.review_run_count().expect("count review runs") >= expected {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for ghost review runs");
+}
+
+#[tokio::test]
+async fn non_trivial_turn_creates_learning_episode() {
+    let mut runtime = test_runtime_with_embedded_ghost_learning();
+    let msg = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "ghost-turn".to_string(),
+        content: "figure out the correct deploy sequence".to_string(),
+        media: vec![],
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    runtime.process_message(msg).await.unwrap();
+
+    assert_eq!(runtime.test_ghost_ledger().episode_count().unwrap(), 1);
+    assert_eq!(
+        runtime
+            .test_ghost_ledger()
+            .latest_boundary_kind()
+            .unwrap()
+            .as_deref(),
+        Some("turn_end")
+    );
+    let episode = runtime
+        .test_ghost_ledger()
+        .latest_episode_by_boundary_kind("turn_end")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        episode.subject_key.as_deref(),
+        Some("chat:ghost-turn:sender:user")
+    );
+}
+
+#[tokio::test]
+async fn runtime_exposes_and_dispatches_ghost_memory_provider_tools() {
+    let llm_provider = Arc::new(ProviderToolCaptureProvider {
+        seen_tools: Mutex::new(Vec::new()),
+    });
+    let provider_tool = Arc::new(RuntimeProviderTool {
+        calls: Mutex::new(Vec::new()),
+    });
+    let mut runtime = test_runtime_with_provider(llm_provider.clone());
+    runtime.ghost_memory_lifecycle = Some(Arc::new(
+        crate::ghost_memory_provider::GhostMemoryProviderManager::new()
+            .with_provider(provider_tool.clone()),
+    ));
+
+    let response = runtime
+        .process_message(InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "provider-tool-chat".to_string(),
+            content: "look up my release preference".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        })
+        .await
+        .expect("process provider tool message");
+
+    assert!(response.contains("runtime_provider_tool"));
+    let seen_tools = llm_provider.seen_tools.lock().unwrap().clone();
+    assert!(seen_tools.iter().any(|tools| {
+        tools.iter().any(|schema| {
+            schema
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(|value| value.as_str())
+                == Some("external_memory_lookup")
+        })
+    }));
+
+    let calls = provider_tool.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["query"], serde_json::json!("canary rollout"));
+}
+
+#[tokio::test]
+async fn pre_compress_boundary_creates_force_review_episode() {
+    let mut runtime = test_runtime_with_embedded_ghost_learning();
+
+    runtime.test_trigger_pre_compress().await.unwrap();
+
+    assert_eq!(
+        runtime
+            .test_ghost_ledger()
+            .latest_episode_status()
+            .unwrap()
+            .as_deref(),
+        Some("pending_review")
+    );
+}
+
+#[tokio::test]
+async fn pre_compress_boundary_flushes_user_preference_to_file_memory() {
+    let provider = Arc::new(BoundaryFlushProvider {
+        calls: Mutex::new(Vec::new()),
+        flush_calls: AtomicUsize::new(0),
+    });
+    let mut runtime = test_runtime_with_boundary_flush_provider(provider.clone());
+
+    runtime.test_trigger_pre_compress().await.unwrap();
+
+    let user_memory = std::fs::read_to_string(runtime.paths.user_md()).expect("read USER.md");
+    assert!(user_memory.contains("rollback order before deploy compression"));
+    let calls = provider.calls.lock().unwrap().clone();
+    let flush_call = calls
+        .iter()
+        .find(|messages| {
+            messages
+                .last()
+                .map(chat_message_text)
+                .unwrap_or_default()
+                .contains("__ghost_memory_flush_sentinel")
+        })
+        .expect("boundary flush model call");
+    assert!(flush_call
+        .iter()
+        .any(|message| chat_message_text(message).contains("allowedTools")));
+    assert!(flush_call.iter().any(
+        |message| chat_message_text(message).contains("figure out the correct deploy sequence")
+    ));
+    assert!(flush_call.iter().all(|message| {
+        message.role != "tool"
+            || !chat_message_text(message).contains("__ghost_memory_flush_sentinel")
+    }));
+}
+
+#[test]
+fn runtime_session_search_finds_persisted_history() {
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-session-search-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let paths = Paths::with_base(base);
+    paths.ensure_dirs().expect("create runtime dirs");
+    let store = SessionStore::new(paths.clone());
+    store
+        .save(
+            "cli:chat-1",
+            &[
+                ChatMessage::user("How should we deploy this service?"),
+                ChatMessage::assistant("Use canary-first deploys and verify rollback order."),
+            ],
+        )
+        .expect("save session");
+
+    let search = RuntimeSessionSearch::new(paths, Some("cli:chat-1".to_string()));
+    let result = search
+        .search_session_json("canary rollback", 5)
+        .expect("search session history");
+    assert_eq!(
+        result.get("count").and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert!(result.to_string().contains("canary-first deploys"));
+    assert!(result.to_string().contains("cli:chat-1"));
+}
+
+#[tokio::test]
+async fn pre_compress_boundary_includes_provider_context_in_episode_snapshot() {
+    let mut runtime = test_runtime_with_embedded_ghost_learning();
+    runtime.ghost_memory_lifecycle = Some(Arc::new(
+        crate::ghost_memory_provider::GhostMemoryProviderManager::new()
+            .with_provider(Arc::new(BoundaryMemoryProvider)),
+    ));
+
+    runtime.test_trigger_pre_compress().await.unwrap();
+
+    let mut claimed = runtime
+        .test_ghost_ledger()
+        .claim_reviewable_episodes(1, "test-worker", 600)
+        .expect("claim pre-compress episode");
+    let episode = claimed.pop().expect("pre-compress episode");
+    assert_eq!(episode.boundary_kind, "pre_compress");
+    assert!(episode
+        .metadata
+        .get("reusableLesson")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("preserve provider-derived rollback preference"));
+}
+
+#[tokio::test]
+async fn session_end_boundary_includes_provider_context_in_episode_snapshot() {
+    let mut runtime = test_runtime_with_embedded_ghost_learning();
+    runtime.ghost_memory_lifecycle = Some(Arc::new(
+        crate::ghost_memory_provider::GhostMemoryProviderManager::new()
+            .with_provider(Arc::new(BoundaryMemoryProvider)),
+    ));
+    let msg = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "ghost-session-end-provider".to_string(),
+        content: "figure out the correct deploy order".to_string(),
+        media: vec![],
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    runtime.process_message(msg).await.unwrap();
+
+    runtime.test_trigger_session_end().await.unwrap();
+
+    let mut claimed = runtime
+        .test_ghost_ledger()
+        .claim_reviewable_episodes(4, "test-worker", 600)
+        .expect("claim session-end episodes");
+    let episode = claimed
+        .drain(..)
+        .find(|episode| episode.boundary_kind == "session_end")
+        .expect("session-end episode");
+    assert!(episode
+        .metadata
+        .get("reusableLesson")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .contains("preserve provider-derived session-end deploy preference"));
+}
+
+#[tokio::test]
+async fn session_end_boundary_creates_force_review_episode() {
+    let mut runtime = test_runtime_with_embedded_ghost_learning();
+    let msg = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "ghost-session-end".to_string(),
+        content: "figure out the correct deploy order".to_string(),
+        media: vec![],
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    runtime.process_message(msg).await.unwrap();
+
+    runtime.test_trigger_session_end().await.unwrap();
+
+    assert_eq!(
+        runtime
+            .test_ghost_ledger()
+            .latest_episode_status()
+            .unwrap()
+            .as_deref(),
+        Some("pending_review")
+    );
+    assert_eq!(runtime.test_ghost_ledger().episode_count().unwrap(), 2);
+}
+
+#[tokio::test]
+async fn session_rotate_boundary_creates_force_review_episode() {
+    let provider = Arc::new(SequencedGhostProvider);
+    let (mut runtime, paths) = test_runtime_with_ghost_review_provider(provider, true);
+
+    runtime
+        .process_message(InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "ghost-rotate-a".to_string(),
+            content: "figure out the correct deploy order".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        })
+        .await
+        .unwrap();
+
+    runtime
+        .process_message(InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "ghost-rotate-b".to_string(),
+            content: "analyze the safer rollback sequence".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        })
+        .await
+        .unwrap();
+
+    wait_for_runtime_review_runs(&paths, 3).await;
+
+    assert_eq!(
+        runtime
+            .test_ghost_ledger()
+            .episode_count_by_boundary_kind("session_rotate")
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        runtime
+            .test_ghost_ledger()
+            .latest_episode_status_by_boundary_kind("session_rotate")
+            .unwrap()
+            .as_deref(),
+        Some("reviewed")
+    );
+}
+
+#[tokio::test]
+async fn session_rotate_boundary_includes_provider_context_in_episode_snapshot() {
+    let provider = Arc::new(SequencedGhostProvider);
+    let (mut runtime, _paths) = test_runtime_with_ghost_review_provider(provider, true);
+    runtime.ghost_memory_lifecycle = Some(Arc::new(
+        crate::ghost_memory_provider::GhostMemoryProviderManager::new()
+            .with_provider(Arc::new(BoundaryMemoryProvider)),
+    ));
+
+    for chat_id in ["ghost-rotate-provider-a", "ghost-rotate-provider-b"] {
+        runtime
+            .process_message(InboundMessage {
+                channel: "cli".to_string(),
+                account_id: None,
+                sender_id: "user".to_string(),
+                chat_id: chat_id.to_string(),
+                content: "figure out the correct deploy order".to_string(),
+                media: vec![],
+                metadata: serde_json::Value::Null,
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let episode = runtime
+        .test_ghost_ledger()
+        .latest_episode_by_boundary_kind("session_rotate")
+        .expect("load session-rotate episode")
+        .expect("session-rotate episode");
+    let lesson = episode
+        .metadata
+        .get("reusableLesson")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    assert!(lesson.contains("Switched active session"));
+    assert!(lesson.contains("preserve provider-derived session-end deploy preference"));
+}
+
+#[tokio::test]
+async fn delegation_completion_creates_parent_learning_episode() {
+    let runtime = test_runtime_with_embedded_ghost_learning();
+
+    runtime
+        .test_complete_delegated_task(
+            "research the release failure",
+            "identified the root cause and the safer rollback order",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(runtime.test_ghost_ledger().episode_count().unwrap(), 1);
+    assert_eq!(
+        runtime
+            .test_ghost_ledger()
+            .latest_boundary_kind()
+            .unwrap()
+            .as_deref(),
+        Some("delegation_end")
+    );
+}
+
+#[tokio::test]
+async fn file_memory_recall_is_fenced_and_not_persisted() {
+    let provider = Arc::new(RecallCaptureProvider {
+        calls: Mutex::new(Vec::new()),
+    });
+    let (mut runtime, paths) = test_runtime_with_file_memory_recall(provider.clone());
+    let msg = InboundMessage {
+        channel: "cli".to_string(),
+        account_id: None,
+        sender_id: "user".to_string(),
+        chat_id: "ghost-recall".to_string(),
+        content: "how do I usually like deploy docs written?".to_string(),
+        media: vec![],
+        metadata: serde_json::Value::Null,
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    runtime.process_message(msg.clone()).await.unwrap();
+
+    let calls = provider.calls.lock().unwrap().clone();
+    let first_call = calls.first().expect("first llm call");
+    assert!(
+        first_call.iter().any(|message| {
+            message.role == "user"
+                && chat_message_text(message).contains("<memory-context>")
+                && chat_message_text(message).contains("rollback checklist")
+        }),
+        "expected fenced file memory recall in provider payload"
+    );
+
+    let session = SessionStore::new(paths).load(&msg.session_key()).unwrap();
+    assert!(session
+        .iter()
+        .all(|message| { !chat_message_text(message).contains("<memory-context>") }));
+}
+
+#[tokio::test]
+async fn ghost_learning_closes_loop_from_experience_to_file_memory_only() {
+    let provider = Arc::new(ReviewAndCaptureProvider {
+        calls: Mutex::new(Vec::new()),
+        review_calls: AtomicUsize::new(0),
+    });
+    let (mut runtime, paths) = test_runtime_with_ghost_review_provider(provider.clone(), false);
+
+    runtime
+        .process_message(InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "ghost-closure".to_string(),
+            content: "figure out the correct release verification sequence with rollback plan"
+                .to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        })
+        .await
+        .unwrap();
+
+    wait_for_runtime_review_runs(&paths, 1).await;
+
+    let user_memory = std::fs::read_to_string(paths.user_md()).expect("read USER.md");
+    let durable_memory = std::fs::read_to_string(paths.memory_md()).expect("read MEMORY.md");
+    assert!(user_memory.contains("canary-first rollout"));
+    assert!(durable_memory.contains("Confirm rollback plan before release verification"));
+    assert!(!paths
+        .skills_dir()
+        .join("release_verification")
+        .join("SKILL.md")
+        .exists());
+
+    let ledger = GhostLedger::open(&paths.ghost_ledger_db()).expect("open ghost ledger");
+    assert_eq!(ledger.review_run_count().unwrap(), 1);
+
+    assert_eq!(provider.review_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn shadow_mode_captures_and_reviews_without_runtime_recall() {
+    let provider = Arc::new(SequencedGhostProvider);
+    let (mut runtime, paths) = test_runtime_with_ghost_review_provider(provider, true);
+    crate::reset_ghost_metrics_for_paths(&paths);
+
+    runtime
+        .process_message(InboundMessage {
+            channel: "cli".to_string(),
+            account_id: None,
+            sender_id: "user".to_string(),
+            chat_id: "ghost-shadow-review".to_string(),
+            content: "learn my preferred deploy style".to_string(),
+            media: vec![],
+            metadata: serde_json::Value::Null,
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        })
+        .await
+        .unwrap();
+
+    wait_for_runtime_review_runs(&paths, 1).await;
+
+    let metrics = runtime.test_ghost_metrics();
+    assert_eq!(metrics.episodes_captured, 1);
+    assert_eq!(metrics.reviews_started, 1);
+    assert_eq!(metrics.reviews_failed, 0);
+    assert_eq!(runtime.test_ghost_ledger().review_run_count().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn turn_review_interval_captures_periodic_trivial_turn() {
+    let provider = Arc::new(SequencedGhostProvider);
+    let (mut runtime, _paths) = test_runtime_with_ghost_review_provider(provider, true);
+    runtime.config.agents.ghost.learning.turn_review_interval = 2;
+
+    for content in ["hello", "thanks"] {
+        runtime
+            .process_message(InboundMessage {
+                channel: "cli".to_string(),
+                account_id: None,
+                sender_id: "user".to_string(),
+                chat_id: "ghost-interval".to_string(),
+                content: content.to_string(),
+                media: vec![],
+                metadata: serde_json::Value::Null,
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(runtime.test_ghost_ledger().episode_count().unwrap(), 1);
+    assert_eq!(
+        runtime
+            .test_ghost_ledger()
+            .latest_boundary_kind()
+            .unwrap()
+            .as_deref(),
+        Some("turn_end")
+    );
+}
+
+#[tokio::test]
+async fn system_tick_processes_pending_ghost_reviews() {
+    let provider = Arc::new(SequencedGhostProvider);
+    let (mut runtime, paths) = test_runtime_with_ghost_review_provider(provider, true);
+
+    runtime.test_trigger_pre_compress().await.unwrap();
+    assert_eq!(
+        runtime
+            .test_ghost_ledger()
+            .latest_episode_status()
+            .unwrap()
+            .as_deref(),
+        Some("pending_review")
+    );
+
+    runtime
+        .process_system_event_tick(chrono::Utc::now().timestamp_millis())
+        .await;
+
+    wait_for_runtime_review_runs(&paths, 1).await;
+    assert_eq!(
+        runtime
+            .test_ghost_ledger()
+            .latest_episode_status()
+            .unwrap()
+            .as_deref(),
+        Some("reviewed")
+    );
+}
+
+#[tokio::test]
+async fn test_orchestrator_tick_emits_event_tx_for_immediate_notifications() {
+    let mut runtime = test_runtime();
+    let (event_tx, mut event_rx) = broadcast::channel(8);
+    runtime.set_event_tx(event_tx);
+    runtime
+        .update_main_session_target(&test_main_session_inbound("cli", "chat-1"))
+        .await;
+
+    let mut event = SystemEvent::new_main_session(
+        "task.failed",
+        "task_manager",
+        EventPriority::Critical,
+        "Task failed",
+        "Background report failed",
+    );
+    event.delivery.immediate = true;
+    runtime.event_emitter_handle().emit(event);
+
+    let decision = runtime
+        .process_system_event_tick(chrono::Utc::now().timestamp_millis())
+        .await;
+
+    assert_eq!(decision.immediate_notifications.len(), 1);
+    let payload = event_rx.recv().await.expect("receive ws event");
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("parse ws event");
+    assert_eq!(json["type"], "system_event_notification");
+    assert_eq!(json["chat_id"], "chat-1");
+    assert_eq!(json["title"], "Task failed");
+}
+
+#[tokio::test]
+async fn test_orchestrator_tick_flushes_summary_to_main_session_outbound() {
+    let mut runtime = test_runtime();
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(8);
+    runtime.set_outbound(outbound_tx);
+    runtime
+        .update_main_session_target(&test_main_session_inbound("cli", "chat-1"))
+        .await;
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut event = SystemEvent::new_main_session(
+        "task.completed",
+        "task_manager",
+        EventPriority::Normal,
+        "Report ready",
+        "Background report finished",
+    );
+    event.created_at_ms = now_ms - 60_000;
+    runtime.event_emitter_handle().emit(event);
+
+    let decision = runtime.process_system_event_tick(now_ms).await;
+
+    assert_eq!(decision.flushed_summaries.len(), 1);
+    let outbound = outbound_rx.recv().await.expect("receive outbound summary");
+    assert_eq!(outbound.channel, "cli");
+    assert_eq!(outbound.chat_id, "chat-1");
+    assert!(outbound.content.contains("Report ready"));
+    assert!(outbound.content.contains("System updates") || outbound.content.contains("🗂️"));
+}
+
+#[tokio::test]
+async fn test_cron_agent_delivery_emits_ws_event_for_deliver_target() {
+    let mut runtime = test_runtime();
+    let (event_tx, mut event_rx) = broadcast::channel(8);
+    runtime.set_event_tx(event_tx);
+
+    let msg = InboundMessage {
+        channel: "cron".to_string(),
+        account_id: None,
+        sender_id: "cron".to_string(),
+        chat_id: "job-123".to_string(),
+        content: "任务完成摘要".to_string(),
+        media: vec![],
+        metadata: serde_json::json!({
+            "deliver": true,
+            "deliver_channel": "ws",
+            "deliver_to": "webui-chat-1",
+            "cron_agent": true,
+        }),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    let result = runtime
+        .process_message(msg)
+        .await
+        .expect("process cron message");
+    assert!(!result.is_empty());
+
+    let json = loop {
+        let payload = event_rx.recv().await.expect("receive ws event");
+        let event: serde_json::Value = serde_json::from_str(&payload).expect("parse ws event");
+        if event["type"] == "message_done" {
+            break event;
+        }
+    };
+    assert_eq!(json["type"], "message_done");
+    assert_eq!(json["chat_id"], "webui-chat-1");
+    assert_eq!(json["content"], result);
+    assert_eq!(json["background_delivery"], true);
+    assert_eq!(json["delivery_kind"], "cron");
+    assert_eq!(json["cron_kind"], "agent");
+}
+
+#[tokio::test]
+async fn test_cron_agent_persists_to_deliver_session_not_cron_job_session() {
+    let mut runtime = test_runtime();
+
+    let msg = InboundMessage {
+        channel: "cron".to_string(),
+        account_id: None,
+        sender_id: "cron".to_string(),
+        chat_id: "job-456".to_string(),
+        content: "搜索美伊战争最新消息，并将结果发给用户。".to_string(),
+        media: vec![],
+        metadata: serde_json::json!({
+            "deliver": true,
+            "deliver_channel": "ws",
+            "deliver_to": "webui-chat-2",
+            "cron_agent": true,
+        }),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+    };
+
+    let result = runtime
+        .process_message(msg)
+        .await
+        .expect("process cron message");
+    assert!(!result.is_empty());
+
+    let ws_session_key = blockcell_core::build_session_key("ws", "webui-chat-2");
+    let cron_session_key = blockcell_core::build_session_key("cron", "job-456");
+
+    let ws_history = runtime
+        .session_store
+        .load(&ws_session_key)
+        .expect("load ws session history");
+    assert!(!ws_history.is_empty());
+    assert!(ws_history.iter().any(|m| match &m.content {
+        serde_json::Value::String(s) => s.contains("搜索美伊战争最新消息"),
+        _ => false,
+    }));
+
+    let cron_path = runtime.paths.session_file(&cron_session_key);
+    assert!(
+        !cron_path.exists(),
+        "cron job session file should not be created"
+    );
+}
+
+#[tokio::test]
+async fn test_orchestrator_tick_gracefully_handles_missing_dispatchers() {
+    let runtime = test_runtime();
+
+    let event = SystemEvent::new_main_session(
+        "task.failed",
+        "task_manager",
+        EventPriority::Critical,
+        "Task failed",
+        "No dispatcher configured",
+    );
+    runtime.event_emitter_handle().emit(event);
+
+    let decision = runtime
+        .process_system_event_tick(chrono::Utc::now().timestamp_millis())
+        .await;
+
+    assert_eq!(decision.immediate_notifications.len(), 1);
+}
+
+#[test]
+fn test_resolve_profile_tool_names_uses_agent_profile_for_unknown_intent() {
+    let raw = r#"{
+  "agents": {
+    "list": [
+      { "id": "ops", "enabled": true, "intentProfile": "ops" }
+    ]
+  },
+  "intentRouter": {
+    "enabled": true,
+    "defaultProfile": "default",
+    "profiles": {
+      "default": {
+        "coreTools": ["read_file"],
+        "intentTools": {
+          "Chat": { "inheritBase": false, "tools": [] },
+          "Unknown": ["browse"]
+        }
+      },
+      "ops": {
+        "coreTools": ["read_file", "exec", "file_ops"],
+        "intentTools": {
+          "Chat": { "inheritBase": false, "tools": [] },
+          "Unknown": ["browse", "http_request"],
+          "DevOps": ["git_api", "network_monitor"]
+        }
+      }
+    }
+  }
+}"#;
+    let config: Config = serde_json::from_str(raw).unwrap();
+    let available: HashSet<String> = [
+        "read_file",
+        "exec",
+        "file_ops",
+        "browse",
+        "http_request",
+        "git_api",
+        "network_monitor",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    let tool_names =
+        resolve_profile_tool_names(&config, Some("ops"), &[IntentCategory::Unknown], &available);
+
+    assert!(tool_names.contains(&"read_file".to_string()));
+    assert!(tool_names.contains(&"exec".to_string()));
+    assert!(tool_names.contains(&"file_ops".to_string()));
+    assert!(tool_names.contains(&"browse".to_string()));
+    assert!(tool_names.contains(&"http_request".to_string()));
+    assert!(!tool_names.contains(&"git_api".to_string()));
+}
+
+#[test]
+fn test_resolve_profile_tool_names_returns_empty_for_chat_when_profile_configures_none() {
+    let config: Config = serde_json::from_str("{}").unwrap();
+    let available: HashSet<String> = ["read_file", "browse"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    let tool_names = resolve_profile_tool_names(&config, None, &[IntentCategory::Chat], &available);
+
+    assert!(tool_names.is_empty());
+}
+
+#[test]
+fn test_napcat_tools_hidden_when_disabled() {
+    // Config with napcat disabled (default)
+    let config: Config = serde_json::from_str(
+        r#"{
+                "channels": {
+                    "napcat": {
+                        "enabled": false
+                    }
+                }
+            }"#,
+    )
+    .unwrap();
+
+    let available: HashSet<String> = [
+        "read_file",
+        "napcat_get_group_list",
+        "napcat_get_login_info",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    let tool_names = resolve_effective_tool_names(
+        &config,
+        InteractionMode::General,
+        None,
+        None,
+        &[IntentCategory::Communication],
+        &available,
+    );
+
+    // napcat tools should be filtered out
+    assert!(tool_names.contains(&"read_file".to_string()));
+    assert!(!tool_names.contains(&"napcat_get_group_list".to_string()));
+    assert!(!tool_names.contains(&"napcat_get_login_info".to_string()));
+}
+
+#[test]
+fn test_napcat_tools_visible_when_enabled() {
+    // Config with napcat enabled
+    let config: Config = serde_json::from_str(
+        r#"{
+                "channels": {
+                    "napcat": {
+                        "enabled": true
+                    }
+                }
+            }"#,
+    )
+    .unwrap();
+
+    let available: HashSet<String> = [
+        "read_file",
+        "napcat_get_group_list",
+        "napcat_get_login_info",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    let tool_names = resolve_effective_tool_names(
+        &config,
+        InteractionMode::General,
+        None,
+        None,
+        &[IntentCategory::Communication],
+        &available,
+    );
+
+    // napcat tools should be visible
+    assert!(tool_names.contains(&"read_file".to_string()));
+    assert!(tool_names.contains(&"napcat_get_group_list".to_string()));
+    assert!(tool_names.contains(&"napcat_get_login_info".to_string()));
+}
+
+#[test]
+fn test_prepare_skill_result_for_presentation_keeps_full_result_payload() {
+    let output = serde_json::json!({
+        "success": true,
+        "action": "search",
+        "display_text": "找到 1 条相关笔记。",
+        "data": {
+            "items": [
+                {
+                    "index": 1,
+                    "title": "上海咖啡推荐"
+                }
+            ]
+        },
+        "raw_result_context": {
+            "search_results": [
+                {
+                    "index": 1,
+                    "title": "上海咖啡推荐",
+                    "feed_id": "feed-1",
+                    "xsec_token": "token-1"
+                }
+            ]
+        }
+    })
+    .to_string();
+
+    let presentation = prepare_skill_result_for_presentation("xiaohongshu", &output);
+
+    assert_eq!(
+        presentation.direct_text.as_deref(),
+        Some("找到 1 条相关笔记。")
+    );
+    let llm_payload = presentation
+        .llm_payload
+        .as_ref()
+        .expect("structured payload should still provide LLM summary input");
+    assert!(llm_payload.contains("上海咖啡推荐"));
+    assert!(llm_payload.contains("feed-1"));
+    assert!(llm_payload.contains("xsec_token"));
+}
+
+#[test]
+fn test_is_sensitive_filename_matches_json5_config() {
+    assert!(is_sensitive_filename("config.json5"));
+    assert!(is_sensitive_filename("/tmp/.blockcell/config.json5"));
+}
+
+#[tokio::test]
+async fn test_deliver_subagent_result_to_ws_origin_emits_message_done_event() {
+    let (event_tx, mut event_rx) = broadcast::channel::<String>(8);
+
+    deliver_subagent_result_to_origin(
+        "ws",
+        "webui-chat-9",
+        "第15条内容已经整理完成",
+        "task-test123",
+        Some("default"),
+        None,
+        Some(event_tx),
+        None,
+        None,
+    )
+    .await;
+
+    let payload = event_rx.recv().await.expect("receive ws event");
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("parse ws event");
+    assert_eq!(json["type"], "message_done");
+    assert_eq!(json["chat_id"], "webui-chat-9");
+    assert_eq!(json["agent_id"], "default");
+    assert_eq!(json["content"], "第15条内容已经整理完成");
+    assert_eq!(json["background_delivery"], true);
+    assert_eq!(json["task_id"], "task-test123");
+}
+
+// resolve_effective_tool_names 测试
+#[test]
+fn test_resolve_effective_tool_names_load_all_applies_deny_tools() {
+    // 当 enabled=false 且 load_all_tools=true 时，应应用 deny_tools 过滤
+    let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": ["exec"]
+                    }
+                }
+            },
+            "channels": {
+                "napcat": { "enabled": false }
+            }
+        }"#;
+    let config: Config = serde_json::from_str(raw).unwrap();
+    let available: HashSet<String> = [
+        "read_file",
+        "write_file",
+        "exec",
+        "web_search",
+        "napcat_send",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let tools = resolve_effective_tool_names(
+        &config,
+        InteractionMode::General,
+        None,
+        None,
+        &[IntentCategory::Unknown],
+        &available,
+    );
+
+    // exec 被 deny_tools 过滤，napcat_send 被 napcat.enabled=false 过滤
+    assert_eq!(tools.len(), 3);
+    assert!(tools.contains(&"read_file".to_string()));
+    assert!(tools.contains(&"write_file".to_string()));
+    assert!(tools.contains(&"web_search".to_string()));
+    assert!(!tools.contains(&"exec".to_string()));
+    assert!(!tools.contains(&"napcat_send".to_string()));
+}
+
+#[test]
+fn test_resolve_effective_tool_names_load_all_applies_napcat_filter() {
+    // 当 napcat.enabled=true 时，napcat 工具应可用
+    let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": []
+                    }
+                }
+            },
+            "channels": {
+                "napcat": { "enabled": true }
+            }
+        }"#;
+    let config: Config = serde_json::from_str(raw).unwrap();
+    let available: HashSet<String> = ["read_file", "napcat_send", "napcat_receive"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let tools = resolve_effective_tool_names(
+        &config,
+        InteractionMode::General,
+        None,
+        None,
+        &[IntentCategory::Unknown],
+        &available,
+    );
+
+    // napcat 工具应可用（enabled=true）
+    assert_eq!(tools.len(), 3);
+    assert!(tools.contains(&"read_file".to_string()));
+    assert!(tools.contains(&"napcat_send".to_string()));
+    assert!(tools.contains(&"napcat_receive".to_string()));
+}
+
+#[test]
+fn test_resolve_effective_tool_names_load_all_extends_skill_tools() {
+    // 当有 active_skill 时，应扩展 skill.tools
+    let raw = r#"{
+            "intentRouter": {
+                "enabled": false,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": [],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "Unknown": []
+                        },
+                        "denyTools": []
+                    }
+                }
+            },
+            "channels": {
+                "napcat": { "enabled": false }
+            }
+        }"#;
+    let config: Config = serde_json::from_str(raw).unwrap();
+    let available: HashSet<String> = ["read_file", "write_file"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let skill = ActiveSkillContext {
+        name: "test_skill".to_string(),
+        prompt_md: String::new(),
+        inject_prompt_md: false,
+        tools: vec!["skill_tool_1".to_string(), "skill_tool_2".to_string()],
+        fallback_message: None,
+        source: blockcell_skills::manager::SkillSource::BlockCell,
+    };
+    let tools = resolve_effective_tool_names(
+        &config,
+        InteractionMode::Skill,
+        None,
+        Some(&skill),
+        &[IntentCategory::Unknown],
+        &available,
+    );
+
+    // 应包含 available tools + skill.tools
+    assert_eq!(tools.len(), 4);
+    assert!(tools.contains(&"read_file".to_string()));
+    assert!(tools.contains(&"write_file".to_string()));
+    assert!(tools.contains(&"skill_tool_1".to_string()));
+    assert!(tools.contains(&"skill_tool_2".to_string()));
+}
+
+#[test]
+fn test_resolve_effective_tool_names_enabled_true_uses_intent_classification() {
+    // 当 enabled=true 时，应走意图分类流程，忽略 load_all_tools
+    let raw = r#"{
+            "intentRouter": {
+                "enabled": true,
+                "loadAllTools": true,
+                "defaultProfile": "default",
+                "profiles": {
+                    "default": {
+                        "coreTools": ["read_file"],
+                        "intentTools": {
+                            "Chat": { "inheritBase": false, "tools": [] },
+                            "FileOps": ["edit_file"]
+                        },
+                        "denyTools": []
+                    }
+                }
+            },
+            "channels": {
+                "napcat": { "enabled": false }
+            }
+        }"#;
+    let config: Config = serde_json::from_str(raw).unwrap();
+    let available: HashSet<String> = ["read_file", "edit_file", "exec", "web_search"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    // FileOps 意图应返回 read_file (core) + edit_file (intent)
+    let tools = resolve_effective_tool_names(
+        &config,
+        InteractionMode::General,
+        None,
+        None,
+        &[IntentCategory::FileOps],
+        &available,
+    );
+    assert_eq!(tools.len(), 2);
+    assert!(tools.contains(&"read_file".to_string()));
+    assert!(tools.contains(&"edit_file".to_string()));
+}
+
+// ========== 集成测试: Inter-Agent 通信 ==========
+
+/// 测试 AbortToken 链式取消
+#[test]
+fn test_abort_token_chain_cancellation() {
+    use blockcell_core::AbortToken;
+
+    // 创建父 token
+    let parent = AbortToken::new();
+    // 创建子 token
+    let child = parent.child();
+    // 创建孙 token
+    let grandchild = child.child();
+
+    // 初始状态：都未取消
+    assert!(!parent.is_cancelled());
+    assert!(!child.is_cancelled());
+    assert!(!grandchild.is_cancelled());
+
+    // 取消父 -> 子和孙也应取消
+    parent.cancel();
+    assert!(parent.is_cancelled());
+    assert!(child.is_cancelled());
+    assert!(grandchild.is_cancelled());
+
+    // 孙 token 的 check() 应返回错误
+    assert!(grandchild.check().is_err());
+}
+
+/// 测试 AbortToken 独立取消（子取消不影响父）
+#[test]
+fn test_abort_token_independent_child() {
+    use blockcell_core::AbortToken;
+
+    let parent = AbortToken::new();
+    let child = parent.child();
+
+    // 只取消子
+    child.cancel();
+    assert!(child.is_cancelled());
+    // 父不应受影响
+    assert!(!parent.is_cancelled());
+}
+
+/// 测试 SubagentContext 的 AbortToken 集成
+#[test]
+fn test_subagent_context_abort_token() {
+    use crate::forked::{create_subagent_context, SubagentOverrides};
+    use blockcell_core::AbortToken;
+
+    // 创建父 token
+    let parent_token = AbortToken::new();
+
+    // 创建子代理上下文，传入父 token
+    let overrides = SubagentOverrides {
+        abort_token: Some(parent_token.child()),
+        ..Default::default()
+    };
+    let context = create_subagent_context(None, None, None, Some(&parent_token), overrides);
+
+    // 子上下文的 abort_token 应是父的子 token
+    assert!(!context.abort_token.is_cancelled());
+
+    // 取消父
+    parent_token.cancel();
+    // 子也应取消
+    assert!(context.abort_token.is_cancelled());
+}
+
+/// 测试 UsageMetrics 统一性
+#[test]
+fn test_usage_metrics_unified() {
+    use blockcell_core::UsageMetrics;
+
+    // 创建两个 UsageMetrics 并合并
+    let mut m1 = UsageMetrics {
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_creation_input_tokens: 20,
+        cache_read_input_tokens: 10,
+    };
+
+    let m2 = UsageMetrics {
+        input_tokens: 200,
+        output_tokens: 100,
+        cache_creation_input_tokens: 30,
+        cache_read_input_tokens: 40,
+    };
+
+    m1.merge(&m2);
+
+    assert_eq!(m1.input_tokens, 300);
+    assert_eq!(m1.output_tokens, 150);
+    assert_eq!(m1.cache_creation_input_tokens, 50);
+    assert_eq!(m1.cache_read_input_tokens, 50);
+
+    // 测试 cache_hit_rate
+    let hit_rate = m1.cache_hit_rate();
+    // cache_read / (input + cache_creation + cache_read)
+    // 50 / (300 + 50 + 50) = 50 / 400 = 0.125
+    assert!((hit_rate - 0.125).abs() < 0.001);
+}
+
+/// 测试 AgentTypeDefinition 的 ONE_SHOT 行为
+#[test]
+fn test_agent_type_one_shot() {
+    use crate::agent_types::{AgentTypeDefinition, PermissionMode};
+
+    // 创建 ONE_SHOT agent type
+    let one_shot_type = AgentTypeDefinition {
+        agent_type: "explore".to_string(),
+        when_to_use: "Explore agent for quick searches".to_string(),
+        disallowed_tools: vec!["exec".to_string()],
+        max_turns: Some(5),
+        system_prompt_template: None,
+        one_shot: true,
+        permission_mode: PermissionMode::Bubble,
+        isolation: None,
+        ..Default::default()
+    };
+
+    assert!(one_shot_type.one_shot);
+
+    // 创建非 ONE_SHOT agent type
+    let normal_type = AgentTypeDefinition {
+        agent_type: "general".to_string(),
+        when_to_use: "General agent for complex tasks".to_string(),
+        disallowed_tools: vec![],
+        max_turns: None,
+        system_prompt_template: None,
+        one_shot: false,
+        permission_mode: PermissionMode::Inherit,
+        isolation: None,
+        ..Default::default()
+    };
+
+    assert!(!normal_type.one_shot);
+}
+
+/// 测试 SpawnHandle trait 的 agent_type 参数传递
+#[test]
+fn test_spawn_handle_agent_type_parameter() {
+    use blockcell_tools::SpawnHandle;
+    use std::sync::Arc;
+
+    // Mock SpawnHandle 实现，验证 agent_type 参数被正确传递
+    struct MockSpawnHandle {
+        captured_agent_type: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl SpawnHandle for MockSpawnHandle {
+        fn spawn(
+            &self,
+            _task: &str,
+            _label: &str,
+            _origin_channel: &str,
+            _origin_chat_id: &str,
+            agent_type: Option<&str>,
+        ) -> blockcell_core::Result<serde_json::Value> {
+            *self.captured_agent_type.lock().unwrap() = agent_type.map(|s| s.to_string());
+            Ok(serde_json::json!({"task_id": "test", "status": "running"}))
+        }
+    }
+
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let handle = MockSpawnHandle {
+        captured_agent_type: captured.clone(),
+    };
+
+    // 调用 spawn，传递 agent_type
+    let result = handle.spawn("test task", "test label", "ws", "chat1", Some("explore"));
+
+    assert!(result.is_ok());
+    let captured_type = captured.lock().unwrap();
+    assert_eq!(captured_type.as_deref(), Some("explore"));
+}
+
+#[tokio::test]
+async fn test_completed_agent_prompt_injection_does_not_mark_before_response() {
+    let task_manager = TaskManager::new();
+    task_manager
+        .create_and_start_task(
+            "task-inject-1",
+            "explore",
+            "inspect code",
+            "cli",
+            "chat-1",
+            None,
+            false,
+            Some("explore"),
+            true,
+        )
+        .await;
+    task_manager
+        .set_completed("task-inject-1", "found the relevant implementation")
+        .await;
+
+    let mut messages = vec![
+        ChatMessage::system("base prompt"),
+        ChatMessage::user("summarize the agent result"),
+    ];
+    let injected_ids = inject_running_tasks_into_system_prompt(&mut messages, &task_manager).await;
+
+    assert_eq!(injected_ids, vec!["task-inject-1".to_string()]);
+    assert!(
+        !task_manager
+            .get_task("task-inject-1")
+            .await
+            .unwrap()
+            .result_injected
+    );
+    assert!(messages[0]
+        .content
+        .as_str()
+        .unwrap()
+        .contains("Completed Agent Results"));
+}
+
+// ========== Mock Provider for Inter-Agent Tests ==========
+
+/// Simple mock provider that returns a fixed text response.
+/// Used for testing spawn_typed_agent and execute_fork_mode without real LLM calls.
+struct MockInterAgentProvider {
+    response_text: String,
+}
+
+impl MockInterAgentProvider {
+    fn new(response: &str) -> Self {
+        Self {
+            response_text: response.to_string(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl blockcell_providers::Provider for MockInterAgentProvider {
+    async fn chat(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> blockcell_core::Result<LLMResponse> {
+        Ok(LLMResponse {
+            content: Some(self.response_text.clone()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            finish_reason: "stop".to_string(),
+            usage: serde_json::json!({
+                "input_tokens": 100,
+                "output_tokens": 50
+            }),
+        })
+    }
+}
+
+// ========== 端到端测试: spawn_typed_agent ==========
+
+/// 测试 spawn_typed_agent 的完整执行流程
+/// 验证：task_id 返回、任务创建、后台执行完成
+#[tokio::test]
+async fn test_spawn_typed_agent_e2e() {
+    use blockcell_providers::ProviderPool;
+
+    // 创建 mock provider pool
+    let mock_provider = Arc::new(MockInterAgentProvider::new(
+        "Task completed successfully. Found 3 relevant files.",
+    ));
+    let provider_pool =
+        ProviderPool::from_single_provider("test-model", "test-provider", mock_provider);
+
+    // 创建 TaskManager (用于后续完整测试扩展)
+    let _task_manager = Arc::new(crate::task_manager::TaskManager::new());
+
+    // 创建简单的 Runtime (不依赖完整配置)
+    // 注意：这里只测试 spawn_typed_agent 的关键逻辑
+    // 实际 AgentRuntime 需要完整配置，我们简化测试
+
+    // 验证：spawn_typed_agent 应返回 task_id
+    // 由于完整的 AgentRuntime 需要 Config/Paths，这里测试 AgentTypeRegistry 和参数传递
+
+    use crate::agent_types::AgentTypeRegistry;
+    let registry = AgentTypeRegistry::new();
+
+    // 验证 explore agent 类型定义
+    let explore_def = registry
+        .get("explore")
+        .expect("explore agent type should exist");
+    assert!(explore_def.one_shot);
+    assert!(explore_def.disallowed_tools.contains(&"agent".to_string()));
+
+    // 验证 typed agent 创建成功
+    let typed_def = registry
+        .get("viper")
+        .expect("viper agent type should exist");
+    assert!(!typed_def.one_shot);
+    assert_eq!(
+        typed_def.permission_mode,
+        crate::agent_types::PermissionMode::Bubble
+    );
+
+    // 验证 ForkedAgentParams 可正确构建
+    use crate::forked::{CacheSafeParams, ForkedAgentParams};
+    let params = ForkedAgentParams::builder()
+        .provider_pool(provider_pool)
+        .prompt_messages(vec![ChatMessage::user("test task")])
+        .cache_safe_params(CacheSafeParams::default())
+        .fork_label("test")
+        .max_turns(3)
+        .agent_type(Some("explore".to_string()))
+        .one_shot(true)
+        .build();
+
+    assert!(params.is_ok());
+    let params = params.unwrap();
+    assert_eq!(params.agent_type, Some("explore".to_string()));
+    assert!(params.one_shot);
+}
+
+// ========== 端到端测试: execute_fork_mode ==========
+
+/// 测试 execute_fork_mode 的上下文继承
+/// 验证：ForkChild 身份、cannot_spawn_subagent、上下文隔离
+#[tokio::test]
+async fn test_execute_fork_mode_context_inheritance() {
+    use blockcell_core::{scope_agent_context, AgentIdentity};
+    use blockcell_providers::ProviderPool;
+
+    // 创建 mock provider pool
+    let mock_provider = Arc::new(MockInterAgentProvider::new(
+        "Fork task completed. Analysis result: 2 files modified.",
+    ));
+    let provider_pool =
+        ProviderPool::from_single_provider("test-model", "test-provider", mock_provider);
+
+    // 创建 ForkChild 身份
+    let fork_identity = AgentIdentity::fork_child(
+        "fork-test-001".to_string(),
+        "parent-session-123".to_string(),
+    );
+
+    // 验证 ForkChild 属性
+    assert!(fork_identity.role.is_fork_child());
+    assert!(!fork_identity.can_spawn_subagent_basic());
+    assert_eq!(fork_identity.agent_name, "fork");
+
+    // 在 ForkChild 上下文中验证 can_spawn_subagent
+    let result = scope_agent_context(fork_identity.clone(), async {
+        // ForkChild 不能 spawn 子 agent
+        let can_spawn = blockcell_core::can_spawn_subagent();
+        assert!(!can_spawn);
+        "verified"
+    })
+    .await;
+
+    assert_eq!(result, "verified");
+
+    // 验证 ForkedAgentParams for Fork mode (无 agent_type)
+    use crate::forked::{CacheSafeParams, ForkedAgentParams};
+    let params = ForkedAgentParams::builder()
+        .provider_pool(provider_pool)
+        .prompt_messages(vec![
+            ChatMessage::system("Fork mode test"),
+            ChatMessage::user("analyze this"),
+        ])
+        .cache_safe_params(CacheSafeParams::default())
+        .fork_label("fork")
+        .max_turns(5)
+        .agent_type(None) // Fork mode: 无 agent_type
+        .disallowed_tools(vec!["agent".to_string(), "spawn".to_string()])
+        .one_shot(true)
+        .build();
+
+    assert!(params.is_ok());
+    let params = params.unwrap();
+    assert!(params.agent_type.is_none());
+    assert!(params.disallowed_tools.contains(&"agent".to_string()));
+}
+
+// ========== 端到端测试: run_forked_agent 执行 ==========
+
+/// 测试 run_forked_agent 的实际执行（使用 mock provider）
+#[tokio::test]
+async fn test_run_forked_agent_with_mock_provider() {
+    use crate::forked::{run_forked_agent, CacheSafeParams, ForkedAgentParams};
+    use blockcell_providers::ProviderPool;
+
+    // 创建 mock provider pool
+    let mock_provider = Arc::new(MockInterAgentProvider::new(
+        "Analysis complete. Found patterns in the codebase.",
+    ));
+    let provider_pool =
+        ProviderPool::from_single_provider("test-model", "test-provider", mock_provider);
+
+    // 构建参数
+    let params = ForkedAgentParams::builder()
+        .provider_pool(provider_pool)
+        .prompt_messages(vec![
+            ChatMessage::system("You are a test agent. Respond briefly."),
+            ChatMessage::user("Find patterns"),
+        ])
+        .cache_safe_params(CacheSafeParams::default())
+        .fork_label("test_e2e")
+        .max_turns(1) // 只执行一轮
+        .one_shot(true)
+        .build()
+        .expect("params should build successfully");
+
+    // 执行 forked agent
+    let result = run_forked_agent(params).await;
+
+    // 验证执行成功
+    assert!(result.is_ok());
+    let result = result.unwrap();
+    let content = result.final_content.clone().unwrap_or_default();
+    assert!(
+        content.contains("Analysis")
+            || content.contains("patterns")
+            || content.contains("complete")
+    );
+
+    // 验证 usage metrics
+    assert!(result.total_usage.input_tokens > 0 || result.total_usage.output_tokens > 0);
+}
+
+#[tokio::test]
+async fn process_message_stops_when_token_budget_is_exhausted() {
+    let mut config = Config::default();
+    config.agents.defaults.model = "test/mock".to_string();
+    config.agents.defaults.provider = Some("test".to_string());
+    config.agents.ghost.learning.enabled = false;
+    config.budget.max_tokens_per_session = 120;
+
+    let provider = Arc::new(MockInterAgentProvider::new(
+        "This response should be replaced by budget exhaustion.",
+    ));
+    let base =
+        std::env::temp_dir().join(format!("blockcell-budget-runtime-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&base).expect("create temp budget runtime dir");
+    let paths = Paths::with_base(base);
+    let mut runtime = test_runtime_with_provider_and_paths(paths, provider, config);
+
+    let result = runtime
+        .process_message(test_main_session_inbound("cli", "budget-test"))
+        .await
+        .expect("process message");
+
+    assert!(result.contains("Budget exhausted"));
+    assert!(result.contains("tokens: 150/120"));
+}
+
+#[tokio::test]
+async fn token_budget_is_tracked_per_session_key() {
+    let mut config = Config::default();
+    config.agents.defaults.model = "test/mock".to_string();
+    config.agents.defaults.provider = Some("test".to_string());
+    config.agents.ghost.learning.enabled = false;
+    config.budget.max_tokens_per_session = 200;
+
+    let provider = Arc::new(MockInterAgentProvider::new("within budget"));
+    let base = std::env::temp_dir().join(format!(
+        "blockcell-budget-sessions-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&base).expect("create temp budget session runtime dir");
+    let paths = Paths::with_base(base);
+    let mut runtime = test_runtime_with_provider_and_paths(paths, provider, config);
+
+    let first = runtime
+        .process_message(test_main_session_inbound("cli", "budget-session-a"))
+        .await
+        .expect("first session message");
+    let second = runtime
+        .process_message(test_main_session_inbound("cli", "budget-session-b"))
+        .await
+        .expect("second session message");
+
+    assert_eq!(first, "within budget");
+    assert_eq!(second, "within budget");
+}
+
+fn tool_policy_rule(
+    name: &str,
+    tool: &str,
+    decision: blockcell_core::tool_policy::ToolPolicyDecision,
+) -> blockcell_core::tool_policy::ToolPolicyRule {
+    blockcell_core::tool_policy::ToolPolicyRule {
+        name: name.to_string(),
+        tool: tool.to_string(),
+        decision,
+        when: None,
+        description: None,
+        inherit_from: None,
+    }
+}
+
+fn tool_call(name: &str, arguments: serde_json::Value) -> ToolCallRequest {
+    ToolCallRequest {
+        id: format!("call-{}", name),
+        name: name.to_string(),
+        arguments,
+        thought_signature: None,
+    }
+}
+
+#[tokio::test]
+async fn tool_policy_deny_blocks_tool_before_execution() {
+    use blockcell_core::tool_policy::{ToolPolicy, ToolPolicyConfig, ToolPolicyDecision};
+
+    let mut runtime = test_runtime();
+    let mut deny_exec = tool_policy_rule("deny-exec", "exec", ToolPolicyDecision::Deny);
+    deny_exec.description = Some("exec is disabled by policy".to_string());
+    runtime.tool_policy = ToolPolicy::from_config(ToolPolicyConfig {
+        rules: vec![deny_exec],
+        ..Default::default()
+    });
+
+    let result = runtime
+        .execute_tool_call(
+            &tool_call("exec", serde_json::json!({"command": "echo hello"})),
+            &test_main_session_inbound("cli", "policy-deny"),
+            None,
+        )
+        .await;
+
+    assert!(result.contains("exec is disabled by policy"));
+    assert!(!result.contains("Unknown tool"));
+}
+
+#[tokio::test]
+async fn tool_policy_ask_uses_existing_confirmation_flow() {
+    use blockcell_core::tool_policy::{ToolPolicy, ToolPolicyConfig, ToolPolicyDecision};
+
+    let mut runtime = test_runtime();
+    let ask_exec = tool_policy_rule("ask-exec", "exec", ToolPolicyDecision::Ask);
+    runtime.tool_policy = ToolPolicy::from_config(ToolPolicyConfig {
+        rules: vec![ask_exec],
+        ..Default::default()
+    });
+    let (confirm_tx, mut confirm_rx) = mpsc::channel(1);
+    runtime.confirm_tx = Some(confirm_tx);
+
+    let msg = test_main_session_inbound("cli", "policy-ask");
+    let call = tool_call("exec", serde_json::json!({"command": "echo hello"}));
+    let handle = tokio::spawn(async move { runtime.execute_tool_call(&call, &msg, None).await });
+
+    let request = confirm_rx
+        .recv()
+        .await
+        .expect("policy ask should send confirmation request");
+    assert_eq!(request.tool_name, "exec");
+    assert_eq!(request.channel, "cli");
+    assert_eq!(request.chat_id, "policy-ask");
+    request.response_tx.send(false).expect("send denial");
+
+    let result = handle.await.expect("policy ask task should finish");
+    assert!(result.contains("用户拒绝") || result.contains("denied"));
+}
+
+#[tokio::test]
+async fn tool_policy_ask_confirmation_skips_duplicate_path_confirmation() {
+    use blockcell_core::tool_policy::{
+        ToolPolicy, ToolPolicyCondition, ToolPolicyConfig, ToolPolicyDecision,
+    };
+
+    let mut runtime = test_runtime();
+    let outside_path = std::env::temp_dir()
+        .join(format!("blockcell-policy-outside-{}", uuid::Uuid::new_v4()))
+        .join("secrets.env");
+    let mut ask_env_write =
+        tool_policy_rule("ask-env-write", "write_file", ToolPolicyDecision::Ask);
+    ask_env_write.when = Some(ToolPolicyCondition {
+        path_glob: Some("*.env".to_string()),
+        ..Default::default()
+    });
+    runtime.tool_policy = ToolPolicy::from_config(ToolPolicyConfig {
+        rules: vec![ask_env_write],
+        ..Default::default()
+    });
+    let (confirm_tx, mut confirm_rx) = mpsc::channel(2);
+    runtime.confirm_tx = Some(confirm_tx);
+
+    let msg = test_main_session_inbound("cli", "policy-single-confirm");
+    let call = tool_call(
+        "write_file",
+        serde_json::json!({"path": outside_path.to_string_lossy(), "content": "secret"}),
+    );
+    let handle = tokio::spawn(async move { runtime.execute_tool_call(&call, &msg, None).await });
+
+    let request = confirm_rx
+        .recv()
+        .await
+        .expect("tool policy ask should send first confirmation");
+    assert_eq!(request.tool_name, "write_file");
+    request.response_tx.send(true).expect("approve policy ask");
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        .await
+        .expect("tool should not wait for a second path confirmation")
+        .expect("tool task should finish");
+
+    assert!(result.contains("Unknown tool"));
+    assert!(confirm_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn tool_policy_channel_condition_only_applies_to_matching_channel() {
+    use blockcell_core::tool_policy::{
+        ToolPolicy, ToolPolicyCondition, ToolPolicyConfig, ToolPolicyDecision,
+    };
+
+    let mut runtime = test_runtime();
+    let mut telegram_only =
+        tool_policy_rule("deny-telegram-exec", "exec", ToolPolicyDecision::Deny);
+    telegram_only.when = Some(ToolPolicyCondition {
+        channel: Some("telegram".to_string()),
+        ..Default::default()
+    });
+    runtime.tool_policy = ToolPolicy::from_config(ToolPolicyConfig {
+        rules: vec![telegram_only],
+        ..Default::default()
+    });
+
+    let result = runtime
+        .execute_tool_call(
+            &tool_call("exec", serde_json::json!({"command": "echo hello"})),
+            &test_main_session_inbound("cli", "policy-channel"),
+            None,
+        )
+        .await;
+
+    assert!(!result.contains("Policy denied"));
+    assert!(result.contains("Unknown tool"));
+}
