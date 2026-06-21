@@ -18,17 +18,40 @@ pub enum WriteTarget {
     UserMd,
     /// MEMORY.md file
     MemoryMd,
-    /// Skill directory (SKILL.md + meta.json)
-    Skill { category: String, name: String },
+    /// Skill directory (SKILL.md + meta.json).
+    ///
+    /// `name` is the canonical lock key: the skill's leaf directory name
+    /// (last `/`-segment). Both the tool layer (which only sees the raw skill
+    /// name) and the learning layer (which resolves a full `category/name`
+    /// path) must key on the same value, so the identity is the leaf name
+    /// rather than the full path. Construct via [`WriteTarget::skill`] to
+    /// guarantee both sites normalize identically.
+    Skill { name: String },
 }
 
 impl WriteTarget {
+    /// Build a skill write target from a raw skill name or `category/name` path.
+    ///
+    /// Normalizes to the leaf segment so the tool layer and the learning layer
+    /// produce the same lock key for the same skill.
+    pub fn skill(raw: &str) -> Self {
+        let name = raw
+            .trim()
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        WriteTarget::Skill { name }
+    }
+
     /// Human-readable label for logging
     pub fn label(&self) -> String {
         match self {
             WriteTarget::UserMd => "USER.md".to_string(),
             WriteTarget::MemoryMd => "MEMORY.md".to_string(),
-            WriteTarget::Skill { category, name } => format!("skill/{}/{}", category, name),
+            WriteTarget::Skill { name } => format!("skill/{}", name),
         }
     }
 
@@ -37,8 +60,8 @@ impl WriteTarget {
         match self {
             WriteTarget::UserMd => ".user_md.lockdir".to_string(),
             WriteTarget::MemoryMd => ".memory_md.lockdir".to_string(),
-            WriteTarget::Skill { category, name } => {
-                format!(".skill_{}_{}.lockdir", category, name)
+            WriteTarget::Skill { name } => {
+                format!(".skill_{}.lockdir", name)
             }
         }
     }
@@ -144,10 +167,7 @@ impl Default for WriteGuard {
 
 /// 帮助函数: 将技能名称映射为 WriteTarget，用于 SkillMutexOps 实现
 fn skill_name_to_target(skill_name: &str) -> WriteTarget {
-    WriteTarget::Skill {
-        category: String::new(),
-        name: skill_name.to_string(),
-    }
+    WriteTarget::skill(skill_name)
 }
 
 /// 为 WriteGuard 实现 SkillMutexOps trait
@@ -232,25 +252,14 @@ mod tests {
 
         let lock1 = guard.acquire(WriteTarget::UserMd).unwrap();
         let lock2 = guard.acquire(WriteTarget::MemoryMd).unwrap();
-        let lock3 = guard
-            .acquire(WriteTarget::Skill {
-                category: "coding".to_string(),
-                name: "debug".to_string(),
-            })
-            .unwrap();
+        let lock3 = guard.acquire(WriteTarget::skill("coding/debug")).unwrap();
 
         assert!(guard.is_active(&WriteTarget::UserMd));
         assert!(guard.is_active(&WriteTarget::MemoryMd));
-        assert!(guard.is_active(&WriteTarget::Skill {
-            category: "coding".to_string(),
-            name: "debug".to_string(),
-        }));
+        assert!(guard.is_active(&WriteTarget::skill("coding/debug")));
 
         // Different skill is not blocked
-        assert!(guard.can_modify(&WriteTarget::Skill {
-            category: "coding".to_string(),
-            name: "other".to_string(),
-        }));
+        assert!(guard.can_modify(&WriteTarget::skill("coding/other")));
 
         drop(lock1);
         drop(lock2);
@@ -259,36 +268,43 @@ mod tests {
 
     #[test]
     fn test_skill_target_key_equality() {
-        let t1 = WriteTarget::Skill {
-            category: "coding".to_string(),
-            name: "debug".to_string(),
-        };
-        let t2 = WriteTarget::Skill {
-            category: "coding".to_string(),
-            name: "debug".to_string(),
-        };
-        let t3 = WriteTarget::Skill {
-            category: "coding".to_string(),
-            name: "other".to_string(),
-        };
+        let t1 = WriteTarget::skill("coding/debug");
+        let t2 = WriteTarget::skill("coding/debug");
+        let t3 = WriteTarget::skill("coding/other");
 
         assert_eq!(t1, t2);
         assert_ne!(t1, t3);
     }
 
     #[test]
+    fn test_skill_key_normalizes_to_leaf_name() {
+        // Tool layer (raw leaf name) and learning layer (full category/name path)
+        // must produce the same lock key for the same skill.
+        assert_eq!(
+            WriteTarget::skill("coding/debug"),
+            WriteTarget::skill("debug")
+        );
+        assert_eq!(
+            WriteTarget::skill("a/b/c/debug"),
+            WriteTarget::skill("debug")
+        );
+        // Trailing slash and surrounding whitespace are normalized away.
+        assert_eq!(
+            WriteTarget::skill("coding/debug/"),
+            WriteTarget::skill(" debug ")
+        );
+    }
+
+    #[test]
     fn test_label_and_lock_filename() {
         assert_eq!(WriteTarget::UserMd.label(), "USER.md");
         assert_eq!(WriteTarget::MemoryMd.label(), "MEMORY.md");
-        assert_eq!(
-            WriteTarget::Skill {
-                category: "coding".to_string(),
-                name: "debug".to_string(),
-            }
-            .label(),
-            "skill/coding/debug"
-        );
+        assert_eq!(WriteTarget::skill("coding/debug").label(), "skill/debug");
         assert_eq!(WriteTarget::UserMd.lock_filename(), ".user_md.lockdir");
         assert_eq!(WriteTarget::MemoryMd.lock_filename(), ".memory_md.lockdir");
+        assert_eq!(
+            WriteTarget::skill("coding/debug").lock_filename(),
+            ".skill_debug.lockdir"
+        );
     }
 }

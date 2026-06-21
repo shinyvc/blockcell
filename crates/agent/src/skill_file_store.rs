@@ -67,10 +67,10 @@ impl SkillFileStore {
         let Some(ref guard) = self.write_guard else {
             return Ok(None);
         };
-        let write_target = WriteTarget::Skill {
-            category: target.category.clone(),
-            name: target.name.clone(),
-        };
+        // Key on the leaf skill name so this learning-layer write and the
+        // tool-layer write (skill_manage, which only sees the raw name) map to
+        // the same WriteGuard target and actually serialize against each other.
+        let write_target = WriteTarget::skill(&target.name);
         guard
             .acquire(write_target)
             .map(Some)
@@ -574,7 +574,6 @@ struct ValidatedSkillTarget {
 #[derive(Debug)]
 struct SkillTarget {
     display_name: String,
-    category: String,
     name: String,
     dir: PathBuf,
 }
@@ -586,14 +585,8 @@ impl SkillTarget {
             .last()
             .cloned()
             .unwrap_or_else(|| target.display_name.clone());
-        let category = if target.segments.len() > 1 {
-            target.segments[..target.segments.len() - 1].join("/")
-        } else {
-            String::new()
-        };
         Self {
             display_name: target.display_name,
-            category,
             name,
             dir,
         }
