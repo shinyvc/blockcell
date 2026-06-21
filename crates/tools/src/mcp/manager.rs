@@ -33,54 +33,6 @@ impl McpToolTarget {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::mcp::client::McpTool;
-    use crate::mcp::search::McpSearchTool;
-    use serde_json::json;
-
-    fn mcp_tool(name: &str, description: &str) -> McpTool {
-        McpTool {
-            name: name.to_string(),
-            description: Some(description.to_string()),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "q": { "type": "string" }
-                },
-                "required": ["q"]
-            }),
-        }
-    }
-
-    #[tokio::test]
-    async fn mcp_search_tool_returns_ranked_full_tool_definitions() {
-        let search = McpSearchTool::new(vec![
-            (
-                "postgres".to_string(),
-                mcp_tool("query", "Run SQL database queries"),
-            ),
-            (
-                "github".to_string(),
-                mcp_tool("create_issue", "Create GitHub issues"),
-            ),
-        ]);
-
-        let result = search.search_value("database query", 5);
-
-        let tools = result["tools"]
-            .as_array()
-            .expect("tools should be an array");
-        assert_eq!(tools[0]["name"], "postgres__query");
-        assert_eq!(tools[0]["server"], "postgres");
-        assert_eq!(tools[0]["schema"]["function"]["name"], "postgres__query");
-        assert_eq!(
-            tools[0]["schema"]["function"]["parameters"]["required"][0],
-            "q"
-        );
-    }
-}
-
 pub fn mcp_access_allows(
     allowed_servers: &[String],
     allowed_tools: &[String],
@@ -246,5 +198,53 @@ impl McpManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::mcp::client::McpTool;
+    use crate::mcp::search::McpSearchTool;
+    use serde_json::json;
+
+    fn mcp_tool(name: &str, description: &str) -> McpTool {
+        McpTool {
+            name: name.to_string(),
+            description: Some(description.to_string()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "q": { "type": "string" }
+                },
+                "required": ["q"]
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_search_tool_returns_ranked_full_tool_definitions() {
+        let search = McpSearchTool::new(vec![
+            (
+                "postgres".to_string(),
+                mcp_tool("query", "Run SQL database queries"),
+            ),
+            (
+                "github".to_string(),
+                mcp_tool("create_issue", "Create GitHub issues"),
+            ),
+        ]);
+
+        let result = search.search_value("database query", 5);
+
+        let tools = result["tools"]
+            .as_array()
+            .expect("tools should be an array");
+        assert_eq!(tools[0]["name"], "postgres__query");
+        assert_eq!(tools[0]["server"], "postgres");
+        assert_eq!(tools[0]["schema"]["function"]["name"], "postgres__query");
+        assert_eq!(
+            tools[0]["schema"]["function"]["parameters"]["required"][0],
+            "q"
+        );
     }
 }

@@ -1770,6 +1770,29 @@ impl Provider for OpenAIProvider {
     }
 }
 
+/// 判断 provider 是否为 NVIDIA NIM 类型。
+/// NVIDIA NIM 使用 `chat_template_kwargs` 而非顶层 `thinking`/`reasoning_effort`。
+fn is_nvidia_nim(provider_name: &str) -> bool {
+    let lower = provider_name.to_ascii_lowercase();
+    lower.contains("nvidia")
+        || lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|token| token == "nim")
+}
+
+/// 判断 provider 是否支持 thinking/reasoning 模式参数。
+/// 仅 DeepSeek 系列及其中继（OpenRouter/Novita/Fireworks/SGLang）和 NVIDIA NIM 支持。
+/// OpenAI、Groq、Kimi、Zhipu 等不支持，注入这些参数会导致 API 报错。
+fn supports_thinking_mode(provider_name: &str) -> bool {
+    let lower = provider_name.to_ascii_lowercase();
+    lower.contains("deepseek")
+        || lower.contains("openrouter")
+        || lower.contains("novita")
+        || lower.contains("fireworks")
+        || lower.contains("sglang")
+        || is_nvidia_nim(provider_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2227,27 +2250,4 @@ ls -la
         assert_eq!(sanitized[2].role, "tool");
         assert_eq!(sanitized[2].tool_call_id.as_deref(), Some("call-1"));
     }
-}
-
-/// 判断 provider 是否为 NVIDIA NIM 类型。
-/// NVIDIA NIM 使用 `chat_template_kwargs` 而非顶层 `thinking`/`reasoning_effort`。
-fn is_nvidia_nim(provider_name: &str) -> bool {
-    let lower = provider_name.to_ascii_lowercase();
-    lower.contains("nvidia")
-        || lower
-            .split(|c: char| !c.is_alphanumeric())
-            .any(|token| token == "nim")
-}
-
-/// 判断 provider 是否支持 thinking/reasoning 模式参数。
-/// 仅 DeepSeek 系列及其中继（OpenRouter/Novita/Fireworks/SGLang）和 NVIDIA NIM 支持。
-/// OpenAI、Groq、Kimi、Zhipu 等不支持，注入这些参数会导致 API 报错。
-fn supports_thinking_mode(provider_name: &str) -> bool {
-    let lower = provider_name.to_ascii_lowercase();
-    lower.contains("deepseek")
-        || lower.contains("openrouter")
-        || lower.contains("novita")
-        || lower.contains("fireworks")
-        || lower.contains("sglang")
-        || is_nvidia_nim(provider_name)
 }

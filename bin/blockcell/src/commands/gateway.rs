@@ -1253,7 +1253,7 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
 
         while let Some(progress) = progress_rx.recv().await {
             progress_events_seen = progress_events_seen.saturating_add(1);
-            if progress_events_seen % THROTTLE_CLEANUP_INTERVAL == 0
+            if progress_events_seen.is_multiple_of(THROTTLE_CLEANUP_INTERVAL)
                 && !last_forwarded_percent.is_empty()
             {
                 let task_ids = last_forwarded_percent.keys().cloned().collect::<Vec<_>>();

@@ -27,6 +27,10 @@ fn ws_inbound_message_within_size_limit(msg: &WsMessage) -> bool {
     ws_inbound_message_size(msg) <= MAX_WS_MESSAGE_BYTES
 }
 
+// Combined size + rate-limit gate. The runtime loop inlines these checks (so it
+// can emit distinct log messages per rejection reason); this helper exists to
+// unit-test the combined policy.
+#[cfg(test)]
 fn ws_inbound_message_allowed(
     msg: &WsMessage,
     limiter: &mut WsRateLimiter,

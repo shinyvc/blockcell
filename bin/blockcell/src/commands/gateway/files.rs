@@ -56,6 +56,9 @@ fn payload_too_large_response(limit: u64) -> Response {
         .into_response()
 }
 
+// `Response` is the gateway-wide error type (axum's response), so the large
+// `Err` variant is intentional here rather than something to box.
+#[allow(clippy::result_large_err)]
 fn bounded_file_response_bytes(bytes: Vec<u8>, limit: u64) -> Result<Vec<u8>, Response> {
     if file_size_within_limit(bytes.len() as u64, limit) {
         Ok(bytes)
@@ -64,6 +67,7 @@ fn bounded_file_response_bytes(bytes: Vec<u8>, limit: u64) -> Result<Vec<u8>, Re
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn bounded_file_response_string(content: String, limit: u64) -> Result<String, Response> {
     if file_size_within_limit(content.len() as u64, limit) {
         Ok(content)

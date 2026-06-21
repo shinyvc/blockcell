@@ -5,9 +5,7 @@
 #[cfg(test)]
 mod tests {
     use blockcell_agent::auto_memory::{ExtractionCursor, ExtractionCursorManager, MemoryType};
-    use blockcell_agent::memory_system::{
-        evaluate_memory_hooks, MemorySystem, MemorySystemConfig, PostSamplingActions,
-    };
+    use blockcell_agent::memory_system::{evaluate_memory_hooks, MemorySystem, MemorySystemConfig};
     use blockcell_agent::session_memory::{
         should_extract_memory, SessionMemoryConfig, SessionMemoryState,
     };

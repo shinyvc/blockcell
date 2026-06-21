@@ -51,7 +51,7 @@ async fn test_dream_prompt_prefers_relative_memory_paths() {
 
 #[test]
 fn test_dream_forked_agent_turn_budget_allows_recovery_from_exploration() {
-    assert!(DREAM_FORKED_AGENT_MAX_TURNS >= 16);
+    const { assert!(DREAM_FORKED_AGENT_MAX_TURNS >= 16) };
 }
 
 #[test]

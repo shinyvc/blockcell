@@ -20,10 +20,10 @@ impl DreamConsolidator {
 
         // 构建整合提示（包含收集的信号）
         fs::create_dir_all(&memory_dir).await?;
-        let prompt = self.build_consolidation_prompt(&memory_dir, signals);
+        let prompt = self.build_consolidation_prompt(memory_dir, signals);
 
         // 创建工具权限检查
-        let can_use_tool = create_dream_can_use_tool(&memory_dir);
+        let can_use_tool = create_dream_can_use_tool(memory_dir);
 
         // 创建 CacheSafeParams（使用默认系统提示）
         let cache_safe_params = CacheSafeParams::default();

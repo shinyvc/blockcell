@@ -9,20 +9,16 @@ use tracing::{info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum HookEvent {
     PreToolUse,
     PostToolUse,
     SessionStart,
     SessionEnd,
+    #[default]
     UserPrompt,
     AgentStop,
     Compaction,
-}
-
-impl Default for HookEvent {
-    fn default() -> Self {
-        Self::UserPrompt
-    }
 }
 
 impl HookEvent {

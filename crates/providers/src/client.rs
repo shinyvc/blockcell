@@ -232,7 +232,7 @@ mod tests {
             &[],
             "https://api.openai.com/v1",
         );
-        matches!(r, ProxyResolution::UseProxy(url) if url == "http://provider-proxy:8080");
+        assert!(matches!(r, ProxyResolution::UseProxy(url) if url == "http://provider-proxy:8080"));
     }
 
     #[test]

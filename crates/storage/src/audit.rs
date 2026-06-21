@@ -205,6 +205,7 @@ impl AuditLogger {
         self.write_event(event)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn log_provider_call(
         &mut self,
         session_key: &str,

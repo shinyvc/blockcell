@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn test_tiered_schemas_keep_web_fetch_full_parameters() {
         let reg = ToolRegistry::with_defaults();
-        let schemas = reg.get_tiered_schemas(&["web_fetch"], global_core_tool_names());
+        let schemas = reg.get_tiered_schemas(&["web_fetch"], GLOBAL_CORE_TOOL_NAMES);
 
         assert_eq!(schemas.len(), 1);
         let properties = schemas[0]["function"]["parameters"]["properties"]
@@ -538,7 +538,7 @@ mod tests {
     #[test]
     fn test_tiered_schemas_keep_required_param_tools_full() {
         let reg = ToolRegistry::with_defaults();
-        let schemas = reg.get_tiered_schemas(&["write_file"], global_core_tool_names());
+        let schemas = reg.get_tiered_schemas(&["write_file"], GLOBAL_CORE_TOOL_NAMES);
 
         assert_eq!(schemas.len(), 1);
         let properties = schemas[0]["function"]["parameters"]["properties"]
@@ -552,7 +552,7 @@ mod tests {
     fn test_tiered_schemas_still_keep_no_required_tools_lightweight() {
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(NoRequiredTool));
-        let schemas = reg.get_tiered_schemas(&["no_required_tool"], global_core_tool_names());
+        let schemas = reg.get_tiered_schemas(&["no_required_tool"], GLOBAL_CORE_TOOL_NAMES);
 
         assert_eq!(schemas.len(), 1);
         let properties = schemas[0]["function"]["parameters"]["properties"]

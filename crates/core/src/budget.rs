@@ -201,7 +201,7 @@ pub type BudgetTrackerHandle = Arc<BudgetTracker>;
 fn format_micro_usd(value: u64) -> String {
     let usd = value / MICRO_USD_PER_USD;
     let micros = value % MICRO_USD_PER_USD;
-    if micros % MICRO_USD_PER_CENT == 0 {
+    if micros.is_multiple_of(MICRO_USD_PER_CENT) {
         format!("${}.{:02}", usd, micros / MICRO_USD_PER_CENT)
     } else {
         format!("${}.{:06}", usd, micros)
