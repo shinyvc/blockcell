@@ -5,7 +5,7 @@
 use super::{canonical_or_normalized, is_path_within_base, ConfirmRequest};
 use blockcell_core::path_policy::{PathOp, PolicyAction};
 use blockcell_core::InboundMessage;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tracing::{info, warn};
 
 impl super::AgentRuntime {
@@ -141,6 +141,18 @@ impl super::AgentRuntime {
         msg: &InboundMessage,
     ) -> bool {
         if matches!(tool_name, "exec_local" | "exec_skill_script") {
+            // These run scripts addressed relative to the active skill
+            // directory, so the generic workspace policy doesn't apply. Still
+            // enforce — at the runtime layer — that the script path is a safe
+            // relative path that cannot escape the skill scope.
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if !is_safe_relative_skill_path(path) {
+                warn!(
+                    tool = tool_name,
+                    path, "Rejecting exec script path that escapes skill scope"
+                );
+                return false;
+            }
             return true;
         }
         let raw_paths = self.extract_paths(tool_name, args);
@@ -331,9 +343,49 @@ fn extract_command_paths(command: &str) -> Vec<String> {
     out
 }
 
+/// Whether `path` is a non-empty relative path that stays inside the active
+/// skill directory (no absolute paths, no `..` traversal). Mirrors the
+/// `exec_local`/`exec_skill_script` tools' own validation as defense in depth.
+fn is_safe_relative_skill_path(path: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return false;
+    }
+    !candidate.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::extract_command_paths;
+    use super::{extract_command_paths, is_safe_relative_skill_path};
+
+    #[test]
+    fn accepts_safe_relative_skill_paths() {
+        for p in ["scripts/hello.sh", "main.py", "./run.sh", "a/b/c.py"] {
+            assert!(is_safe_relative_skill_path(p), "expected `{p}` accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_absolute_or_escaping_skill_paths() {
+        for p in [
+            "",
+            "   ",
+            "/etc/passwd",
+            "../secret.sh",
+            "scripts/../../etc/passwd",
+        ] {
+            assert!(!is_safe_relative_skill_path(p), "expected `{p}` rejected");
+        }
+    }
 
     #[test]
     fn extracts_absolute_and_home_paths() {
