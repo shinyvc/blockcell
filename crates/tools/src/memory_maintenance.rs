@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use tracing::{debug, info};
 
-use crate::memory::looks_like_ghost_maintenance_log;
+use crate::memory::{looks_like_ghost_maintenance_log, run_store_blocking};
 use crate::Tool;
 use crate::ToolContext;
 use crate::ToolSchema;
@@ -332,7 +332,8 @@ impl Tool for MemoryMaintenanceTool {
         let store = ctx
             .memory_store
             .as_ref()
-            .ok_or_else(|| blockcell_core::Error::Tool("Memory store not available".into()))?;
+            .ok_or_else(|| blockcell_core::Error::Tool("Memory store not available".into()))?
+            .clone();
 
         match action {
             "garden" => {
@@ -343,65 +344,68 @@ impl Tool for MemoryMaintenanceTool {
                     "Memory garden: scanning recent memories"
                 );
 
-                let prune_report = prune_ghost_maintenance_logs(store, dry_run)?;
-                let junk_report = sweep_junk_short_term(store, 30, dry_run)?;
+                run_store_blocking(move || {
+                    let prune_report = prune_ghost_maintenance_logs(&store, dry_run)?;
+                    let junk_report = sweep_junk_short_term(&store, 30, dry_run)?;
 
-                // Query recent short-term memories for batch long-term maintenance.
-                let query_params = json!({
-                    "scope": "short_term",
-                    "time_range_days": days,
-                    "top_k": 100
-                });
-                let recent = store.query_json(query_params)?;
-                let items = recent.as_array().map(|a| a.len()).unwrap_or(0);
+                    // Query recent short-term memories for batch long-term maintenance.
+                    let query_params = json!({
+                        "scope": "short_term",
+                        "time_range_days": days,
+                        "top_k": 100
+                    });
+                    let recent = store.query_json(query_params)?;
+                    let items = recent.as_array().map(|a| a.len()).unwrap_or(0);
 
-                // Query existing long-term memories so the model can avoid duplicates and
-                // merge stable facts using memory_upsert dedup keys.
-                let lt_params = json!({
-                    "scope": "long_term",
-                    "top_k": 50
-                });
-                let long_term = store.query_json(lt_params)?;
-                let lt_count = long_term.as_array().map(|a| a.len()).unwrap_or(0);
+                    // Query existing long-term memories so the model can avoid duplicates and
+                    // merge stable facts using memory_upsert dedup keys.
+                    let lt_params = json!({
+                        "scope": "long_term",
+                        "top_k": 50
+                    });
+                    let long_term = store.query_json(lt_params)?;
+                    let lt_count = long_term.as_array().map(|a| a.len()).unwrap_or(0);
 
-                // Get stats
-                let stats = store.stats_json()?;
+                    // Get stats
+                    let stats = store.stats_json()?;
 
-                if dry_run {
-                    return Ok(json!({
+                    if dry_run {
+                        return Ok(json!({
+                            "action": "garden",
+                            "dry_run": true,
+                            "prune": prune_report,
+                            "junk_sweep": junk_report,
+                            "recent_short_term_count": items,
+                            "existing_long_term_count": lt_count,
+                            "stats": stats,
+                            "note": "Would scan recent short-term memory, maintain long-term memory, and remove trivial entries."
+                        }));
+                    }
+
+                    // Run maintenance (TTL cleanup + recycle bin purge)
+                    let (expired, purged) = store.maintenance(30)?;
+
+                    debug!(
+                        recent = items,
+                        expired = expired,
+                        purged = purged,
+                        "Memory garden complete"
+                    );
+
+                    Ok(json!({
                         "action": "garden",
-                        "dry_run": true,
                         "prune": prune_report,
                         "junk_sweep": junk_report,
-                        "recent_short_term_count": items,
-                        "existing_long_term_count": lt_count,
-                        "stats": stats,
-                        "note": "Would scan recent short-term memory, maintain long-term memory, and remove trivial entries."
-                    }));
-                }
-
-                // Run maintenance (TTL cleanup + recycle bin purge)
-                let (expired, purged) = store.maintenance(30)?;
-
-                debug!(
-                    recent = items,
-                    expired = expired,
-                    purged = purged,
-                    "Memory garden complete"
-                );
-
-                Ok(json!({
-                    "action": "garden",
-                    "prune": prune_report,
-                    "junk_sweep": junk_report,
-                    "recent_memories_scanned": items,
-                    "existing_long_term": lt_count,
-                    "expired_cleaned": expired,
-                    "recycle_purged": purged,
-                    "recent_memories": recent,
-                    "long_term_memories": long_term,
-                    "instruction": "Review recent_memories and long_term_memories. Promote only stable user preferences, project facts, recurring patterns, and durable lessons by calling memory_upsert with scope='long_term' and a dedup_key. Delete trivial, expired, or duplicate short-term entries with memory_forget. Do not create skills here; skills are handled by Ghost Learning."
-                }))
+                        "recent_memories_scanned": items,
+                        "existing_long_term": lt_count,
+                        "expired_cleaned": expired,
+                        "recycle_purged": purged,
+                        "recent_memories": recent,
+                        "long_term_memories": long_term,
+                        "instruction": "Review recent_memories and long_term_memories. Promote only stable user preferences, project facts, recurring patterns, and durable lessons by calling memory_upsert with scope='long_term' and a dedup_key. Delete trivial, expired, or duplicate short-term entries with memory_forget. Do not create skills here; skills are handled by Ghost Learning."
+                    }))
+                })
+                .await
             }
 
             "cleanup" => {
@@ -410,73 +414,82 @@ impl Tool for MemoryMaintenanceTool {
                     "Memory cleanup: removing expired entries"
                 );
 
-                let prune_report = prune_ghost_maintenance_logs(store, dry_run)?;
-                let junk_report = sweep_junk_short_term(store, 30, dry_run)?;
+                run_store_blocking(move || {
+                    let prune_report = prune_ghost_maintenance_logs(&store, dry_run)?;
+                    let junk_report = sweep_junk_short_term(&store, 30, dry_run)?;
 
-                if dry_run {
-                    let stats = store.stats_json()?;
-                    return Ok(json!({
+                    if dry_run {
+                        let stats = store.stats_json()?;
+                        return Ok(json!({
+                            "action": "cleanup",
+                            "dry_run": true,
+                            "prune": prune_report,
+                            "junk_sweep": junk_report,
+                            "stats": stats,
+                            "note": "Would run TTL cleanup and purge recycle bin entries older than 30 days."
+                        }));
+                    }
+
+                    let (expired, purged) = store.maintenance(30)?;
+
+                    Ok(json!({
                         "action": "cleanup",
-                        "dry_run": true,
                         "prune": prune_report,
                         "junk_sweep": junk_report,
-                        "stats": stats,
-                        "note": "Would run TTL cleanup and purge recycle bin entries older than 30 days."
-                    }));
-                }
-
-                let (expired, purged) = store.maintenance(30)?;
-
-                Ok(json!({
-                    "action": "cleanup",
-                    "prune": prune_report,
-                    "junk_sweep": junk_report,
-                    "expired_cleaned": expired,
-                    "recycle_purged": purged,
-                    "status": "ok"
-                }))
+                        "expired_cleaned": expired,
+                        "recycle_purged": purged,
+                        "status": "ok"
+                    }))
+                })
+                .await
             }
 
             "stats" => {
-                let stats = store.stats_json()?;
-                let brief = store.generate_brief(10, 5)?;
+                run_store_blocking(move || {
+                    let stats = store.stats_json()?;
+                    let brief = store.generate_brief(10, 5)?;
 
-                Ok(json!({
-                    "action": "stats",
-                    "stats": stats,
-                    "brief_preview": brief,
-                    "health": "ok"
-                }))
+                    Ok(json!({
+                        "action": "stats",
+                        "stats": stats,
+                        "brief_preview": brief,
+                        "health": "ok"
+                    }))
+                })
+                .await
             }
 
             "compact" => {
                 info!(dry_run = dry_run, "Memory compact: merging duplicates");
 
-                // Query all long-term memories to find duplicates
-                let lt_params = json!({
-                    "scope": "long_term",
-                    "top_k": 200
-                });
-                let long_term = store.query_json(lt_params)?;
-                let items = long_term.as_array().map(|a| a.len()).unwrap_or(0);
+                run_store_blocking(move || {
+                    // Query all long-term memories to find duplicates
+                    let lt_params = json!({
+                        "scope": "long_term",
+                        "top_k": 200
+                    });
+                    let long_term = store.query_json(lt_params)?;
+                    let items = long_term.as_array().map(|a| a.len()).unwrap_or(0);
 
-                if dry_run {
-                    return Ok(json!({
+                    if dry_run {
+                        return Ok(json!({
+                            "action": "compact",
+                            "dry_run": true,
+                            "long_term_count": items,
+                            "note": "Would scan for duplicate/similar long-term memories and merge them."
+                        }));
+                    }
+
+                    // The actual merging is best done by the LLM (Ghost Agent) which can
+                    // understand semantic similarity. We return the data for it to process.
+                    Ok(json!({
                         "action": "compact",
-                        "dry_run": true,
-                        "long_term_count": items,
-                        "note": "Would scan for duplicate/similar long-term memories and merge them."
-                    }));
-                }
-
-                // The actual merging is best done by the LLM (Ghost Agent) which can
-                // understand semantic similarity. We return the data for it to process.
-                Ok(json!({
-                    "action": "compact",
-                    "long_term_memories": long_term,
-                    "count": items,
-                    "instruction": "Review the long_term_memories above. Find entries with similar or overlapping content. For duplicates, keep the most complete version and call memory_forget on the others. For related entries, merge them into a single comprehensive entry using memory_upsert with the same dedup_key."
-                }))
+                        "long_term_memories": long_term,
+                        "count": items,
+                        "instruction": "Review the long_term_memories above. Find entries with similar or overlapping content. For duplicates, keep the most complete version and call memory_forget on the others. For related entries, merge them into a single comprehensive entry using memory_upsert with the same dedup_key."
+                    }))
+                })
+                .await
             }
 
             _ => Err(blockcell_core::Error::Tool(format!(

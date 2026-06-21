@@ -23,6 +23,18 @@ fn get_memory_store(ctx: &ToolContext) -> Result<&crate::MemoryStoreHandle> {
         .ok_or_else(|| Error::Tool("Memory store not available".to_string()))
 }
 
+/// Run a synchronous (SQLite-backed) memory-store operation on a blocking
+/// thread so it never stalls the async runtime (see O3).
+pub(crate) async fn run_store_blocking<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| Error::Tool(format!("memory store task panicked: {}", e)))?
+}
+
 /// 判断文本是否像 Ghost Agent 维护日志
 ///
 /// 用于阻止 Ghost Agent 将自己的维护日志写入记忆存储。
@@ -279,7 +291,7 @@ impl Tool for MemoryQueryTool {
     }
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
-        let store = get_memory_store(&ctx)?;
+        let store = get_memory_store(&ctx)?.clone();
 
         // Stats mode
         if params
@@ -287,7 +299,7 @@ impl Tool for MemoryQueryTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
         {
-            return store.stats_json();
+            return run_store_blocking(move || store.stats_json()).await;
         }
 
         let query_params = json!({
@@ -300,7 +312,7 @@ impl Tool for MemoryQueryTool {
             "include_deleted": params.get("include_deleted").and_then(|v| v.as_bool()).unwrap_or(false),
         });
 
-        let results = store.query_json(query_params)?;
+        let results = run_store_blocking(move || store.query_json(query_params)).await?;
 
         // 当查询返回空数组时，添加明确提示避免 LLM 幻觉编造结果
         if results == json!([]) {
@@ -410,7 +422,7 @@ impl Tool for MemoryUpsertTool {
     }
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
-        let store = get_memory_store(&ctx)?;
+        let store = get_memory_store(&ctx)?.clone();
 
         let content = params
             .get("content")
@@ -480,7 +492,7 @@ impl Tool for MemoryUpsertTool {
             "expires_at": expires_at,
         });
 
-        let result = store.upsert_json(upsert_params)?;
+        let result = run_store_blocking(move || store.upsert_json(upsert_params)).await?;
 
         debug!(
             scope = scope,
@@ -556,7 +568,7 @@ impl Tool for MemoryForgetTool {
     }
 
     async fn execute(&self, ctx: ToolContext, params: Value) -> Result<Value> {
-        let store = get_memory_store(&ctx)?;
+        let store = get_memory_store(&ctx)?.clone();
         let action = params
             .get("action")
             .and_then(|v| v.as_str())
@@ -567,7 +579,11 @@ impl Tool for MemoryForgetTool {
                 let id = params.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
                     Error::Tool("Missing or non-string parameter: id".to_string())
                 })?;
-                let deleted = store.soft_delete(id)?;
+                let id = id.to_string();
+                let deleted = {
+                    let id = id.clone();
+                    run_store_blocking(move || store.soft_delete(&id)).await?
+                };
                 Ok(json!({
                     "action": "delete",
                     "id": id,
@@ -582,7 +598,8 @@ impl Tool for MemoryForgetTool {
                     "tags": params.get("tags").and_then(|v| v.as_str()),
                     "before_days": params.get("before_days").and_then(|v| v.as_i64()),
                 });
-                let count = store.batch_soft_delete_json(batch_params)?;
+                let count =
+                    run_store_blocking(move || store.batch_soft_delete_json(batch_params)).await?;
                 Ok(json!({
                     "action": "batch_delete",
                     "deleted_count": count,
@@ -593,7 +610,11 @@ impl Tool for MemoryForgetTool {
                 let id = params.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
                     Error::Tool("Missing or non-string parameter: id".to_string())
                 })?;
-                let restored = store.restore(id)?;
+                let id = id.to_string();
+                let restored = {
+                    let id = id.clone();
+                    run_store_blocking(move || store.restore(&id)).await?
+                };
                 Ok(json!({
                     "action": "restore",
                     "id": id,
