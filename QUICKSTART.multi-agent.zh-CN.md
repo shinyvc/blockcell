@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/blockcell-labs/blockcell/refs/heads
 
 ### 方式 B：源码编译
 
-必需：Rust 1.75+
+必需：Rust 1.85+
 
 ```bash
 cargo build -p blockcell --release

@@ -18,7 +18,7 @@ version = "0.1.6"
 edition = "2021"
 authors = ["blockcell"]
 license = "MIT"
-rust-version = "1.82"
+rust-version = "1.85"
 
 [workspace.dependencies]
 # Async runtime

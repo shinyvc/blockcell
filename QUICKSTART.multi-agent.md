@@ -20,7 +20,7 @@ By default, this installs `blockcell` to `~/.local/bin`.
 
 ### Option B: Build from source
 
-Prereqs: Rust 1.75+
+Prereqs: Rust 1.85+
 
 ```bash
 cargo build -p blockcell --release
