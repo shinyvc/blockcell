@@ -81,6 +81,7 @@ impl IntentCategory {
     }
 }
 
+#[derive(Clone)]
 struct IntentRule {
     category: IntentCategory,
     /// 内置规则的关键词（静态字符串）
@@ -115,6 +116,7 @@ impl Default for IntentRule {
     }
 }
 
+#[derive(Clone)]
 pub struct IntentClassifier {
     rules: Vec<IntentRule>,
 }
@@ -447,7 +449,9 @@ impl IntentClassifier {
     /// 配置规则始终在内置规则之后追加，优先级由配置中的 priority 字段决定。
     /// 如果配置文件中出现重复 category，只会记录第一次，忽略后续重复项并发出警告。
     pub fn with_extra_rules(extra_rules: &[blockcell_core::config::IntentRuleConfig]) -> Self {
-        let mut classifier = Self::new();
+        // 克隆全局单例，复用已编译的内置正则（Regex 克隆是廉价的 Arc 引用计数），
+        // 避免每条消息重新编译数十个内置正则。
+        let mut classifier = Self::global().clone();
         // 用 String 而非 &IntentCategory 引用，避免 borrow 冲突
         let mut seen_extra_categories: std::collections::HashSet<String> =
             std::collections::HashSet::new();

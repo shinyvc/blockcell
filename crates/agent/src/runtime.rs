@@ -22,7 +22,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
@@ -1064,18 +1064,20 @@ fn expand_history_stubs_with_cache(
         .collect()
 }
 
+static FORCED_SKILL_REQUEST_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:使用(?:已安装的)?|用|调用|执行|use|using|run|call)\s*([A-Za-z0-9_.@-]+)\s*(?:技能|skill)\s*[：:\-，,]?\s*(.*)",
+    )
+    .expect("forced skill request regex is valid")
+});
+
 fn parse_spawn_task_forced_skill_request(task: &str) -> Option<(String, String)> {
     let trimmed = task.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let regex = Regex::new(
-        r"(?i)(?:使用(?:已安装的)?|用|调用|执行|use|using|run|call)\s*([A-Za-z0-9_.@-]+)\s*(?:技能|skill)\s*[：:\-，,]?\s*(.*)",
-    )
-    .ok()?;
-
-    let captures = regex.captures(trimmed)?;
+    let captures = FORCED_SKILL_REQUEST_RE.captures(trimmed)?;
     let skill_name = captures.get(1)?.as_str().trim().to_string();
     if skill_name.is_empty() {
         return None;
@@ -1768,9 +1770,18 @@ fn truncate_runtime_session_search_text(text: &str, max_chars: usize) -> String 
     }
 }
 
+static IMAGE_ABS_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(/[^\s`"']+\.(?i:jpg|jpeg|png|gif|webp|bmp))"#)
+        .expect("image abs path regex is valid")
+});
+static IMAGE_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"([A-Za-z0-9._-]+\.(?i:jpg|jpeg|png|gif|webp|bmp))"#)
+        .expect("image name regex is valid")
+});
+
 async fn pick_image_path(paths: &Paths, history: &[ChatMessage]) -> Option<String> {
-    let re_abs = Regex::new(r#"(/[^\s`"']+\.(?i:jpg|jpeg|png|gif|webp|bmp))"#).ok()?;
-    let re_name = Regex::new(r#"([A-Za-z0-9._-]+\.(?i:jpg|jpeg|png|gif|webp|bmp))"#).ok()?;
+    let re_abs = &*IMAGE_ABS_PATH_RE;
+    let re_name = &*IMAGE_NAME_RE;
 
     let media_dir = paths.media_dir();
 
@@ -1912,14 +1923,8 @@ fn extract_urls_from_search_result(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn is_dangerous_exec_command(command: &str) -> bool {
-    let c = command.to_lowercase();
-    let c = c.trim();
-    if c.is_empty() {
-        return false;
-    }
-
-    let direct_patterns = [
+static DANGEROUS_EXEC_DIRECT_RES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
         r"(^|[;&|]\s*|\b(?:sudo|env)\s+)(?:rm|trash|unlink)\b",
         r"(^|[;&|]\s*|\b(?:sudo|env)\s+)rmdir\b",
         r"\bfind\b[\s\S]*\s-delete\b",
@@ -1929,16 +1934,32 @@ fn is_dangerous_exec_command(command: &str) -> bool {
         r#"\bzsh\s+-c\s+['"][^'"]*\brm\b"#,
         r"\bpython(?:3)?\b[\s\S]*\b(?:shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir)\b",
         r"\bperl\b[\s\S]*\bunlink\b",
-    ];
-    for pattern in direct_patterns {
-        if let Ok(re) = Regex::new(pattern) {
-            if re.is_match(c) {
-                return true;
-            }
+    ]
+    .iter()
+    .map(|p| Regex::new(p).expect("dangerous exec direct regex is valid"))
+    .collect()
+});
+
+static DANGEROUS_EXEC_RM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(^|[;&|]\s*|\b(?:sudo|env)\s+)rm\b([^;&|]*)")
+        .expect("dangerous exec rm regex is valid")
+});
+
+fn is_dangerous_exec_command(command: &str) -> bool {
+    let c = command.to_lowercase();
+    let c = c.trim();
+    if c.is_empty() {
+        return false;
+    }
+
+    for re in DANGEROUS_EXEC_DIRECT_RES.iter() {
+        if re.is_match(c) {
+            return true;
         }
     }
 
-    if let Ok(rm_re) = Regex::new(r"(^|[;&|]\s*|\b(?:sudo|env)\s+)rm\b([^;&|]*)") {
+    {
+        let rm_re = &*DANGEROUS_EXEC_RM_RE;
         for caps in rm_re.captures_iter(c) {
             let suffix = caps.get(2).map(|m| m.as_str()).unwrap_or("");
             let has_recursive = suffix.contains(" -r")
