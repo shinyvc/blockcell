@@ -55,6 +55,13 @@ impl super::AgentRuntime {
                 if let Some(wd) = args.get("working_dir").and_then(|v| v.as_str()) {
                     paths.push(wd.to_string());
                 }
+                // Also subject filesystem paths referenced inside the command
+                // itself to the path policy, so built-in sensitive paths
+                // (~/.ssh, /etc, ...) are enforced for `exec`, not just for
+                // its working directory.
+                if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                    paths.extend(extract_command_paths(cmd));
+                }
             }
             _ => {}
         }
@@ -292,5 +299,75 @@ impl super::AgentRuntime {
             );
             false
         }
+    }
+}
+
+/// Heuristically extract filesystem-path-looking tokens from a shell command.
+///
+/// Used to subject paths referenced inside an `exec` command to the path
+/// policy. This is intentionally conservative: when in doubt a token is
+/// treated as a path, so the policy (deny / confirm) gets a chance to run.
+/// Flags (`-x`), URLs (`scheme://...`), and `key=value` tokens are skipped.
+fn extract_command_paths(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in command.split_whitespace() {
+        let tok = raw.trim_matches(|c| c == '"' || c == '\'');
+        if tok.is_empty() || tok.starts_with('-') {
+            continue;
+        }
+        if tok.contains("://") {
+            continue;
+        }
+        let looks_like_path = tok.starts_with('/')
+            || tok.starts_with("~/")
+            || tok == "~"
+            || tok.starts_with("./")
+            || tok.starts_with("../")
+            || (tok.contains('/') && !tok.contains('='));
+        if looks_like_path {
+            out.push(tok.to_string());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_command_paths;
+
+    #[test]
+    fn extracts_absolute_and_home_paths() {
+        assert_eq!(
+            extract_command_paths("cat /etc/shadow"),
+            vec!["/etc/shadow".to_string()]
+        );
+        assert_eq!(
+            extract_command_paths("cat ~/.ssh/id_rsa"),
+            vec!["~/.ssh/id_rsa".to_string()]
+        );
+        assert_eq!(
+            extract_command_paths("cp 'a' \"/etc/hosts\""),
+            vec!["/etc/hosts".to_string()]
+        );
+    }
+
+    #[test]
+    fn extracts_relative_paths_with_slash() {
+        assert_eq!(
+            extract_command_paths("python src/main.py"),
+            vec!["src/main.py".to_string()]
+        );
+        assert_eq!(
+            extract_command_paths("ls ./build ../out"),
+            vec!["./build".to_string(), "../out".to_string()]
+        );
+    }
+
+    #[test]
+    fn skips_flags_urls_and_kv_and_bare_words() {
+        assert!(extract_command_paths("ls -la").is_empty());
+        assert!(extract_command_paths("echo hello world").is_empty());
+        assert!(extract_command_paths("curl https://example.com/x").is_empty());
+        assert!(extract_command_paths("git log --format=%H").is_empty());
     }
 }
