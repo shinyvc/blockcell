@@ -18,6 +18,20 @@ static AUDIT_WRITE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuditEvent {
+    SessionStart {
+        session_key: String,
+        provider: String,
+        model: String,
+        channel: String,
+        timestamp_ms: i64,
+    },
+    SessionEnd {
+        session_key: String,
+        turns: u32,
+        total_tokens: u64,
+        total_cost_cents: u64,
+        timestamp_ms: i64,
+    },
     ToolCall {
         tool_name: String,
         params: serde_json::Value,
@@ -33,6 +47,24 @@ pub enum AuditEvent {
         matched_rule: Option<String>,
         description: Option<String>,
         simulated: bool,
+        timestamp_ms: i64,
+        session_key: String,
+    },
+    ProviderCall {
+        provider: String,
+        model: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_cents: u64,
+        duration_ms: u64,
+        timestamp_ms: i64,
+        session_key: String,
+    },
+    BudgetEvent {
+        event_kind: String,
+        usage_ratio: f64,
+        tokens_used: u64,
+        cost_cents: u64,
         timestamp_ms: i64,
         session_key: String,
     },
@@ -95,6 +127,42 @@ impl AuditLogger {
         self.session_id = session_id.to_string();
     }
 
+    pub fn log_session_start(
+        &mut self,
+        session_key: &str,
+        provider: &str,
+        model: &str,
+        channel: &str,
+    ) -> Result<()> {
+        self.set_session_id(session_key);
+        let event = AuditEvent::SessionStart {
+            session_key: session_key.to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            channel: channel.to_string(),
+            timestamp_ms: Utc::now().timestamp_millis(),
+        };
+        self.write_event(event)
+    }
+
+    pub fn log_session_end(
+        &mut self,
+        session_key: &str,
+        turns: u32,
+        total_tokens: u64,
+        total_cost_cents: u64,
+    ) -> Result<()> {
+        self.set_session_id(session_key);
+        let event = AuditEvent::SessionEnd {
+            session_key: session_key.to_string(),
+            turns,
+            total_tokens,
+            total_cost_cents,
+            timestamp_ms: Utc::now().timestamp_millis(),
+        };
+        self.write_event(event)
+    }
+
     pub fn log_tool_call(
         &mut self,
         tool_name: &str,
@@ -131,6 +199,50 @@ impl AuditLogger {
             matched_rule,
             description,
             simulated,
+            timestamp_ms: Utc::now().timestamp_millis(),
+            session_key: session_key.to_string(),
+        };
+        self.write_event(event)
+    }
+
+    pub fn log_provider_call(
+        &mut self,
+        session_key: &str,
+        provider: &str,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_cents: u64,
+        duration_ms: u64,
+    ) -> Result<()> {
+        self.set_session_id(session_key);
+        let event = AuditEvent::ProviderCall {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            input_tokens,
+            output_tokens,
+            cost_cents,
+            duration_ms,
+            timestamp_ms: Utc::now().timestamp_millis(),
+            session_key: session_key.to_string(),
+        };
+        self.write_event(event)
+    }
+
+    pub fn log_budget_event(
+        &mut self,
+        session_key: &str,
+        event_kind: &str,
+        usage_ratio: f64,
+        tokens_used: u64,
+        cost_cents: u64,
+    ) -> Result<()> {
+        self.set_session_id(session_key);
+        let event = AuditEvent::BudgetEvent {
+            event_kind: event_kind.to_string(),
+            usage_ratio,
+            tokens_used,
+            cost_cents,
             timestamp_ms: Utc::now().timestamp_millis(),
             session_key: session_key.to_string(),
         };
@@ -523,6 +635,85 @@ mod tests {
             }
             _ => panic!("Expected PermissionDecision event"),
         }
+    }
+
+    #[test]
+    fn logs_session_provider_and_budget_audit_events() {
+        let temp_dir = TempDir::new().unwrap();
+        let paths = Paths::with_base(temp_dir.path().to_path_buf());
+        let mut logger = AuditLogger::new(paths.clone());
+
+        logger
+            .log_session_start("cli:session", "openai", "gpt-5.5", "cli")
+            .unwrap();
+        logger
+            .log_provider_call("cli:session", "openai", "gpt-5.5", 100, 25, 3, 250)
+            .unwrap();
+        logger
+            .log_budget_event("cli:session", "warning", 0.8, 1000, 12)
+            .unwrap();
+        logger.log_session_end("cli:session", 2, 125, 3).unwrap();
+
+        let events = logger.read_today().unwrap();
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            &events[0],
+            AuditEvent::SessionStart {
+                session_key,
+                provider,
+                model,
+                channel,
+                ..
+            } if session_key == "cli:session"
+                && provider == "openai"
+                && model == "gpt-5.5"
+                && channel == "cli"
+        ));
+        assert!(matches!(
+            &events[1],
+            AuditEvent::ProviderCall {
+                session_key,
+                provider,
+                model,
+                input_tokens: 100,
+                output_tokens: 25,
+                cost_cents: 3,
+                duration_ms: 250,
+                ..
+            } if session_key == "cli:session"
+                && provider == "openai"
+                && model == "gpt-5.5"
+        ));
+        assert!(matches!(
+            &events[2],
+            AuditEvent::BudgetEvent {
+                session_key,
+                event_kind,
+                usage_ratio,
+                tokens_used: 1000,
+                cost_cents: 12,
+                ..
+            } if session_key == "cli:session"
+                && event_kind == "warning"
+                && (*usage_ratio - 0.8).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            &events[3],
+            AuditEvent::SessionEnd {
+                session_key,
+                turns: 2,
+                total_tokens: 125,
+                total_cost_cents: 3,
+                ..
+            } if session_key == "cli:session"
+        ));
+
+        let log_file = paths
+            .audit_dir()
+            .join(format!("{}.jsonl", Utc::now().format("%Y-%m-%d")));
+        let result = AuditLogger::verify_chain(&log_file);
+        assert!(result.valid, "{:?}", result.errors);
+        assert_eq!(result.total_records, 4);
     }
 
     #[test]
