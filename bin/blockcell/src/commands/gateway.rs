@@ -53,7 +53,6 @@ use axum::{
 };
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
-use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use super::memory_store::open_memory_store;
 
@@ -91,9 +90,11 @@ fn create_skill_evolution_llm_provider(
 mod alerts;
 mod banner;
 mod capabilities;
+mod channel_ids;
 mod channels;
 mod chat;
 mod config_api;
+mod cors;
 mod cron;
 mod files;
 mod memory;
@@ -102,6 +103,7 @@ mod sessions;
 mod skills_install;
 mod streams;
 mod toggles;
+mod util;
 mod webhooks;
 mod websocket;
 mod webui;
@@ -109,9 +111,11 @@ mod webui;
 use alerts::*;
 use banner::*;
 use capabilities::*;
+use channel_ids::*;
 use channels::*;
 use chat::*;
 use config_api::*;
+use cors::*;
 use cron::*;
 use files::*;
 use memory::*;
@@ -120,6 +124,7 @@ use sessions::*;
 use skills_install::*;
 use streams::*;
 use toggles::*;
+use util::*;
 use webhooks::*;
 use websocket::*;
 use webui::*;
@@ -250,500 +255,10 @@ struct PendingWsConfirm {
     response_tx: tokio::sync::oneshot::Sender<bool>,
 }
 
-fn new_confirm_request_id() -> String {
-    format!("confirm_{}", uuid::Uuid::new_v4().simple())
-}
-
-fn retain_active_progress_throttle_entries<F>(
-    forwarded: &mut HashMap<String, u8>,
-    mut status_for_task: F,
-) where
-    F: FnMut(&str) -> Option<blockcell_agent::task_manager::TaskStatus>,
-{
-    forwarded.retain(|task_id, _| {
-        status_for_task(task_id)
-            .as_ref()
-            .is_some_and(|status| !blockcell_agent::task_manager::is_terminal_status(status))
-    });
-}
-
-fn update_stage_progress_throttle(
-    forwarded: &mut HashMap<String, u8>,
-    task_id: &str,
-    percent: u8,
-    threshold: u8,
-    task_status: Option<&blockcell_agent::task_manager::TaskStatus>,
-) -> bool {
-    let terminal_or_missing = task_status
-        .map(blockcell_agent::task_manager::is_terminal_status)
-        .unwrap_or(true);
-    if terminal_or_missing {
-        forwarded.remove(task_id);
-        return percent >= 100 && task_status.is_some();
-    }
-
-    let should_forward = match forwarded.get(task_id) {
-        Some(&last) => percent.abs_diff(last) >= threshold,
-        None => true,
-    } || percent >= 100;
-
-    if percent >= 100 {
-        forwarded.remove(task_id);
-    } else if should_forward {
-        forwarded.insert(task_id.to_string(), percent);
-    }
-
-    should_forward
-}
-
 #[derive(Deserialize, Default)]
 pub(super) struct AgentScopedQuery {
     #[serde(default)]
     pub agent: Option<String>,
-}
-
-/// 格式化进度条（10 格宽度，用于 channel 进度转发）
-/// 使用四舍五入避免 1-9% 显示为空进度条
-fn format_progress_bar(percent: u8) -> String {
-    let clamped = percent.min(100);
-    // 四舍五入：(clamped * 10 + 50) / 100，5% 显示 1 格
-    let filled = ((clamped as usize * 10 + 50) / 100).min(10);
-    let empty = 10 - filled;
-    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
-}
-
-fn secure_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (&x, &y) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-fn url_decode(input: &str) -> Option<String> {
-    let mut out = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(' ');
-                i += 1;
-            }
-            b'%' => {
-                if i + 2 >= bytes.len() {
-                    return None;
-                }
-                let hi = bytes[i + 1];
-                let lo = bytes[i + 2];
-                let hex = |c: u8| -> Option<u8> {
-                    match c {
-                        b'0'..=b'9' => Some(c - b'0'),
-                        b'a'..=b'f' => Some(c - b'a' + 10),
-                        b'A'..=b'F' => Some(c - b'A' + 10),
-                        _ => None,
-                    }
-                };
-                let h = hex(hi)?;
-                let l = hex(lo)?;
-                out.push((h * 16 + l) as char);
-                i += 3;
-            }
-            c => {
-                out.push(c as char);
-                i += 1;
-            }
-        }
-    }
-    Some(out)
-}
-
-fn token_from_query(req: &Request<axum::body::Body>) -> Option<String> {
-    let q = req.uri().query()?;
-    for pair in q.split('&') {
-        let (k, v) = pair.split_once('=')?;
-
-        if k == "token" {
-            return url_decode(v);
-        }
-    }
-    None
-}
-
-fn validate_workspace_relative_path(path: &str) -> Result<std::path::PathBuf, String> {
-    if path.trim().is_empty() {
-        return Err("path is required".to_string());
-    }
-    let p = std::path::Path::new(path);
-    if p.is_absolute() {
-        return Err("absolute paths are not allowed".to_string());
-    }
-    let mut normalized = std::path::PathBuf::new();
-    for c in p.components() {
-        match c {
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(s) => normalized.push(s),
-            std::path::Component::ParentDir => {
-                return Err("path traversal (..) is not allowed".to_string());
-            }
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                return Err("invalid path".to_string());
-            }
-        }
-    }
-    if normalized.as_os_str().is_empty() {
-        return Err("invalid path".to_string());
-    }
-    Ok(normalized)
-}
-
-fn primary_pool_entry(config: &Config) -> Option<&blockcell_core::config::ModelEntry> {
-    config
-        .agents
-        .defaults
-        .model_pool
-        .iter()
-        .min_by(|a, b| a.priority.cmp(&b.priority).then(b.weight.cmp(&a.weight)))
-}
-
-fn active_model_and_provider(config: &Config) -> (String, Option<String>, &'static str) {
-    if let Some(entry) = primary_pool_entry(config) {
-        return (
-            entry.model.clone(),
-            Some(entry.provider.clone()),
-            "modelPool",
-        );
-    }
-
-    (
-        config.agents.defaults.model.clone(),
-        config.agents.defaults.provider.clone(),
-        "agents.defaults",
-    )
-}
-
-const EXTERNAL_CHANNELS: [&str; 11] = [
-    "telegram", "whatsapp", "feishu", "slack", "discord", "dingtalk", "wecom", "lark", "qq",
-    "napcat", "weixin",
-];
-
-fn known_channel_account_ids(config: &Config, channel: &str) -> Vec<String> {
-    let mut ids = match channel {
-        "telegram" => config
-            .channels
-            .telegram
-            .accounts
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
-        "whatsapp" => config
-            .channels
-            .whatsapp
-            .accounts
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
-        "feishu" => config
-            .channels
-            .feishu
-            .accounts
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
-        "slack" => config
-            .channels
-            .slack
-            .accounts
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
-        "discord" => config
-            .channels
-            .discord
-            .accounts
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
-        "dingtalk" => config
-            .channels
-            .dingtalk
-            .accounts
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
-        "wecom" => config
-            .channels
-            .wecom
-            .accounts
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
-        "lark" => config
-            .channels
-            .lark
-            .accounts
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
-        "weixin" => config
-            .channels
-            .weixin
-            .accounts
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
-        "qq" => config
-            .channels
-            .qq
-            .accounts
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
-        "napcat" => config
-            .channels
-            .napcat
-            .accounts
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
-    ids.sort();
-    ids
-}
-
-fn enabled_channel_account_ids(config: &Config, channel: &str) -> Vec<String> {
-    let mut ids = match channel {
-        "telegram" => config
-            .channels
-            .telegram
-            .accounts
-            .iter()
-            .filter(|(_, account)| account.enabled && !account.token.trim().is_empty())
-            .map(|(account_id, _)| account_id.clone())
-            .collect::<Vec<_>>(),
-        "whatsapp" => config
-            .channels
-            .whatsapp
-            .accounts
-            .iter()
-            .filter(|(_, account)| account.enabled && !account.bridge_url.trim().is_empty())
-            .map(|(account_id, _)| account_id.clone())
-            .collect::<Vec<_>>(),
-        "feishu" => config
-            .channels
-            .feishu
-            .accounts
-            .iter()
-            .filter(|(_, account)| account.enabled && !account.app_id.trim().is_empty())
-            .map(|(account_id, _)| account_id.clone())
-            .collect::<Vec<_>>(),
-        "slack" => config
-            .channels
-            .slack
-            .accounts
-            .iter()
-            .filter(|(_, account)| account.enabled && !account.bot_token.trim().is_empty())
-            .map(|(account_id, _)| account_id.clone())
-            .collect::<Vec<_>>(),
-        "discord" => config
-            .channels
-            .discord
-            .accounts
-            .iter()
-            .filter(|(_, account)| account.enabled && !account.bot_token.trim().is_empty())
-            .map(|(account_id, _)| account_id.clone())
-            .collect::<Vec<_>>(),
-        "dingtalk" => config
-            .channels
-            .dingtalk
-            .accounts
-            .iter()
-            .filter(|(_, account)| account.enabled && !account.app_key.trim().is_empty())
-            .map(|(account_id, _)| account_id.clone())
-            .collect::<Vec<_>>(),
-        "wecom" => config
-            .channels
-            .wecom
-            .accounts
-            .iter()
-            .filter(|(_, account)| account.enabled && !account.corp_id.trim().is_empty())
-            .map(|(account_id, _)| account_id.clone())
-            .collect::<Vec<_>>(),
-        "lark" => config
-            .channels
-            .lark
-            .accounts
-            .iter()
-            .filter(|(_, account)| account.enabled && !account.app_id.trim().is_empty())
-            .map(|(account_id, _)| account_id.clone())
-            .collect::<Vec<_>>(),
-        "weixin" => config
-            .channels
-            .weixin
-            .accounts
-            .iter()
-            .filter(|(_, account)| account.enabled && !account.token.trim().is_empty())
-            .map(|(account_id, _)| account_id.clone())
-            .collect::<Vec<_>>(),
-        "qq" => config
-            .channels
-            .qq
-            .accounts
-            .iter()
-            .filter(|(_, account)| account.enabled && !account.app_id.trim().is_empty())
-            .map(|(account_id, _)| account_id.clone())
-            .collect::<Vec<_>>(),
-        "napcat" => config
-            .channels
-            .napcat
-            .accounts
-            .iter()
-            .filter(|(_, account)| {
-                account.enabled
-                    && account
-                        .ws_url
-                        .as_ref()
-                        .map(|s| !s.trim().is_empty())
-                        .unwrap_or(false)
-            })
-            .map(|(account_id, _)| account_id.clone())
-            .collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
-    ids.sort();
-    ids
-}
-
-fn validate_channel_owner_bindings(config: &Config) -> anyhow::Result<()> {
-    for channel in EXTERNAL_CHANNELS {
-        let account_owner_bindings = config.channel_account_owners.get(channel);
-        let known_account_ids = known_channel_account_ids(config, channel);
-
-        if let Some(bindings) = account_owner_bindings {
-            for (account_id, owner) in bindings {
-                let account_id = account_id.trim();
-                let owner = owner.trim();
-                if account_id.is_empty() {
-                    return Err(anyhow::anyhow!(
-                        "Channel '{}' has an empty account id in channelAccountOwners.",
-                        channel
-                    ));
-                }
-                if owner.is_empty() {
-                    return Err(anyhow::anyhow!(
-                        "Channel '{}' account '{}' has a blank owner agent.",
-                        channel,
-                        account_id
-                    ));
-                }
-                if !known_account_ids.iter().any(|id| id == account_id) {
-                    return Err(anyhow::anyhow!(
-                        "Channel '{}' account '{}' is not defined under channels.{}.accounts.",
-                        channel,
-                        account_id,
-                        channel
-                    ));
-                }
-                if !config.agent_exists(owner) {
-                    return Err(anyhow::anyhow!(
-                        "Channel '{}' account owner '{}' does not exist in agents.list.",
-                        channel,
-                        owner
-                    ));
-                }
-            }
-        }
-
-        if !config.is_external_channel_enabled(channel) {
-            continue;
-        }
-
-        if let Some(owner) = config.resolve_channel_owner(channel) {
-            if !config.agent_exists(owner) {
-                return Err(anyhow::anyhow!(
-                    "Channel '{}' owner '{}' does not exist in agents.list.",
-                    channel,
-                    owner
-                ));
-            }
-            continue;
-        }
-
-        let enabled_account_ids = enabled_channel_account_ids(config, channel);
-        if enabled_account_ids.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Channel '{}' is enabled but has no owner agent. Set channelOwners.{} in config.",
-                channel,
-                channel
-            ));
-        }
-
-        for account_id in enabled_account_ids {
-            if config
-                .resolve_channel_account_owner(channel, &account_id)
-                .is_none()
-            {
-                return Err(anyhow::anyhow!(
-                    "Channel '{}' is enabled but missing owner binding for enabled account '{}'. Set channelAccountOwners.{}.{} or channelOwners.{}.",
-                    channel,
-                    account_id,
-                    channel,
-                    account_id,
-                    channel
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn is_internal_channel(channel: &str) -> bool {
-    matches!(
-        channel,
-        "ws" | "cli" | "cron" | "system" | "subagent" | "heartbeat" | "ghost"
-    )
-}
-
-fn metadata_route_agent_id(msg: &InboundMessage) -> Option<String> {
-    msg.metadata
-        .get("route_agent_id")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn resolve_runtime_agent_id(config: &Config, msg: &InboundMessage) -> Option<String> {
-    if let Some(agent_id) = metadata_route_agent_id(msg) {
-        return config.agent_exists(&agent_id).then_some(agent_id);
-    }
-
-    if is_internal_channel(&msg.channel) {
-        return Some("default".to_string());
-    }
-
-    let owner = config.resolve_effective_channel_owner(&msg.channel, msg.account_id.as_deref())?;
-    config.agent_exists(owner).then(|| owner.to_string())
-}
-
-fn resolve_requested_agent_id(
-    config: &Config,
-    requested: Option<&str>,
-) -> std::result::Result<String, String> {
-    let agent_id = requested
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("default");
-
-    if config.agent_exists(agent_id) {
-        Ok(agent_id.to_string())
-    } else {
-        Err(format!("Unknown agent '{}'", agent_id))
-    }
 }
 
 fn memory_store_for_agent(
@@ -770,25 +285,6 @@ fn cron_service_for_agent(
         .cloned()
         .ok_or_else(|| format!("Cron service not available for agent '{}'", agent_id))?;
     Ok((agent_id, service))
-}
-
-fn with_route_agent_id(mut msg: InboundMessage, agent_id: &str) -> InboundMessage {
-    let mut metadata = if msg.metadata.is_object() {
-        msg.metadata
-    } else {
-        serde_json::json!({})
-    };
-
-    if let Some(obj) = metadata.as_object_mut() {
-        obj.insert("route_agent_id".to_string(), serde_json::json!(agent_id));
-        if !is_internal_channel(&msg.channel) {
-            obj.entry("route_match_level".to_string())
-                .or_insert_with(|| serde_json::json!("channel_owner"));
-        }
-    }
-
-    msg.metadata = metadata;
-    msg
 }
 
 fn open_agent_memory_store(paths: &Paths, config: &Config) -> Option<MemoryStoreHandle> {
@@ -2406,35 +1902,6 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
 
     info!("Gateway stopped");
     Ok(())
-}
-
-/// 构建 API CORS 层。
-///
-/// 如果配置了 `gateway.allowed_origins`，使用配置的源列表；
-/// 否则回退到宽松策略（适用于本地/信任网络环境）。
-fn build_api_cors_layer(config: &Config) -> CorsLayer {
-    let origins = &config.gateway.allowed_origins;
-    if origins.is_empty() {
-        // 未配置 allowed_origins，使用宽松策略减少用户配置负担
-        CorsLayer::permissive().allow_credentials(false)
-    } else {
-        // 使用配置的 allowed_origins 列表
-        // axum::http 重导出了 http crate 的类型
-        let origin_list: Vec<axum::http::HeaderValue> =
-            origins.iter().filter_map(|o| o.parse().ok()).collect();
-        CorsLayer::new()
-            .allow_origin(AllowOrigin::list(origin_list))
-            .allow_credentials(false)
-    }
-}
-
-/// 构建 WebUI CORS 层。
-///
-/// 如果配置了 `gateway.allowed_origins`，使用配置的源列表；
-/// 否则回退到宽松策略（WebUI 通常在同机或内网访问）。
-fn build_webui_cors_layer(config: &Config) -> CorsLayer {
-    // WebUI 与 API 共用相同的 CORS 策略
-    build_api_cors_layer(config)
 }
 
 #[cfg(test)]

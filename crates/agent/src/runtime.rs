@@ -71,6 +71,7 @@ mod lightweight_handle;
 mod message_dispatch;
 mod message_task;
 mod process_message_inner;
+mod process_message_phases;
 mod run_loop;
 mod skill_session;
 mod subagent;
