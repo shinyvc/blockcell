@@ -8,8 +8,11 @@
 //! - DeepSeek, Claude, and other OpenAI-compatible models
 
 use blockcell_core::types::ChatMessage;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 
 /// Global tiktoken encoder using cl100k_base (GPT-3.5-turbo, GPT-4).
 ///
@@ -101,8 +104,50 @@ pub(crate) fn estimate_thinking_tokens(msg: &ChatMessage) -> usize {
         .unwrap_or(0)
 }
 
-/// Estimate tokens for a single ChatMessage (content + tool_calls + thinking overhead).
-pub(crate) fn estimate_message_tokens(msg: &ChatMessage) -> usize {
+/// Process-wide, bounded memoization cache for per-message token counts.
+///
+/// Keyed by a 64-bit fingerprint of the message's token-relevant fields
+/// (role + content + reasoning + tool calls). Chat messages are effectively
+/// immutable once created, so a content fingerprint stays correct even if a
+/// message is later mutated in place — a changed message simply produces a new
+/// fingerprint and is recomputed. This turns the repeated full-history tiktoken
+/// re-encoding done on every agent loop iteration into cheap fingerprint hashing
+/// plus a single encode per distinct message.
+static TOKEN_MEMO: LazyLock<Mutex<HashMap<u64, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Upper bound on cached entries. When exceeded the cache is cleared wholesale,
+/// keeping memory bounded for long-running processes (e.g. the gateway).
+const TOKEN_MEMO_CAP: usize = 16_384;
+
+/// Compute a cheap fingerprint of the token-relevant fields of a message.
+fn message_fingerprint(msg: &ChatMessage) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    msg.role.hash(&mut hasher);
+    match &msg.content {
+        serde_json::Value::String(s) => {
+            0u8.hash(&mut hasher);
+            s.hash(&mut hasher);
+        }
+        other => {
+            1u8.hash(&mut hasher);
+            other.to_string().hash(&mut hasher);
+        }
+    }
+    if let Some(reasoning) = msg.reasoning_content.as_ref() {
+        reasoning.hash(&mut hasher);
+    }
+    if let Some(calls) = msg.tool_calls.as_ref() {
+        for call in calls {
+            call.name.hash(&mut hasher);
+            call.arguments.to_string().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+/// Uncached per-message token estimation (content + tool_calls + thinking overhead).
+fn estimate_message_tokens_uncached(msg: &ChatMessage) -> usize {
     let content_tokens = match &msg.content {
         serde_json::Value::String(s) => estimate_tokens(s),
         serde_json::Value::Array(parts) => {
@@ -137,8 +182,32 @@ pub(crate) fn estimate_message_tokens(msg: &ChatMessage) -> usize {
 }
 
 /// Estimate the total token count for a slice of chat messages.
+///
+/// Acquires the memoization cache once for the whole slice (rather than once per
+/// message) so the common all-cached path costs a single lock plus per-message
+/// fingerprint hashing — avoiding the previous O(N) tiktoken re-encode on every
+/// agent loop iteration.
 pub(crate) fn estimate_messages_tokens(messages: &[ChatMessage]) -> usize {
-    messages.iter().map(estimate_message_tokens).sum()
+    let mut cache = TOKEN_MEMO
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= TOKEN_MEMO_CAP {
+        cache.clear();
+    }
+    let mut total = 0;
+    for msg in messages {
+        let fingerprint = message_fingerprint(msg);
+        let tokens = match cache.get(&fingerprint) {
+            Some(&tokens) => tokens,
+            None => {
+                let tokens = estimate_message_tokens_uncached(msg);
+                cache.insert(fingerprint, tokens);
+                tokens
+            }
+        };
+        total += tokens;
+    }
+    total
 }
 
 /// Check if tiktoken encoder is available.
@@ -176,8 +245,24 @@ mod tests {
     #[test]
     fn test_estimate_message_tokens_simple() {
         let msg = ChatMessage::user("测试消息");
-        let tokens = estimate_message_tokens(&msg);
+        let tokens = estimate_messages_tokens(std::slice::from_ref(&msg));
         assert!(tokens > 0);
+    }
+
+    #[test]
+    fn test_memoized_matches_uncached() {
+        // Cached batch estimate must equal the sum of uncached per-message estimates.
+        let messages = vec![
+            ChatMessage::user("hello 你好 world"),
+            ChatMessage::assistant("a longer assistant reply with some content"),
+            ChatMessage::tool_result("call_1", "{\"result\": [1, 2, 3]}"),
+        ];
+        let uncached: usize = messages.iter().map(estimate_message_tokens_uncached).sum();
+        let cached = estimate_messages_tokens(&messages);
+        // Run twice to exercise the cache-hit path.
+        let cached_again = estimate_messages_tokens(&messages);
+        assert_eq!(cached, uncached);
+        assert_eq!(cached_again, uncached);
     }
 
     #[test]

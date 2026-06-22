@@ -252,15 +252,17 @@ pub(crate) async fn deliver_subagent_result_to_origin(
     }
 }
 
-pub(crate) fn append_ephemeral_context_to_latest_user_message(
-    messages: &[ChatMessage],
+pub(crate) fn append_ephemeral_context_to_latest_user_message<'a>(
+    messages: &'a [ChatMessage],
     context_block: Option<&str>,
-) -> Vec<ChatMessage> {
+) -> std::borrow::Cow<'a, [ChatMessage]> {
     let Some(context_block) = context_block
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return messages.to_vec();
+        // No ephemeral context to inject (the common case): borrow the existing
+        // slice instead of deep-cloning the entire history on every LLM call.
+        return std::borrow::Cow::Borrowed(messages);
     };
     let mut api_messages = messages.to_vec();
     if let Some(message) = api_messages
@@ -271,7 +273,7 @@ pub(crate) fn append_ephemeral_context_to_latest_user_message(
         let base = chat_message_text(message);
         *message = ChatMessage::user(&format!("{}\n\n{}", base, context_block));
     }
-    api_messages
+    std::borrow::Cow::Owned(api_messages)
 }
 
 /// Build outbound metadata containing reply-to information from an inbound message.
