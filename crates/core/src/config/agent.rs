@@ -1,0 +1,218 @@
+//! Agent 默认值与多 agent 档案配置类型。
+//!
+//! 包含 AgentDefaults、AgentsConfig、AgentProfileConfig、ResolvedAgentConfig。
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+use super::{GhostConfig, ModelEntry, RoutingStrategy};
+
+fn is_default_routing_strategy(strategy: &RoutingStrategy) -> bool {
+    matches!(strategy, RoutingStrategy::Manual)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDefaults {
+    #[serde(default = "default_workspace")]
+    pub workspace: String,
+    #[serde(default = "default_model")]
+    pub model: String,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_max_tool_iterations")]
+    pub max_tool_iterations: u32,
+    /// Per-tool max iterations. If a tool name is not present, use max_tool_iterations as default.
+    #[serde(default)]
+    pub max_tool_iterations_by_tool: HashMap<String, u32>,
+    #[serde(default = "default_llm_max_retries")]
+    pub llm_max_retries: u32,
+    #[serde(default = "default_llm_retry_delay_ms")]
+    pub llm_retry_delay_ms: u64,
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: u32,
+    /// 显式指定 LLM provider（可选）
+    /// 如果不指定，将从 model 字符串前缀推断（如 "anthropic/claude-..."）
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// 自进化专用模型（如果为 None，则使用主模型）
+    /// 建议使用更便宜/更快的模型，避免与对话抢占并发
+    #[serde(default)]
+    pub evolution_model: Option<String>,
+    /// 自进化专用 provider（可选）
+    /// 如果不指定，将从 evolution_model 推断，或使用主 provider
+    #[serde(default)]
+    pub evolution_provider: Option<String>,
+    /// 多模型高可用池（可选）。
+    /// 配置后，系统将从池中按优先级+权重选取 provider，失败自动降级。
+    /// 若留空，则沿用旧的单 model + provider 配置（向后兼容）。
+    #[serde(default)]
+    pub model_pool: Vec<ModelEntry>,
+    /// ProviderPool routing strategy for this agent.
+    #[serde(default, skip_serializing_if = "is_default_routing_strategy")]
+    pub routing_strategy: RoutingStrategy,
+    /// Allowed MCP server names visible to this agent.
+    #[serde(default)]
+    pub allowed_mcp_servers: Vec<String>,
+    /// Allowed MCP tool names visible to this agent.
+    #[serde(default)]
+    pub allowed_mcp_tools: Vec<String>,
+    /// 推理强度控制（DeepSeek V4 thinking mode 等）：
+    /// - "off": 禁用思考 (thinking.type = disabled)
+    /// - "low"/"medium"/"high": reasoning_effort = high (DeepSeek 默认)
+    /// - "max": reasoning_effort = max (最深推理)
+    /// - None: 不发送任何参数，由 provider 自行决定
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+fn default_workspace() -> String {
+    "~/.blockcell/workspace".to_string()
+}
+
+fn default_model() -> String {
+    "deepseek-v4-pro".to_string()
+}
+
+fn default_max_tokens() -> u32 {
+    8192
+}
+
+fn default_temperature() -> f32 {
+    0.7
+}
+
+fn default_max_tool_iterations() -> u32 {
+    30
+}
+
+fn default_llm_max_retries() -> u32 {
+    3
+}
+
+fn default_llm_retry_delay_ms() -> u64 {
+    2000
+}
+
+fn default_max_context_tokens() -> u32 {
+    1_048_576 // 1M 上下文
+}
+
+impl Default for AgentDefaults {
+    fn default() -> Self {
+        Self {
+            workspace: default_workspace(),
+            model: default_model(),
+            max_tokens: default_max_tokens(),
+            temperature: default_temperature(),
+            max_tool_iterations: default_max_tool_iterations(),
+            max_tool_iterations_by_tool: HashMap::new(),
+            llm_max_retries: default_llm_max_retries(),
+            llm_retry_delay_ms: default_llm_retry_delay_ms(),
+            max_context_tokens: default_max_context_tokens(),
+            provider: None,
+            evolution_model: None,
+            evolution_provider: None,
+            model_pool: Vec::new(),
+            routing_strategy: RoutingStrategy::Manual,
+            allowed_mcp_servers: Vec::new(),
+            allowed_mcp_tools: Vec::new(),
+            reasoning_effort: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentsConfig {
+    #[serde(default)]
+    pub defaults: AgentDefaults,
+    #[serde(default)]
+    pub ghost: GhostConfig,
+    /// Optional multi-agent definitions.
+    /// If empty, runtime falls back to a single implicit "default" agent.
+    #[serde(default)]
+    pub list: Vec<AgentProfileConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProfileConfig {
+    pub id: String,
+    #[serde(default = "default_agent_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub intent_profile: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model_pool: Vec<ModelEntry>,
+    #[serde(default)]
+    pub routing_strategy: Option<RoutingStrategy>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_tool_iterations: Option<u32>,
+    #[serde(default)]
+    pub max_tool_iterations_by_tool: HashMap<String, u32>,
+    #[serde(default)]
+    pub llm_max_retries: Option<u32>,
+    #[serde(default)]
+    pub llm_retry_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub max_context_tokens: Option<u32>,
+    #[serde(default)]
+    pub evolution_model: Option<String>,
+    #[serde(default)]
+    pub evolution_provider: Option<String>,
+    #[serde(default)]
+    pub allowed_mcp_servers: Option<Vec<String>>,
+    #[serde(default)]
+    pub allowed_mcp_tools: Option<Vec<String>>,
+}
+
+fn default_agent_enabled() -> bool {
+    true
+}
+
+impl Default for AgentProfileConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            enabled: true,
+            name: None,
+            intent_profile: None,
+            model: None,
+            provider: None,
+            model_pool: Vec::new(),
+            routing_strategy: None,
+            max_tokens: None,
+            temperature: None,
+            max_tool_iterations: None,
+            max_tool_iterations_by_tool: HashMap::new(),
+            llm_max_retries: None,
+            llm_retry_delay_ms: None,
+            max_context_tokens: None,
+            evolution_model: None,
+            evolution_provider: None,
+            allowed_mcp_servers: None,
+            allowed_mcp_tools: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedAgentConfig {
+    pub id: String,
+    pub name: Option<String>,
+    pub defaults: AgentDefaults,
+    pub intent_profile: Option<String>,
+}

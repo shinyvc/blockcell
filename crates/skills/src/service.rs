@@ -4,10 +4,16 @@ use crate::evolution::{
 };
 use blockcell_core::{Error, Result};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+
+mod error_tracker;
+mod layout;
+mod observation;
+use error_tracker::ErrorTracker;
+use observation::ObservationStats;
 
 /// Result of a single evolution pipeline run.
 ///
@@ -119,173 +125,6 @@ pub struct CapabilityErrorReport {
     pub error_count: u32,
     /// 是否建议重新进化（错误达到阈值）
     pub should_re_evolve: bool,
-}
-
-/// 错误追踪器：记录每个技能的错误次数和时间窗口
-#[derive(Debug, Clone)]
-struct ErrorTracker {
-    /// skill_name -> (错误时间戳列表, 已触发进化的时间戳)
-    errors: HashMap<String, (Vec<i64>, Option<i64>)>,
-    /// 触发进化所需的连续错误次数
-    threshold: u32,
-    /// 错误统计的时间窗口（分钟）
-    window_minutes: u32,
-    /// 回滚冷却期：skill_name -> 冷却结束时间戳
-    /// 在冷却期内不会触发新的进化，避免“进化→回滚→再进化”死循环
-    cooldowns: HashMap<String, i64>,
-    /// 冷却期时长（分钟），默认 60 分钟
-    cooldown_minutes: u32,
-}
-
-/// ErrorTracker 内部返回
-struct TrackResult {
-    count: u32,
-    is_first: bool,
-    trigger: Option<TriggerReason>,
-}
-
-impl ErrorTracker {
-    fn new(threshold: u32, window_minutes: u32, cooldown_minutes: u32) -> Self {
-        Self {
-            errors: HashMap::new(),
-            threshold,
-            window_minutes,
-            cooldowns: HashMap::new(),
-            cooldown_minutes,
-        }
-    }
-
-    /// 记录一次错误，返回计数信息和是否触发进化
-    fn record_error(&mut self, skill_name: &str) -> TrackResult {
-        let now = chrono::Utc::now().timestamp();
-        let cutoff = now - (self.window_minutes as i64 * 60);
-
-        let entry = self
-            .errors
-            .entry(skill_name.to_string())
-            .or_insert((Vec::new(), None));
-        let (timestamps, triggered_at) = entry;
-
-        let was_empty = timestamps.is_empty();
-        timestamps.push(now);
-
-        // 清理过期的错误记录
-        timestamps.retain(|&t| t > cutoff);
-
-        // 如果已触发的进化也过期了，清除标记
-        if let Some(trigger_time) = *triggered_at {
-            if trigger_time <= cutoff {
-                *triggered_at = None;
-            }
-        }
-
-        let count = timestamps.len() as u32;
-        let is_first = was_empty || count == 1;
-
-        // 检查冷却期：回滚后的冷却期内不触发新进化
-        let in_cooldown = if let Some(&cooldown_until) = self.cooldowns.get(skill_name) {
-            if now < cooldown_until {
-                true
-            } else {
-                // 冷却期已过，清除
-                self.cooldowns.remove(skill_name);
-                false
-            }
-        } else {
-            false
-        };
-
-        // 检查是否应该触发进化：达到阈值 且 未在窗口期内触发过 且 不在冷却期
-        let should_trigger = count >= self.threshold && triggered_at.is_none() && !in_cooldown;
-
-        if should_trigger {
-            // 标记已触发，但不清空计数器（保留历史用于统计）
-            *triggered_at = Some(now);
-            TrackResult {
-                count,
-                is_first,
-                trigger: Some(TriggerReason::ConsecutiveFailures {
-                    count,
-                    window_minutes: self.window_minutes,
-                }),
-            }
-        } else {
-            TrackResult {
-                count,
-                is_first,
-                trigger: None,
-            }
-        }
-    }
-
-    /// 清除某个技能的错误记录（进化成功后调用）
-    fn clear(&mut self, skill_name: &str) {
-        self.errors.remove(skill_name);
-    }
-
-    /// 重置触发标记（允许再次触发进化）
-    #[allow(dead_code)]
-    fn reset_trigger(&mut self, skill_name: &str) {
-        if let Some(entry) = self.errors.get_mut(skill_name) {
-            entry.1 = None;
-        }
-    }
-
-    /// 设置冷却期（回滚后调用，避免立即重新触发进化）
-    fn set_cooldown(&mut self, skill_name: &str) {
-        let cooldown_until = chrono::Utc::now().timestamp() + (self.cooldown_minutes as i64 * 60);
-        self.cooldowns
-            .insert(skill_name.to_string(), cooldown_until);
-    }
-
-    /// 检查某个技能是否在冷却期内
-    #[allow(dead_code)]
-    fn is_in_cooldown(&self, skill_name: &str) -> bool {
-        if let Some(&cooldown_until) = self.cooldowns.get(skill_name) {
-            chrono::Utc::now().timestamp() < cooldown_until
-        } else {
-            false
-        }
-    }
-}
-
-/// 观察期统计追踪器：记录部署后观察窗口内的执行统计
-#[derive(Debug, Clone, Default)]
-struct ObservationStats {
-    /// evolution_id -> (total_calls, error_calls)
-    active: HashMap<String, (u64, u64)>,
-}
-
-impl ObservationStats {
-    /// 记录一次技能调用结果
-    fn record_call(&mut self, evolution_id: &str, is_error: bool) {
-        let entry = self
-            .active
-            .entry(evolution_id.to_string())
-            .or_insert((0, 0));
-        entry.0 += 1;
-        if is_error {
-            entry.1 += 1;
-        }
-    }
-
-    /// 获取当前错误率
-    fn error_rate(&self, evolution_id: &str) -> f64 {
-        if let Some(&(total, errors)) = self.active.get(evolution_id) {
-            if total == 0 {
-                0.0
-            } else {
-                errors as f64 / total as f64
-            }
-        } else {
-            0.0
-        }
-    }
-
-    /// 移除已完成的 evolution
-    fn remove(&mut self, evolution_id: &str) {
-        self.active.remove(evolution_id);
-    }
 }
 
 /// 进化服务配置
@@ -443,111 +282,6 @@ impl EvolutionService {
             return s.to_string();
         }
         s.chars().take(max_chars).collect::<String>()
-    }
-
-    fn first_legacy_python_script(skill_dir: &Path) -> Option<PathBuf> {
-        let mut candidates: Vec<PathBuf> = Vec::new();
-
-        let scripts_dir = skill_dir.join("scripts");
-        if scripts_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&scripts_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() && path.extension().is_some_and(|e| e == "py") {
-                        candidates.push(path);
-                    }
-                }
-            }
-        }
-
-        if candidates.is_empty() {
-            if let Ok(entries) = std::fs::read_dir(skill_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file()
-                        && path.file_name().and_then(|n| n.to_str()) != Some("SKILL.py")
-                        && path.extension().is_some_and(|e| e == "py")
-                    {
-                        candidates.push(path);
-                    }
-                }
-            }
-        }
-
-        candidates.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
-        candidates.into_iter().next()
-    }
-
-    fn first_local_script_asset(skill_dir: &Path) -> Option<PathBuf> {
-        let mut candidates: Vec<PathBuf> = Vec::new();
-
-        let allowed_extensions = ["sh", "bash", "zsh", "js", "php", "rb"];
-        let scan_dir = |dir: &Path, candidates: &mut Vec<PathBuf>| {
-            if !dir.is_dir() {
-                return;
-            }
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_file() {
-                        continue;
-                    }
-                    let ext_ok = path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| allowed_extensions.contains(&ext));
-                    let no_ext_exec = path.extension().is_none() && Self::looks_executable(&path);
-                    if ext_ok || no_ext_exec {
-                        candidates.push(path);
-                    }
-                }
-            }
-        };
-
-        scan_dir(&skill_dir.join("scripts"), &mut candidates);
-        scan_dir(&skill_dir.join("bin"), &mut candidates);
-
-        if candidates.is_empty() {
-            if let Ok(entries) = std::fs::read_dir(skill_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_file() {
-                        continue;
-                    }
-                    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if matches!(
-                        file_name,
-                        "SKILL.md" | "SKILL.py" | "SKILL.rhai" | "meta.yaml" | "meta.json"
-                    ) {
-                        continue;
-                    }
-                    let ext_ok = path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| allowed_extensions.contains(&ext));
-                    let no_ext_exec = path.extension().is_none() && Self::looks_executable(&path);
-                    if ext_ok || no_ext_exec {
-                        candidates.push(path);
-                    }
-                }
-            }
-        }
-
-        candidates.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
-        candidates.into_iter().next()
-    }
-
-    #[cfg(unix)]
-    fn looks_executable(path: &Path) -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-
-    #[cfg(not(unix))]
-    fn looks_executable(_path: &Path) -> bool {
-        false
     }
 
     fn detect_skill_layout(
@@ -2186,7 +1920,7 @@ impl EvolutionService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn setup_test_dirs(tag: &str) -> (PathBuf, PathBuf) {
