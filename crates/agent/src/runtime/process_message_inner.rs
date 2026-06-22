@@ -222,8 +222,8 @@ impl AgentRuntime {
         };
 
         // Load disabled toggles for filtering
-        let disabled_tools = load_disabled_toggles(&self.paths, "tools");
-        let disabled_skills = load_disabled_toggles(&self.paths, "skills");
+        let (disabled_tools, disabled_skills) =
+            load_disabled_toggles_pair(&self.paths, "tools", "skills");
         let recent_skill_name = continued_skill_name(&session_metadata, &history);
         let _ = self.context_builder.reload_skills();
         let skill_cards = self

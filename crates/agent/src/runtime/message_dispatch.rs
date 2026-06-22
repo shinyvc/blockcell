@@ -28,6 +28,11 @@ impl AgentRuntime {
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
         };
+        // Computed once instead of re-cloning the Option<String> on every streamed delta.
+        let agent_id = self
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
 
         for attempt in 0..=max_retries {
             if attempt > 0 {
@@ -95,7 +100,7 @@ impl AgentRuntime {
                                             let event = serde_json::json!({
                                                 "type": "token",
                                                 "channel": msg.channel,
-                                                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                                                "agent_id": agent_id.as_str(),
                                                 "chat_id": msg.chat_id.clone(),
                                                 "delta": delta,
                                             });
@@ -108,7 +113,7 @@ impl AgentRuntime {
                                             let event = serde_json::json!({
                                                 "type": "thinking",
                                                 "channel": msg.channel,
-                                                "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                                                "agent_id": agent_id.as_str(),
                                                 "chat_id": msg.chat_id.clone(),
                                                 "content": delta,
                                             });
@@ -220,7 +225,7 @@ impl AgentRuntime {
                                 let event = serde_json::json!({
                                     "type": "stream_reset",
                                     "channel": msg.channel,
-                                    "agent_id": self.agent_id.clone().unwrap_or_else(|| "default".to_string()),
+                                    "agent_id": agent_id.as_str(),
                                     "chat_id": msg.chat_id.clone(),
                                 });
                                 let _ = event_tx.send(event.to_string());

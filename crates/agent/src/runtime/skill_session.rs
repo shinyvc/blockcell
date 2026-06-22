@@ -9,8 +9,8 @@ impl AgentRuntime {
         session_key: &str,
         tool_names: &[String],
     ) -> Result<(String, Vec<ChatMessage>, serde_json::Value)> {
-        let disabled_skills = load_disabled_toggles(&self.paths, "skills");
-        let disabled_tools = load_disabled_toggles(&self.paths, "tools");
+        let (disabled_tools, disabled_skills) =
+            load_disabled_toggles_pair(&self.paths, "tools", "skills");
 
         let mode_names = vec![format!("Skill:{}", active_skill.name)];
         let prompt_ctx = blockcell_tools::PromptContext {

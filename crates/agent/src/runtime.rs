@@ -2074,16 +2074,40 @@ fn load_disabled_toggles(paths: &Paths, category: &str) -> HashSet<String> {
     let mut disabled = HashSet::new();
     if let Ok(content) = std::fs::read_to_string(&path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(obj) = val.get(category).and_then(|v| v.as_object()) {
-                for (name, enabled) in obj {
-                    if enabled == false {
-                        disabled.insert(name.clone());
-                    }
-                }
-            }
+            collect_disabled(&val, category, &mut disabled);
         }
     }
     disabled
+}
+
+/// Collect the names disabled under `category` from a parsed toggles document.
+fn collect_disabled(val: &serde_json::Value, category: &str, out: &mut HashSet<String>) {
+    if let Some(obj) = val.get(category).and_then(|v| v.as_object()) {
+        for (name, enabled) in obj {
+            if enabled == false {
+                out.insert(name.clone());
+            }
+        }
+    }
+}
+
+/// Read toggles.json once and return the disabled item sets for two categories.
+/// Avoids reading and parsing the same file twice back-to-back on the message hot path.
+fn load_disabled_toggles_pair(
+    paths: &Paths,
+    category_a: &str,
+    category_b: &str,
+) -> (HashSet<String>, HashSet<String>) {
+    let path = paths.toggles_file();
+    let mut a = HashSet::new();
+    let mut b = HashSet::new();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            collect_disabled(&val, category_a, &mut a);
+            collect_disabled(&val, category_b, &mut b);
+        }
+    }
+    (a, b)
 }
 
 pub struct AgentRuntime {
