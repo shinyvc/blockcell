@@ -122,6 +122,12 @@ impl UpdateManager {
         // Verify signature if required
         if self.config.auto_upgrade.require_signature {
             self.verify_signature(manifest, &bytes, artifact.sig.as_deref())?;
+        } else {
+            warn!(
+                "requireSignature is disabled: installing update verified by SHA256 only. \
+                 A tampered manifest could serve a malicious binary. \
+                 Enable signature verification (requireSignature: true) for fail-closed safety."
+            );
         }
 
         // Save to staging

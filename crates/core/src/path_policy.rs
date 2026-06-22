@@ -290,29 +290,55 @@ pub fn expand_tilde(path_str: &str) -> PathBuf {
     }
 }
 
-/// Check whether `path` starts with `base`, after normalizing both sides.
-/// Falls back to lexicographic normalization when `canonicalize` fails
-/// (e.g. for paths that don't exist yet).
+/// Check whether `path` starts with `base`, after resolving both sides.
 ///
-/// On Windows, `canonicalize` returns UNC paths (`\\?\C:\...`) for existing
-/// paths, but `normalize_path` returns regular paths (`C:\...`) for non-existing
-/// ones. To ensure consistent comparison, if either side fails to canonicalize,
-/// both sides fall back to `normalize_path`.
+/// Both sides go through [`resolve_for_policy`], which canonicalizes the
+/// longest existing prefix (resolving any symlinks in it) before appending the
+/// remaining non-existing components. This prevents a symlinked directory from
+/// being used to escape a deny rule when the final target does not exist yet
+/// (e.g. a write to `~/allowed/link/newfile` where `link -> ~/.ssh`), which a
+/// purely lexical normalization would miss.
 pub fn path_starts_with_normalized(path: &Path, base: &Path) -> bool {
-    // Try canonicalize on both sides first
-    let path_canonical = std::fs::canonicalize(path);
-    let base_canonical = std::fs::canonicalize(base);
+    let p = resolve_for_policy(path);
+    let b = resolve_for_policy(base);
+    p.starts_with(&b)
+}
 
-    // If both canonicalize succeeded, compare canonical forms
-    if let (Ok(p), Ok(b)) = (path_canonical, base_canonical) {
-        return p.starts_with(&b);
+/// Resolve a path for policy evaluation.
+///
+/// Fully canonicalizes the path when it exists. Otherwise it canonicalizes the
+/// longest existing ancestor (so symlinks in real directories are resolved) and
+/// re-applies the remaining components lexically (handling `..`/`.`). Only when
+/// no ancestor exists does it fall back to pure lexical normalization.
+///
+/// Resolving both the candidate and the rule prefix through the same routine
+/// keeps their representations consistent (e.g. avoids mixing Windows `\\?\C:\`
+/// with `C:\`) while closing the symlink-escape gap of lexical-only handling.
+fn resolve_for_policy(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
     }
-
-    // If either failed (path doesn't exist), fall back to normalize for BOTH
-    // to ensure consistent representation (e.g. avoid mixing \\?\C:\ with C:\)
-    let path_n = normalize_path(path);
-    let base_n = normalize_path(base);
-    path_n.starts_with(&base_n)
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        if let Ok(canonical) = std::fs::canonicalize(ancestor) {
+            let mut out = canonical;
+            if let Ok(rest) = path.strip_prefix(ancestor) {
+                for component in rest.components() {
+                    match component {
+                        Component::ParentDir => {
+                            out.pop();
+                        }
+                        Component::CurDir => {}
+                        c => out.push(c.as_os_str()),
+                    }
+                }
+            }
+            return out;
+        }
+    }
+    normalize_path(path)
 }
 
 fn normalize_path(p: &Path) -> PathBuf {
@@ -526,5 +552,77 @@ mod tests {
         assert_eq!(PathOp::from_tool_name("list_dir"), PathOp::List);
         assert_eq!(PathOp::from_tool_name("exec"), PathOp::Exec);
         assert_eq!(PathOp::from_tool_name("edit_file"), PathOp::Write);
+    }
+
+    /// Create a unique temporary directory without pulling in an extra crate.
+    fn unique_temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bc_pathpolicy_{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_dir_cannot_escape_deny_for_nonexistent_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("symlink_deny");
+        let secret = root.join("secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        let link = root.join("link");
+        symlink(&secret, &link).unwrap();
+
+        // Deny rule is written against the real (canonical) secret directory.
+        let canon_secret = std::fs::canonicalize(&secret).unwrap();
+        let policy = make_policy(
+            vec![PathRule {
+                name: "deny-secret".to_string(),
+                action: PolicyAction::Deny,
+                ops: vec![PathOp::Read, PathOp::Write],
+                paths: vec![canon_secret.to_string_lossy().to_string()],
+            }],
+            PolicyAction::Allow,
+        );
+
+        // A not-yet-existing file reached through the symlinked directory must
+        // still resolve to the real secret dir and be denied.
+        let via_link = link.join("new_file.txt");
+        assert_eq!(
+            policy.evaluate(&via_link, PathOp::Write),
+            PolicyAction::Deny
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_nonexistent_target_under_real_dir_matches_prefix() {
+        let root = unique_temp_dir("real_prefix");
+        let allowed = root.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+
+        let canon_allowed = std::fs::canonicalize(&allowed).unwrap();
+        let policy = make_policy(
+            vec![PathRule {
+                name: "allow-dir".to_string(),
+                action: PolicyAction::Allow,
+                ops: vec![PathOp::Write],
+                paths: vec![canon_allowed.to_string_lossy().to_string()],
+            }],
+            PolicyAction::Confirm,
+        );
+
+        // Deeply nested non-existing target stays matched to its real prefix.
+        let target = allowed.join("sub").join("deeper").join("file.txt");
+        assert_eq!(policy.evaluate(&target, PathOp::Write), PolicyAction::Allow);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

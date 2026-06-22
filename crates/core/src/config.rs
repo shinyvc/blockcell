@@ -700,7 +700,7 @@ fn default_memory_vector_table() -> String {
 // 内存与进化系统配置 — 已移至 config/memory.rs
 // (模块声明在文件顶部)
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoUpgradeConfig {
     #[serde(default)]
@@ -715,12 +715,29 @@ pub struct AutoUpgradeConfig {
     pub maintenance_window: String,
 }
 
+impl Default for AutoUpgradeConfig {
+    fn default() -> Self {
+        // 与 serde 字段默认保持一致；尤其是 require_signature 必须默认开启，
+        // 否则当配置中缺失整个 autoUpgrade 段时会退化为派生默认的 false。
+        Self {
+            enabled: false,
+            channel: default_upgrade_channel(),
+            manifest_url: default_manifest_url(),
+            require_signature: default_require_signature(),
+            maintenance_window: String::new(),
+        }
+    }
+}
+
 fn default_upgrade_channel() -> String {
     "stable".to_string()
 }
 
+/// 默认要求校验自升级产物的 ed25519 签名（fail-closed）。
+/// 仅靠同源 manifest 的 SHA256 无法防御 manifest 被篡改/中间人，
+/// 因此默认开启签名校验；如需关闭须在配置中显式 `requireSignature: false`。
 fn default_require_signature() -> bool {
-    false
+    true
 }
 
 fn default_manifest_url() -> String {
