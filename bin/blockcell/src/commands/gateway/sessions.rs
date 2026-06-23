@@ -79,6 +79,14 @@ pub(super) async fn handle_sessions_list(
                     .unwrap_or("")
                     .to_string();
 
+                // Hide internal Ghost maintenance routine sessions: they run
+                // automatically in the background and would otherwise flood the
+                // user's session list. Their session key is `ghost:ghost_<ts>`,
+                // i.e. a file stem whose channel segment is `ghost`.
+                if file_stem.split('_').next() == Some("ghost") {
+                    continue;
+                }
+
                 let session_id = session_id_from_file_stem(&file_stem);
 
                 let updated_at = std::fs::metadata(&path)
