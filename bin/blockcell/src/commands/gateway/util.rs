@@ -74,13 +74,16 @@ pub(super) fn secure_eq(a: &str, b: &str) -> bool {
 }
 
 pub(super) fn url_decode(input: &str) -> Option<String> {
-    let mut out = String::with_capacity(input.len());
+    // Decode into a byte buffer first, then validate as UTF-8. Percent-escapes
+    // encode raw bytes, so a multi-byte UTF-8 char (e.g. `%E4%B8%AD` → 中) spans
+    // several escapes; pushing each byte as a `char` would corrupt it.
     let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'+' => {
-                out.push(' ');
+                out.push(b' ');
                 i += 1;
             }
             b'%' => {
@@ -99,16 +102,16 @@ pub(super) fn url_decode(input: &str) -> Option<String> {
                 };
                 let h = hex(hi)?;
                 let l = hex(lo)?;
-                out.push((h * 16 + l) as char);
+                out.push(h * 16 + l);
                 i += 3;
             }
             c => {
-                out.push(c as char);
+                out.push(c);
                 i += 1;
             }
         }
     }
-    Some(out)
+    String::from_utf8(out).ok()
 }
 
 pub(super) fn token_from_query(req: &Request<axum::body::Body>) -> Option<String> {
@@ -173,4 +176,30 @@ pub(super) fn active_model_and_provider(config: &Config) -> (String, Option<Stri
         config.agents.defaults.provider.clone(),
         "agents.defaults",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_decode_handles_ascii_and_plus() {
+        assert_eq!(url_decode("bc_abc123").as_deref(), Some("bc_abc123"));
+        assert_eq!(url_decode("a+b%20c").as_deref(), Some("a b c"));
+    }
+
+    #[test]
+    fn url_decode_handles_multibyte_utf8() {
+        // %E4%B8%AD is the UTF-8 encoding of 中; decoding byte-by-byte as chars
+        // would corrupt it. The fix buffers bytes then validates as UTF-8.
+        assert_eq!(url_decode("%E4%B8%AD%E6%96%87").as_deref(), Some("中文"));
+    }
+
+    #[test]
+    fn url_decode_rejects_truncated_or_invalid_escape() {
+        assert_eq!(url_decode("%E4"), None);
+        assert_eq!(url_decode("%ZZ"), None);
+        // Lone high byte is not valid UTF-8.
+        assert_eq!(url_decode("%FF"), None);
+    }
 }
