@@ -238,6 +238,16 @@ impl GhostMaintenanceService {
 
         // Clone paths for config reloading
         let config_paths = self.paths.clone();
+        // 仅在 config.json5 mtime 变化时才重新读盘+解析（JSON5 解析较重）。
+        // 否则每 60s tick 都全量读+解析一次配置，而配置几乎从不变动。
+        // 首次 tick 强制加载一次（loaded_once=false），与原“总是加载”行为对齐；
+        // 加载后重新记录 mtime，以吸收 load_or_default 写入默认字段造成的 mtime 变化。
+        let config_file = config_paths.config_file();
+        let config_mtime = |path: &std::path::Path| -> Option<std::time::SystemTime> {
+            std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+        };
+        let mut last_config_mtime: Option<std::time::SystemTime> = None;
+        let mut loaded_once = false;
 
         let mut consecutive_failures = 0u32;
         const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -245,7 +255,14 @@ impl GhostMaintenanceService {
         loop {
             tokio::select! {
                 _ = check_interval.tick() => {
-                    // Hot-reload config
+                    // Hot-reload config（按 mtime 短路，避免每分钟重复读+解析）
+                    let current_mtime = config_mtime(&config_file);
+                    let config_changed = match (current_mtime, last_config_mtime) {
+                        (Some(current), Some(last)) => current != last,
+                        (Some(_), None) => true,
+                        (None, _) => false,
+                    };
+                    if !loaded_once || config_changed {
                     if let Ok(new_config) = Config::load_or_default(&config_paths) {
                         let new_ghost = GhostMaintenanceServiceConfig::from_config(&new_config);
 
@@ -287,6 +304,10 @@ impl GhostMaintenanceService {
                                 info!("👻 GhostMaintenanceService enabled/updated via config: {}", self.config.schedule);
                             }
                         }
+                    }
+                        loaded_once = true;
+                        // 重新读取 mtime：load_or_default 可能写入了默认字段。
+                        last_config_mtime = config_mtime(&config_file);
                     }
 
                     if !self.config.enabled {
