@@ -11,6 +11,24 @@ struct WsSessionScope {
     chat_id: String,
 }
 
+/// Only the fields needed to route a broadcast event to a connection. Used
+/// instead of `serde_json::Value` so visibility checks skip the heavy payload
+/// (`content`/`token`/…) without allocating a full JSON tree — this runs once
+/// per event *per connection* on the streaming hot path.
+#[derive(Deserialize)]
+struct WsEventRouting<'a> {
+    #[serde(rename = "type", borrow, default)]
+    event_type: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow, default)]
+    channel: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow, default)]
+    chat_id: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow, default)]
+    agent_id: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow, default)]
+    ws_connection_id: Option<std::borrow::Cow<'a, str>>,
+}
+
 const MAX_WS_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_WS_MESSAGES_PER_WINDOW: usize = 60;
 const WS_RATE_LIMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
@@ -83,11 +101,11 @@ fn ws_event_visible_to_connection(
     connection_id: &str,
     msg: &str,
 ) -> bool {
-    let Ok(event) = serde_json::from_str::<serde_json::Value>(msg) else {
+    let Ok(event) = serde_json::from_str::<WsEventRouting>(msg) else {
         return false;
     };
 
-    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let event_type = event.event_type.as_deref().unwrap_or("");
     if matches!(
         event_type,
         "skills_updated"
@@ -99,21 +117,16 @@ fn ws_event_visible_to_connection(
         return true;
     }
 
-    if event.get("channel").and_then(|v| v.as_str()) != Some("ws") {
+    if event.channel.as_deref() != Some("ws") {
         return false;
     }
 
-    let Some(chat_id) = event.get("chat_id").and_then(|v| v.as_str()) else {
-        return false;
+    let chat_id = match event.chat_id.as_deref() {
+        Some(c) if !c.is_empty() => c,
+        _ => return false,
     };
-    if chat_id.is_empty() {
-        return false;
-    }
 
-    let agent_id = event
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default");
+    let agent_id = event.agent_id.as_deref().unwrap_or("default");
 
     if !subscriptions.contains(&WsSessionScope {
         agent_id: agent_id.to_string(),
@@ -122,7 +135,7 @@ fn ws_event_visible_to_connection(
         return false;
     }
 
-    if let Some(expected_connection_id) = event.get("ws_connection_id").and_then(|v| v.as_str()) {
+    if let Some(expected_connection_id) = event.ws_connection_id.as_deref() {
         return expected_connection_id == connection_id;
     }
 
