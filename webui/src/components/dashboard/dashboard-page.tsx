@@ -89,7 +89,7 @@ export function DashboardPage() {
 
   return (
     <div className="flex flex-col h-full overflow-y-auto">
-      <div className="border-b border-border px-6 py-4 flex items-center justify-between">
+      <div className="border-b border-border py-4 pl-6 pr-16 flex items-center justify-between">
         <div>
           <h1 className="text-lg font-semibold">{t('dashboard.title')}</h1>
           <p className="text-xs text-muted-foreground">{t('dashboard.scopeGlobal')}</p>

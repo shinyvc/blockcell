@@ -124,7 +124,7 @@ function ConfigEditor({ onBack, t }: { onBack: () => void; t: (k: string, p?: Re
   return (
     <div className="flex flex-col h-full">
       <RestartNoticeDialog open={restartNoticeOpen} onClose={() => setRestartNoticeOpen(false)} />
-      <div className="border-b border-border px-6 py-4 flex items-center justify-between">
+      <div className="border-b border-border py-4 pl-6 pr-16 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <button onClick={onBack} className="p-1.5 rounded-lg hover:bg-accent text-muted-foreground">
             <ChevronRight size={16} className="rotate-180" />

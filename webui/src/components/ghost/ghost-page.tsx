@@ -12,7 +12,7 @@ export function GhostPage() {
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <div className="border-b border-border px-6 py-4 flex items-center justify-between shrink-0">
+      <div className="border-b border-border py-4 pl-6 pr-16 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-3">
           <Ghost className="w-6 h-6 text-purple-500" />
           <h1 className="text-lg font-semibold">{t('ghost.title')}</h1>

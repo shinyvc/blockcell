@@ -372,7 +372,7 @@ export function EvolutionPage() {
   return (
     <div className="flex flex-col h-full overflow-y-auto">
       {/* Header */}
-      <div className="border-b border-border px-6 py-4 flex items-center justify-between">
+      <div className="border-b border-border py-4 pl-6 pr-16 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <Dna size={20} className="text-rust" />
           <h1 className="text-lg font-semibold">{t('evolution.title')}</h1>

@@ -345,7 +345,7 @@ ${activeContent || '（文件为空，请生成初始内容）'}
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Header */}
-      <div className="border-b border-border px-6 py-4 flex items-center justify-between shrink-0">
+      <div className="border-b border-border py-4 pl-6 pr-16 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-3">
           <User size={19} className="text-rust" />
           <div>

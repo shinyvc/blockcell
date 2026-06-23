@@ -119,7 +119,7 @@ export function DeliverablesPage() {
 
   return (
     <div className="flex flex-col h-full overflow-y-auto">
-      <div className="border-b border-border px-6 py-4 flex items-center justify-between">
+      <div className="border-b border-border py-4 pl-6 pr-16 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <FolderOpen size={18} className="text-muted-foreground" />
           <h1 className="text-lg font-semibold">{t('deliverables.title')}</h1>
