@@ -410,8 +410,6 @@ impl CronService {
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut jobs = self.jobs.write().await;
-        let known_ids: std::collections::HashSet<String> =
-            jobs.iter().map(|job| job.id.clone()).collect();
         let mut jobs_to_run = Vec::new();
         let mut state_changed = false;
 
@@ -503,25 +501,20 @@ impl CronService {
             *self.has_unsaved_changes.write().await = true;
         }
 
-        // 同步磁盘上的新任务，缩小 mtime 竞态窗口
-        // CronTool 可能在 merge_load 之后写入了新任务；没有这一步的话，
-        // save() 会覆盖那些新任务。
+        // 同步磁盘上的新任务，缩小 mtime 竞态窗口。
+        // CronTool 可能在 merge_load 之后写入新任务；缺这一步 save() 会覆盖它们。
+        // merge_load 已按 mtime 短路读取，因此只有当文件在本 tick 内又发生改动
+        // （mtime 不同于 merge_load 记录的 last_file_mtime）时才需要 sync；否则
+        // 磁盘内容已在 merge_load 并入内存，再全量读+解析纯属冗余（每秒一次）。
         let mut retries = 0;
         let max_retries = 2;
+        // 延迟构建 known_ids：仅在确实需要 sync 时才克隆 job id 集合。集合需覆盖
+        // 本 tick 起始时存在的全部任务（含已被 delete_after_run 移除、尚未落盘的），
+        // 以免把刚删除的任务当成磁盘上的“新任务”重新加入。
+        let mut known_ids: Option<std::collections::HashSet<String>> = None;
         loop {
-            match self.sync_new_from_disk(&known_ids).await {
-                Ok(added) => {
-                    if added {
-                        *self.has_unsaved_changes.write().await = true;
-                    }
-                }
-                Err(e) => {
-                    error!(error = %e.to_string(), "Failed to sync new cron jobs from disk");
-                }
-            }
-
-            // 检查文件 mtime：如果在 sync_new_from_disk 之后又被其他进程修改了，
-            // 则需要重新读取，避免 save() 覆盖其他进程的写入
+            // 检查文件 mtime：若自 merge_load 后未变化，则无新写入，跳过读盘+解析。
+            // 若在 sync 之后又被其他进程修改，则需要重新读取，避免 save() 覆盖其写入。
             let path = self.paths.cron_jobs_file();
             let current_mtime = if path.exists() {
                 tokio::fs::metadata(&path)
@@ -533,13 +526,38 @@ impl CronService {
             };
             let last_mtime = *self.last_file_mtime.read().await;
 
-            let file_changed_again = match (current_mtime, last_mtime) {
+            let file_changed = match (current_mtime, last_mtime) {
                 (Some(current), Some(last)) => current != last,
                 (Some(_), None) => true,
                 (None, _) => false,
             };
 
-            if !file_changed_again || retries >= max_retries {
+            if !file_changed {
+                break;
+            }
+
+            if known_ids.is_none() {
+                let mem_jobs = self.jobs.read().await;
+                let mut ids: std::collections::HashSet<String> =
+                    mem_jobs.iter().map(|job| job.id.clone()).collect();
+                drop(mem_jobs);
+                ids.extend(delete_ids.iter().cloned());
+                known_ids = Some(ids);
+            }
+            let ids = known_ids.as_ref().expect("known_ids initialized above");
+
+            match self.sync_new_from_disk(ids).await {
+                Ok(added) => {
+                    if added {
+                        *self.has_unsaved_changes.write().await = true;
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e.to_string(), "Failed to sync new cron jobs from disk");
+                }
+            }
+
+            if retries >= max_retries {
                 break;
             }
 
