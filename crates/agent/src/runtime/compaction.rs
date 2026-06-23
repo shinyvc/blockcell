@@ -62,6 +62,73 @@ impl AgentRuntime {
         summary
     }
 
+    /// Replace `messages` in place with the compacted form: a system summary,
+    /// a continuation user turn, then the retained recent messages.
+    pub(crate) fn rebuild_messages_after_compact(
+        messages: &mut Vec<ChatMessage>,
+        compact: &crate::compact::CompactResult,
+    ) {
+        messages.clear();
+        messages.push(ChatMessage::system(&compact.to_compact_message()));
+        messages.push(ChatMessage::user("请继续当前任务。"));
+        messages.extend(compact.recent_messages.iter().cloned());
+    }
+
+    /// Clear file/skill trackers and reset incremental memory baselines after a
+    /// successful compact, so the next compact does not re-restore the same
+    /// context and memory extraction keeps triggering.
+    pub(crate) fn finalize_trackers_after_compact(&mut self, history: &[ChatMessage]) {
+        if let Some(ms) = self.memory_system.as_mut() {
+            ms.file_tracker_mut().clear();
+            ms.skill_tracker_mut().clear();
+            ms.reset_baselines_after_compact(history);
+        }
+    }
+
+    /// Run a Layer-4 compact and, on success, replace both the in-flight LLM
+    /// message list and the persisted history with the compacted form, saving
+    /// the new history to the session store. Returns whether the compact
+    /// succeeded. `phase` is used only for log context (e.g. "pre-loop").
+    pub(crate) async fn apply_layer4_compact_in_loop(
+        &mut self,
+        current_messages: &mut Vec<ChatMessage>,
+        history: &mut Vec<ChatMessage>,
+        msg: &InboundMessage,
+        persist_session_key: &str,
+        phase: &str,
+    ) -> bool {
+        let compact_ctx = CompactContext {
+            channel: &msg.channel,
+            chat_id: &msg.chat_id,
+            account_id: msg.account_id.as_deref(),
+        };
+        if let Err(e) = self
+            .capture_pre_compress_learning_boundary(persist_session_key, current_messages)
+            .await
+        {
+            warn!(error = %e, session_key = %persist_session_key, "Ghost learning pre-compress capture failed");
+        }
+        let compact_result = self
+            .execute_layer4_compact(current_messages, persist_session_key, Some(compact_ctx), true)
+            .await;
+        if !compact_result.success {
+            warn!(error = ?compact_result.error, phase, "[layer4] Compact failed, continuing without compression");
+            return false;
+        }
+        Self::rebuild_messages_after_compact(current_messages, &compact_result);
+        info!(
+            phase,
+            post_compact_tokens = estimate_messages_tokens(current_messages),
+            "[layer4] Compact completed, messages replaced with summary"
+        );
+        Self::rebuild_messages_after_compact(history, &compact_result);
+        if let Err(e) = self.session_store.save(persist_session_key, history) {
+            warn!(error = %e, phase, "[layer4] 无法保存 compacted history");
+        }
+        self.finalize_trackers_after_compact(history);
+        true
+    }
+
     /// Execute Layer 4 Full Compact - LLM 语义压缩
     ///
     /// 当 token 超过预算阈值时，使用 LLM 生成 9-part structured summary，

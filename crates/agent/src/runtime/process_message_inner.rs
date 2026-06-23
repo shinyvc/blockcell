@@ -543,7 +543,7 @@ impl AgentRuntime {
         {
             let estimated_tokens = estimate_messages_tokens(&current_messages);
             // Update Layer 4 token usage metrics
-            if let Some(memory_system) = self.memory_system.as_ref() {
+            let trigger_compact = if let Some(memory_system) = self.memory_system.as_ref() {
                 crate::memory_event!(
                     layer4,
                     token_usage,
@@ -558,68 +558,25 @@ impl AgentRuntime {
                         threshold = memory_system.config().layer4.compact_threshold_ratio,
                         "[layer4] Pre-loop compact check triggered"
                     );
-
-                    let compact_ctx = CompactContext {
-                        channel: &msg.channel,
-                        chat_id: &msg.chat_id,
-                        account_id: msg.account_id.as_deref(),
-                    };
-                    if let Err(e) = self
-                        .capture_pre_compress_learning_boundary(
-                            &persist_session_key,
-                            &current_messages,
-                        )
-                        .await
-                    {
-                        warn!(error = %e, session_key = %persist_session_key, "Ghost learning pre-compress capture failed");
-                    }
-                    let compact_result = self
-                        .execute_layer4_compact(
-                            &current_messages,
-                            &persist_session_key,
-                            Some(compact_ctx),
-                            true, // is_auto for automatic compact
-                        )
-                        .await;
-                    if compact_result.success {
-                        // 替换当前消息为压缩后的内容（用于 LLM API 调用）
-                        current_messages.clear();
-                        current_messages
-                            .push(ChatMessage::system(&compact_result.to_compact_message()));
-                        current_messages.push(ChatMessage::user("请继续当前任务。"));
-
-                        current_messages.extend(compact_result.recent_messages.clone());
-
-                        info!(
-                            post_compact_tokens = estimate_messages_tokens(&current_messages),
-                            "[layer4] Pre-loop compact completed"
-                        );
-                        metrics.record_compression();
-
-                        // 同步更新 history 并持久化到 session store
-                        // 确保 compact 结果在请求中断或失败时也不会丢失
-                        history.clear();
-                        history.push(ChatMessage::system(&compact_result.to_compact_message()));
-                        history.push(ChatMessage::user("请继续当前任务。"));
-                        history.extend(compact_result.recent_messages);
-                        if let Err(e) = self.session_store.save(&persist_session_key, &history) {
-                            warn!(error = %e, "[layer4] 无法保存 pre-loop compacted history");
-                        }
-
-                        // Compact 成功后清空追踪器，防止下次 Compact 重复恢复
-                        if let Some(ms) = self.memory_system.as_mut() {
-                            ms.file_tracker_mut().clear();
-                            ms.skill_tracker_mut().clear();
-                            // 重置 Session/Auto 增量基线，避免压缩后永远不触发记忆提取
-                            ms.reset_baselines_after_compact(&history);
-                        }
-                    } else {
-                        warn!(
-                            error = ?compact_result.error,
-                            "[layer4] Pre-loop compact failed"
-                        );
-                    }
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            if trigger_compact
+                && self
+                    .apply_layer4_compact_in_loop(
+                        &mut current_messages,
+                        &mut history,
+                        &msg,
+                        &persist_session_key,
+                        "pre-loop",
+                    )
+                    .await
+            {
+                metrics.record_compression();
             }
         }
 
@@ -1222,7 +1179,7 @@ impl AgentRuntime {
                 // 预算阈值: token_budget * compact_threshold (默认 100_000 * 0.8 = 80_000)
                 let estimated_tokens = estimate_messages_tokens(&current_messages);
                 // Update Layer 4 token usage metrics
-                if let Some(memory_system) = self.memory_system.as_ref() {
+                let trigger_compact = if let Some(memory_system) = self.memory_system.as_ref() {
                     crate::memory_event!(
                         layer4,
                         token_usage,
@@ -1237,74 +1194,27 @@ impl AgentRuntime {
                             threshold = memory_system.config().layer4.compact_threshold_ratio,
                             "[layer4] Full compact threshold reached"
                         );
-
-                        // 执行 Layer 4 Compact
-                        let compact_ctx = CompactContext {
-                            channel: &msg.channel,
-                            chat_id: &msg.chat_id,
-                            account_id: msg.account_id.as_deref(),
-                        };
-                        if let Err(e) = self
-                            .capture_pre_compress_learning_boundary(
-                                &persist_session_key,
-                                &current_messages,
-                            )
-                            .await
-                        {
-                            warn!(error = %e, session_key = %persist_session_key, "Ghost learning pre-compress capture failed");
-                        }
-                        let compact_result = self
-                            .execute_layer4_compact(
-                                &current_messages,
-                                &persist_session_key,
-                                Some(compact_ctx),
-                                true, // is_auto for automatic compact
-                            )
-                            .await;
-                        if compact_result.success {
-                            // 替换消息历史为压缩后的内容（用于 LLM API 调用）
-                            current_messages.clear();
-                            current_messages
-                                .push(ChatMessage::system(&compact_result.to_compact_message()));
-                            // 添加当前用户消息作为继续点
-                            current_messages.push(ChatMessage::user("请继续当前任务。"));
-
-                            current_messages.extend(compact_result.recent_messages.clone());
-
-                            info!(
-                                post_compact_tokens = estimate_messages_tokens(&current_messages),
-                                "[layer4] Compact completed, messages replaced with summary"
-                            );
-                            metrics.record_compression();
-
-                            // 同步更新 history 并持久化到 session store
-                            // 确保 compact 结果不会因请求中断而丢失
-                            history.clear();
-                            history.push(ChatMessage::system(&compact_result.to_compact_message()));
-                            history.push(ChatMessage::user("请继续当前任务。"));
-                            history.extend(compact_result.recent_messages);
-                            if let Err(e) = self.session_store.save(&persist_session_key, &history)
-                            {
-                                warn!(error = %e, "[layer4] 无法保存 mid-loop compacted history");
-                            }
-
-                            // Compact 成功后清空追踪器，防止下次 Compact 重复恢复
-                            if let Some(ms) = self.memory_system.as_mut() {
-                                ms.file_tracker_mut().clear();
-                                ms.skill_tracker_mut().clear();
-                                // 重置 Session/Auto 增量基线，避免压缩后永远不触发记忆提取
-                                ms.reset_baselines_after_compact(&history);
-                            }
-
-                            // 跳过后续处理
-                            continue;
-                        } else {
-                            warn!(
-                                error = ?compact_result.error,
-                                "[layer4] Compact failed, continuing without compression"
-                            );
-                        }
+                        true
+                    } else {
+                        false
                     }
+                } else {
+                    false
+                };
+                if trigger_compact
+                    && self
+                        .apply_layer4_compact_in_loop(
+                            &mut current_messages,
+                            &mut history,
+                            &msg,
+                            &persist_session_key,
+                            "mid-loop",
+                        )
+                        .await
+                {
+                    metrics.record_compression();
+                    // 跳过后续处理
+                    continue;
                 }
 
                 // Skill Nudge: check after each iteration (replaces skill_nudge_engine.check_skill_nudge)
@@ -1833,7 +1743,6 @@ impl AgentRuntime {
 
                 // 克隆必要的数据
                 let provider_pool = Arc::clone(&self.provider_pool);
-                let history_clone = history.clone();
                 let config_dir = memory_system.config_dir().to_path_buf();
                 let model = self.config.agents.defaults.model.clone();
                 let layer5_config = memory_system.config().layer5.clone();
@@ -1845,7 +1754,7 @@ impl AgentRuntime {
                 // 为每种记忆类型创建独立的异步任务
                 for memory_type in actions.auto_memory_types.drain(..) {
                     let provider_pool_for_type = Arc::clone(&provider_pool);
-                    let history_for_type = history_clone.clone();
+                    let history_for_type = history.clone();
                     let config_dir_for_type = config_dir.clone();
                     let model_for_type = model.clone();
                     let layer5_config_for_type = layer5_config.clone();
@@ -2037,11 +1946,7 @@ impl AgentRuntime {
                     .await;
                 if compact_result.success {
                     // 压缩成功，替换历史
-                    history.clear();
-                    history.push(ChatMessage::system(&compact_result.to_compact_message()));
-                    history.push(ChatMessage::user("请继续当前任务。"));
-
-                    history.extend(compact_result.recent_messages);
+                    Self::rebuild_messages_after_compact(&mut history, &compact_result);
 
                     info!(
                         post_compact_tokens = estimate_messages_tokens(&history),
@@ -2049,13 +1954,7 @@ impl AgentRuntime {
                     );
                     metrics.record_compression();
 
-                    // 清空追踪器
-                    if let Some(ms) = self.memory_system.as_mut() {
-                        ms.file_tracker_mut().clear();
-                        ms.skill_tracker_mut().clear();
-                        // 重置 Session/Auto 增量基线，避免压缩后永远不触发记忆提取
-                        ms.reset_baselines_after_compact(&history);
-                    }
+                    self.finalize_trackers_after_compact(&history);
                 } else {
                     warn!(
                         error = ?compact_result.error,
