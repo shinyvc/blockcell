@@ -59,7 +59,15 @@ fn collect_skill_entries_recursive(
         return;
     }
 
-    const EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
+    const EXCLUDED_DIRS: &[&str] = &[
+        ".git",
+        ".github",
+        ".hub",
+        ".snapshots",
+        ".skill_file_store.lockdir",
+        "__pycache__",
+        "node_modules",
+    ];
 
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -170,7 +178,15 @@ fn collect_skill_entries_filtered_recursive(
         return;
     }
 
-    const EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
+    const EXCLUDED_DIRS: &[&str] = &[
+        ".git",
+        ".github",
+        ".hub",
+        ".snapshots",
+        ".skill_file_store.lockdir",
+        "__pycache__",
+        "node_modules",
+    ];
 
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -299,7 +315,15 @@ fn collect_skill_search_entries_recursive(
         return;
     }
 
-    const EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
+    const EXCLUDED_DIRS: &[&str] = &[
+        ".git",
+        ".github",
+        ".hub",
+        ".snapshots",
+        ".skill_file_store.lockdir",
+        "__pycache__",
+        "node_modules",
+    ];
 
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -405,7 +429,15 @@ fn collect_skill_search_entries_filtered_recursive(
         return;
     }
 
-    const EXCLUDED_DIRS: &[&str] = &[".git", ".github", ".hub", "__pycache__", "node_modules"];
+    const EXCLUDED_DIRS: &[&str] = &[
+        ".git",
+        ".github",
+        ".hub",
+        ".snapshots",
+        ".skill_file_store.lockdir",
+        "__pycache__",
+        "node_modules",
+    ];
 
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
