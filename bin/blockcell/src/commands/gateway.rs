@@ -549,7 +549,8 @@ async fn auth_middleware(
         _ => return next.run(req).await,
     };
 
-    if req.uri().path() == "/v1/health" || req.uri().path() == "/v1/auth/login" {
+    let path = req.uri().path();
+    if path == "/v1/health" || path == "/v1/auth/login" {
         return next.run(req).await;
     }
 
@@ -558,15 +559,23 @@ async fn auth_middleware(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
 
-    let authorized = match auth_header {
+    let authorized_by_header = match auth_header {
         Some(h) if h.starts_with("Bearer ") => secure_eq(&h[7..], token.as_str()),
         _ => false,
     };
 
-    let authorized = authorized
-        || token_from_query(&req)
-            .map(|v| secure_eq(&v, token.as_str()))
-            .unwrap_or(false);
+    // A `?token=` query param is only honoured for endpoints the browser must
+    // reach without being able to set an Authorization header: the WebSocket
+    // upgrade and media/download links opened directly by the browser. For all
+    // other endpoints (called via fetch/XHR, which can send the header) the
+    // query token is rejected so tokens don't leak into access logs / Referer.
+    let query_token_allowed = matches!(path, "/v1/ws" | "/v1/files/download" | "/v1/files/serve");
+
+    let authorized = authorized_by_header
+        || (query_token_allowed
+            && token_from_query(&req)
+                .map(|v| secure_eq(&v, token.as_str()))
+                .unwrap_or(false));
 
     if authorized {
         next.run(req).await
