@@ -1,24 +1,8 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, lazy, Suspense } from 'react';
 import { Bell, X } from 'lucide-react';
 import { Sidebar } from './components/sidebar';
-import { ChatPage } from './components/chat/chat-page';
-import { TasksPage } from './components/tasks/tasks-page';
-import { DashboardPage } from './components/dashboard/dashboard-page';
-import { ConfigPage } from './components/config/config-page';
-import { MemoryPage } from './components/memory/memory-page';
-import { CronPage } from './components/cron/cron-page';
-import { AlertsPage } from './components/alerts/alerts-page';
-import { StreamsPage } from './components/streams/streams-page';
-import { FilesPage } from './components/files/files-page';
-import { EvolutionPage } from './components/evolution/evolution-page';
-import { GhostPage } from './components/ghost/ghost-page';
 import { LoginPage } from './components/login-page';
 import { ConnectionOverlay } from './components/connection-overlay';
-import { DeliverablesPage } from './components/deliverables/deliverables-page';
-import { PersonaPage } from './components/persona/persona-page';
-import { LLMPage } from './components/llm/llm-page';
-import { ChannelsPage } from './components/channels/channels-page';
-import { SkillsPage } from './components/skills/skills-page';
 import { SetupWizard } from './components/setup-wizard';
 import { SystemEventsPanel } from './components/system-events-panel';
 import { ThemeProvider } from './components/theme-provider';
@@ -27,6 +11,26 @@ import { wsManager, type WsEvent } from './lib/ws';
 import { WsEventBatcher } from './lib/ws-batcher';
 import { cn } from './lib/utils';
 import { registerShortcuts, handleGlobalKeyDown } from './lib/keyboard';
+
+// Pages are lazy-loaded so each becomes its own chunk: only the active page's
+// code is fetched, keeping the initial bundle small. Named exports are mapped
+// to the default export shape that React.lazy expects.
+const ChatPage = lazy(() => import('./components/chat/chat-page').then((m) => ({ default: m.ChatPage })));
+const TasksPage = lazy(() => import('./components/tasks/tasks-page').then((m) => ({ default: m.TasksPage })));
+const DashboardPage = lazy(() => import('./components/dashboard/dashboard-page').then((m) => ({ default: m.DashboardPage })));
+const ConfigPage = lazy(() => import('./components/config/config-page').then((m) => ({ default: m.ConfigPage })));
+const MemoryPage = lazy(() => import('./components/memory/memory-page').then((m) => ({ default: m.MemoryPage })));
+const CronPage = lazy(() => import('./components/cron/cron-page').then((m) => ({ default: m.CronPage })));
+const AlertsPage = lazy(() => import('./components/alerts/alerts-page').then((m) => ({ default: m.AlertsPage })));
+const StreamsPage = lazy(() => import('./components/streams/streams-page').then((m) => ({ default: m.StreamsPage })));
+const FilesPage = lazy(() => import('./components/files/files-page').then((m) => ({ default: m.FilesPage })));
+const EvolutionPage = lazy(() => import('./components/evolution/evolution-page').then((m) => ({ default: m.EvolutionPage })));
+const GhostPage = lazy(() => import('./components/ghost/ghost-page').then((m) => ({ default: m.GhostPage })));
+const DeliverablesPage = lazy(() => import('./components/deliverables/deliverables-page').then((m) => ({ default: m.DeliverablesPage })));
+const PersonaPage = lazy(() => import('./components/persona/persona-page').then((m) => ({ default: m.PersonaPage })));
+const LLMPage = lazy(() => import('./components/llm/llm-page').then((m) => ({ default: m.LLMPage })));
+const ChannelsPage = lazy(() => import('./components/channels/channels-page').then((m) => ({ default: m.ChannelsPage })));
+const SkillsPage = lazy(() => import('./components/skills/skills-page').then((m) => ({ default: m.SkillsPage })));
 
 interface ConfirmDialog {
   requestId: string;
@@ -197,22 +201,24 @@ export default function App() {
           <div className="absolute top-3 right-4 z-30">
             <SystemEventsPanel />
           </div>
-          {activePage === 'chat' && <ChatPage />}
-          {activePage === 'tasks' && <TasksPage />}
-          {activePage === 'dashboard' && <DashboardPage />}
-          {activePage === 'evolution' && <EvolutionPage />}
-          {activePage === 'config' && <ConfigPage />}
-          {activePage === 'memory' && <MemoryPage />}
-          {activePage === 'ghost' && <GhostPage />}
-          {activePage === 'cron' && <CronPage />}
-          {activePage === 'alerts' && <AlertsPage />}
-          {activePage === 'streams' && <StreamsPage />}
-          {activePage === 'files' && <FilesPage />}
-          {activePage === 'deliverables' && <DeliverablesPage />}
-          {activePage === 'persona' && <PersonaPage />}
-          {activePage === 'llm' && <LLMPage />}
-          {activePage === 'channels' && <ChannelsPage />}
-          {activePage === 'skills' && <SkillsPage />}
+          <Suspense fallback={<div className="flex items-center justify-center h-full text-sm text-muted-foreground">Loading…</div>}>
+            {activePage === 'chat' && <ChatPage />}
+            {activePage === 'tasks' && <TasksPage />}
+            {activePage === 'dashboard' && <DashboardPage />}
+            {activePage === 'evolution' && <EvolutionPage />}
+            {activePage === 'config' && <ConfigPage />}
+            {activePage === 'memory' && <MemoryPage />}
+            {activePage === 'ghost' && <GhostPage />}
+            {activePage === 'cron' && <CronPage />}
+            {activePage === 'alerts' && <AlertsPage />}
+            {activePage === 'streams' && <StreamsPage />}
+            {activePage === 'files' && <FilesPage />}
+            {activePage === 'deliverables' && <DeliverablesPage />}
+            {activePage === 'persona' && <PersonaPage />}
+            {activePage === 'llm' && <LLMPage />}
+            {activePage === 'channels' && <ChannelsPage />}
+            {activePage === 'skills' && <SkillsPage />}
+          </Suspense>
         </main>
         <ConnectionOverlay />
         {showWizard && (
