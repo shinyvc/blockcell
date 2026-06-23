@@ -16,6 +16,33 @@ struct SessionInfo {
     message_count: usize,
 }
 
+/// Count messages in a session `.jsonl` without loading the whole file into
+/// memory. Each non-empty line is one record and the first line is session
+/// metadata (hence the `-1`). Streams the file with a reused line buffer so a
+/// large history does not allocate its full contents on every list request.
+fn count_session_messages(path: &std::path::Path) -> usize {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    let mut non_empty = 0usize;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if !line.trim().is_empty() {
+                    non_empty += 1;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    non_empty.saturating_sub(1)
+}
+
 fn session_file_stems(sessions_dir: &std::path::Path) -> Vec<String> {
     std::fs::read_dir(sessions_dir)
         .ok()
@@ -97,14 +124,7 @@ pub(super) async fn handle_sessions_list(
                     })
                     .unwrap_or_default();
 
-                let message_count = std::fs::read_to_string(&path)
-                    .map(|c| {
-                        c.lines()
-                            .filter(|l| !l.trim().is_empty())
-                            .count()
-                            .saturating_sub(1)
-                    })
-                    .unwrap_or(0);
+                let message_count = count_session_messages(&path);
 
                 let name = meta
                     .get(&file_stem)
