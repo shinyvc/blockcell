@@ -109,7 +109,12 @@ impl AgentRuntime {
             warn!(error = %e, session_key = %persist_session_key, "Ghost learning pre-compress capture failed");
         }
         let compact_result = self
-            .execute_layer4_compact(current_messages, persist_session_key, Some(compact_ctx), true)
+            .execute_layer4_compact(
+                current_messages,
+                persist_session_key,
+                Some(compact_ctx),
+                true,
+            )
             .await;
         if !compact_result.success {
             warn!(error = ?compact_result.error, phase, "[layer4] Compact failed, continuing without compression");
