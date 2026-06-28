@@ -14,7 +14,7 @@
 
 [Website](https://blockcell.dev) • [Documentation](https://blockcell.dev/docs) • [中文](README.md)
 
-**Latest release**: v0.1.6 • [Download Release](https://github.com/blockcell-labs/blockcell/releases/tag/v0.1.6) • [Changelog](CHANGELOG.en.md)
+**Latest release**: v0.1.7 • [Download Release](https://github.com/blockcell-labs/blockcell/releases/tag/v0.1.7) • [Changelog](CHANGELOG.en.md)
 
 </div>
 
@@ -90,6 +90,35 @@ BlockCell can retain durable lessons from real usage:
 - Project facts, environment conventions, and recurring lessons go into `MEMORY.md`
 - Reusable workflows can become workspace skills
 - Background review failures do not block the current answer, and automatic writes are audited, snapshotted, and undoable
+
+### 🧭 ModelRouter and Connection-Phase Fallback
+
+When multiple models are configured, BlockCell can choose the right provider by policy:
+
+- `manual`: keep Provider Pool priority and weighted selection
+- `cost_optimized`: prefer lower-cost models for short contexts and return to primary models for long contexts
+- `quality_first`: prefer higher-priority primary models
+- `latency_first`: reserved for latency-focused routing; currently approximated using availability history
+
+Main LLM calls also support connection-phase fallback. If the preferred provider fails before streaming starts, BlockCell can try the next available provider. Once streaming has started, it will not mix partial output from one model with another model's response.
+
+### 🪝 Hook Lifecycle Events
+
+BlockCell can run local commands from `~/.blockcell/hooks.yaml` at key lifecycle events:
+
+- `pre_tool_use` / `post_tool_use` around tool execution, with tool-name glob matching
+- `session_start` / `user_prompt` / `agent_stop` for session and message lifecycle events
+- Template variables such as `{tool_name}`, `{session_id}`, `{cwd}`, `{command}`, `{file_path}`, and `{result}`
+- Hook failures and timeouts do not block the main agent flow, making hooks useful for auditing, formatting, notifications, and external logging
+
+### 🔐 Controlled Execution and Audit
+
+v0.1.7 tightens agent execution boundaries:
+
+- Tool Policy supports tool-name globs, channel conditions, path conditions, `allow` / `ask` / `deny` decisions, and inherited rule groups
+- Global token and cost budgets are tracked per session to prevent runaway tasks
+- Audit logs support SHA-256 hash-chain verification and include session, provider-call, and budget events
+- Gateway API authentication is stricter: regular APIs no longer accept URL `?token=`, so use `Authorization: Bearer <token>`
 
 ### 🤖 Multi-Agent and Custom Agents
 
@@ -379,6 +408,8 @@ For full functionality, install these tools:
 - [Skill System](docs/en/04_skill_system.md)
 - [Memory System](docs/en/05_memory_system.md)
 - [Ghost Native Learning Design (Chinese)](docs/27_ghost_learning_design.md)
+- [ModelRouter and Fallback (Chinese)](docs/28_model_router.md)
+- [Hook Lifecycle Events (Chinese)](docs/29_hook_system.md)
 - [Channel Configuration](docs/en/06_channels.md)
 - [Browser Automation](docs/en/07_browser_automation.md)
 - [Gateway Mode](docs/en/08_gateway_mode.md)

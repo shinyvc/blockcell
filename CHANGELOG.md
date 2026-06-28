@@ -5,6 +5,45 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)，
 并遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
+## [0.1.7] - 2026-06-28
+
+### 新增
+- 新增 ModelRouter 智能路由与连接阶段自动降级，支持 `manual`、`cost_optimized`、`quality_first` 和 `latency_first` 路由策略。
+- 新增 Tool Policy 执行策略系统，支持工具名 glob、`|` 多模式、渠道/路径条件、`allow` / `ask` / `deny` 决策、规则组继承和 simulation mode。
+- 新增全局 Token / 成本预算控制，按会话跟踪 LLM 用量，避免长任务或异常循环失控消耗。
+- 新增 Steering Channel 实时消息注入，允许在 Agent 执行期间继续接收用户指令并注入当前轮次。
+- 新增 Agent 生命周期 Hook：`session_start`、`user_prompt`、`pre_tool_use`、`post_tool_use`、`agent_stop`，可通过 `~/.blockcell/hooks.yaml` 执行本机命令。
+- 新增审计日志 SHA-256 hash chain 防篡改校验，并补充 SessionStart、SessionEnd、ProviderCall、BudgetEvent 等审计事件。
+- 新增 MCP 工具按需发现：当允许的 MCP 工具数量较大时，仅向模型暴露 `mcp_search_tools`，远端工具保持可执行但默认不注入 system prompt。
+- 新增 GitHub Actions CI 与多平台 Release 构建流程。
+
+### 调整
+- 更新 2026-06 Provider 与默认模型预设，包括 DeepSeek、OpenAI、Anthropic、Gemini、Ollama、GLM、Qwen 等模型族。
+- WebUI 改用 `React.lazy` + `Suspense` 分块加载，并优化系统动态区域的按钮布局。
+- Gateway 事件广播改为轻量 `WsEventRouting`，避免在路由阶段复制 content/token 等大字段。
+- Token 估算与流式读取路径减少无缓存重复计算、历史深拷贝和单行缓冲分配。
+- Ghost 配置热重载与 Cron sync 按 mtime 判断是否需要重读配置，减少不必要的读盘和解析。
+- SQLite 记忆查询、写入、删除和 maintenance 操作迁移到 `spawn_blocking`，降低阻塞 Tokio worker 的风险。
+- 大文件继续按职责拆分，覆盖 runtime、agent、gateway、config、openai、memory、evolution、consolidator 等模块。
+- 全仓库 Rust 版本统一为 1.85。
+
+### 修复
+- 修复 Gateway API 普通接口接受 URL `?token=` 导致 token 进入访问日志或 Referer 的风险；仅保留 WebSocket 与文件下载/serve 等必要入口。
+- 修复 WebSocket / outbound 广播缺少会话隔离、跨会话泄漏，以及任意 WS 客户端可批准其他会话确认请求的问题。
+- 修复文件读取/上传缺少大小限制、本地图片 serve 边界、`url_decode` 多字节 UTF-8、CLI Unicode 光标编辑、Home/End/Delete 键处理等问题。
+- 修复 `http_request` SSRF 风险、`exec_local` / `exec_skill_script` 路径逃逸、危险 `rm` 命令绕过、超时子进程残留和 symlink 写入逃逸。
+- 修复 Ghost review TOCTOU、路径穿越、阻塞主流程、节流泄漏，以及 `.snapshots` / `.skill_file_store.lockdir` 被误扫描的问题。
+- 修复 Dream / Session / Auto / Compact 记忆链路中的并发、原子性、事务提交、恢复、锁释放、预算和 Unicode panic 问题。
+- 修复 skill evolution 与 core evolution 中状态机、回滚、staging 路径、跨流程污染、无限重试、Python 语法检查和代码围栏注入等安全稳定性问题。
+- 修复 OpenAI 兼容 streaming 工具调用、MCP 短名工具加载、hash 算法使用、浏览器导航竞态、CDP 监听器泄漏和 semver 预发布解析问题。
+- 修复 Windows 原子写入、路径分隔符、临时目录清理、跨进程锁误删、配置丢失和 schema 不一致等兼容性问题。
+
+### 文档
+- 新增 ModelRouter 智能路由与自动降级文档。
+- 新增 Hook 生命周期事件系统文档。
+- 更新 README / README.en，补充 v0.1.7 的安全、审计、路由和 Hook 能力说明。
+- 新增 v0.1.7 Release 说明文档。
+
 ## [0.1.6] - 2026-05-09
 
 ### 新增
